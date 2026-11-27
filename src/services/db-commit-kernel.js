@@ -274,6 +274,16 @@ async function runRootCommit(db, work, options = {}) {
             stateFor(context);
           }
           state.preparations.clear();
+          // Deferred owner checks and DWI locator publications are part of the
+          // command, not advisory work. Prisma 5.22 can resolve its COMMIT when
+          // PostgreSQL rejects it with an unmapped deferred-trigger error. Run
+          // these checks after every preparation but before returning to the
+          // driver, where a failed SQL statement rejects and rolls back the
+          // root. Keep normal COMMIT handling for serialization/transport errors.
+          if (typeof tx.$executeRawUnsafe === "function") {
+            await tx.$executeRawUnsafe("SET CONSTRAINTS ALL IMMEDIATE");
+            stateFor(context);
+          }
           state.phase = "COMMITTING";
           return value;
         });

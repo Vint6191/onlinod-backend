@@ -521,7 +521,25 @@ async function publishVerifiedFinancialFactsPage({ db, job, facts, now }) {
   if (tipIds.length) await require("./creator-entity-change-service").publishCanonicalFactInvalidations({ db, agencyId: job.agencyId, creatorId: job.creatorId, model: "creatorTip", ids: tipIds });
 }
 
+async function withdrawVerifiedFinancialFactsPage({ db, job, transactionIds, observedAt, now }) {
+  if (!transactionIds.length) return;
+  if (transactionIds.length > 100) throw new Error("FINANCIAL_WITHDRAWAL_PAGE_TOO_LARGE");
+  await lockCreatorFacts(db,job.agencyId,job.creatorId);
+  // Retain receipt payloads and original canonical amounts for inspection.
+  // Superseded is a membership withdrawal, not a fabricated refund.
+  const rows=await db.$queryRawUnsafe(`UPDATE "CreatorFinancialTransaction" SET "transactionStatus"='superseded',
+    "projectionStatus"='STORED_ONLY',"reasonCode"='VERIFIED_SNAPSHOT_ABSENT',"sourceUpdatedAt"=$4,"updatedAt"=$5
+    WHERE "agencyId"=$1 AND "creatorId"=$2 AND "externalTransactionId"=ANY($3::text[])
+      AND ("sourceUpdatedAt" IS NULL OR "sourceUpdatedAt"<=$4)
+    RETURNING "externalTransactionId"`,job.agencyId,job.creatorId,transactionIds,observedAt,now);
+  const ids=await require("./financial-canonical-publication-repository").supersede({db,job,observedAt,now,
+    rows:rows.map(row=>({...row,factType:"OTHER",projectionStatus:"STORED_ONLY",sourceUpdatedAt:observedAt}))});
+  if(ids.SALE.length)await require("./creator-entity-change-service").publishCanonicalSales({db,agencyId:job.agencyId,creatorId:job.creatorId,saleIds:ids.SALE});
+  if(ids.TIP.length)await require("./creator-entity-change-service").publishCanonicalFactInvalidations({db,agencyId:job.agencyId,creatorId:job.creatorId,model:"creatorTip",ids:ids.TIP});
+}
+
 module.exports = {
+  withdrawVerifiedFinancialFactsPage,
   publishVerifiedFinancialFactsPage,
   ingestExactLiveTransaction,
   normalizeTransaction,

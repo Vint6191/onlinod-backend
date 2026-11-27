@@ -9,6 +9,8 @@ const { CrmAnalysisService } = require("./crm-analysis-service");
 const { HistoryRelay } = require("./history-relay");
 const { readFanCurrent } = require("../fan-data-authority-service");
 const { readCapacity, assertCapacity } = require("./capacity");
+const { collectConversationGarbage } = require("./garbage-collection");
+const { financialPublicationPendingSql } = require("../earnings-coverage-service");
 let singleton;
 const READS = new Set([
   "getIdentity",
@@ -69,6 +71,8 @@ class ConversationRuntime {
     this.capacities = new Map();
     this.capacityReads = new Map();
     this.pumpBusy = false;
+    this.gcCursors = { dialogs: "", crm: "" };
+    this.gcProgress = null;
   }
   async check(domain) {
     const now = Date.now();
@@ -104,6 +108,7 @@ class ConversationRuntime {
     const row = await c.one(
       this.core,
       `SELECT s.stage,s.snapshot,b."netCents",b.payments,p.generation,p."activeGeneration",p."creatorId",p."throughAt",
+      ${financialPublicationPendingSql('s."creatorId"')} AS publishing,
       EXISTS(SELECT 1 FROM "FanLtvChange" x WHERE x."creatorId"=s."creatorId") dirty,
       EXISTS(SELECT 1 FROM "FanLtvReceipt" x WHERE x."creatorId"=s."creatorId" AND x."nextDueAt"<=now()) due
       FROM "FanLtvState" s LEFT JOIN "FanLtvBalance" b ON b."creatorId"=s."creatorId" AND b."rangeKey"='all' AND b."fanId"=$3
@@ -115,6 +120,7 @@ class ConversationRuntime {
     );
     const available = Boolean(
       row &&
+        !row.publishing &&
         row.stage === "LIVE" &&
         !row.dirty &&
         !row.due &&
@@ -418,6 +424,10 @@ class ConversationRuntime {
           firstError ||= error;
         }
       }
+      const garbage = await collectConversationGarbage({ db: this.db, dialogs: this.dialogs,
+        analysis: this.analysis, cursors: this.gcCursors });
+      this.gcProgress = garbage.progress;
+      firstError ||= garbage.error;
       await c.exec(
         this.db.crm,
         "DELETE FROM crm_command_receipt WHERE (scope_id,command_id) IN (SELECT scope_id,command_id FROM crm_command_receipt WHERE expires_at<now() ORDER BY expires_at LIMIT 128)"

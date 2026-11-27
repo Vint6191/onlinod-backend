@@ -84,7 +84,8 @@ async function readPublishedEarningsAggregates({ db, creatorIds, from, to, now, 
       ${require("./earnings-live-read-sql").liveLedgerDailySql("live_scope","$6")},
       authoritative_days AS MATERIALIZED (
         SELECT l."creatorId",l.date,l."totalCents",l."collectedAt",
-          (NOT a.recovering AND NOT a.unresolved AND a."shortGapFrom" IS NULL
+          (a."proofPolicyVersion"=${require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION} AND NOT a.publishing
+            AND NOT a.recovering AND NOT a.unresolved AND NOT a.undelivered AND a."shortGapFrom" IS NULL
             AND l.observed BETWEEN ($4::timestamptz AT TIME ZONE 'UTC') AND ($5::timestamptz AT TIME ZONE 'UTC')) AS fresh
         FROM ledger_daily l JOIN ledger_authority a ON a.id=l."creatorId"
         WHERE l.date::timestamp>=a."fromAt"
@@ -95,14 +96,20 @@ async function readPublishedEarningsAggregates({ db, creatorIds, from, to, now, 
         SELECT d."creatorId",d.date,d."totalCents",d."collectedAt",
           (${earningsObservationSql()} BETWEEN ($4::timestamptz AT TIME ZONE 'UTC') AND ($5::timestamptz AT TIME ZONE 'UTC')
             AND NOT EXISTS(SELECT 1 FROM ledger_authority a WHERE a.id=d."creatorId"
-              AND (a.recovering OR a.unresolved OR a."shortGapFrom" IS NOT NULL))) AS fresh
+              AND (a."proofPolicyVersion"<>${require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION} OR a.publishing
+                OR a.recovering OR a.unresolved OR a.undelivered OR a."shortGapFrom" IS NOT NULL))) AS fresh
         FROM "CreatorEarningsPublishedDay" d ${publishedEarningsJoins()}
         WHERE d."creatorId"=ANY($1::text[]) AND d."sourceTimezone"='UTC' AND d."date" BETWEEN ($2::timestamptz AT TIME ZONE 'UTC')::date AND ($3::timestamptz AT TIME ZONE 'UTC')::date
           AND v."status"='COMPLETE'
           AND NOT EXISTS(SELECT 1 FROM ledger_daily l WHERE l."creatorId"=d."creatorId" AND l.date=d.date)
       )
       SELECT "creatorId",COUNT(*)::bigint AS days,SUM("totalCents")::bigint AS cents,
-        MAX("collectedAt") AS captured,COUNT(*) FILTER (WHERE fresh)::bigint AS fresh
+        MAX("collectedAt") AS captured,COUNT(*) FILTER (WHERE fresh)::bigint AS fresh,
+        (SELECT CASE WHEN a."proofPolicyVersion"<>${require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION} THEN 'POLICY_ADOPTION_REQUIRED'
+          WHEN a.publishing THEN 'FINANCIAL_PUBLICATION_PENDING'
+          WHEN a.recovering THEN 'RECOVERY_PENDING' WHEN a.unresolved THEN 'UNRESOLVED_MONEY'
+          WHEN a.undelivered THEN 'DELIVERY_PENDING' WHEN a."shortGapFrom" IS NOT NULL THEN 'DELIVERY_GAP'
+          ELSE NULL END FROM ledger_authority a WHERE a.id=usable_days."creatorId") AS "staleReason"
       FROM usable_days GROUP BY "creatorId"`, ids.slice(offset, offset+CREATOR_BATCH), from, to, freshAfter, freshBefore, now);
     rows.push(...batch.map(row => ({ ...row, days: integer(row.days), cents: integer(row.cents), fresh: integer(row.fresh) })));
   }

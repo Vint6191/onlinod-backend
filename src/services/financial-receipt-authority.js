@@ -328,7 +328,13 @@ async function commitPage(db, job, chunk, prepared, accepted, backendRejected, r
     const w = row.windows[index];
     const traversalComplete = totals.exhausted || totals.traversalComplete === true;
     if (traversalComplete) {
-      totals.comparisonFrom = w.comparisonFrom || w.from || (totals.oldestAt ? new Date(Date.parse(totals.oldestAt)).toISOString().slice(0, 10) + "T00:00:00.000Z" : null);
+      // Exhaustion proves the leading empty history independently of chart
+      // coordinates. Compare every observed payment; for an empty history use
+      // the already-supported recent window instead of requesting years of
+      // empty chart points. Generation coverage records the wider proof.
+      totals.comparisonFrom = w.comparisonFrom || w.from
+        || (totals.oldestAt ? new Date(Date.parse(totals.oldestAt)).toISOString().slice(0, 10) + "T00:00:00.000Z"
+          : w.kind === "FULL" && totals.exhausted ? new Date(Math.max(+FLOOR, +date(w.to) - RECENT_DAYS * DAY)).toISOString().slice(0, 10) + "T00:00:00.000Z" : null);
       totals.comparisonTo = w.to;
       cursor.comparisonFrom = totals.comparisonFrom;
       cursor.traversalComplete = true;
@@ -336,8 +342,7 @@ async function commitPage(db, job, chunk, prepared, accepted, backendRejected, r
       cursor.historyRead = w.kind === "FULL" && totals.exhausted;
       proof.historyRead = cursor.historyRead;
       proof.traversalComplete = true;
-      // An empty unbounded list does not establish a date range suitable for
-      // chart verification. Preserve the explicit end-of-source observation.
+      // Other traversals still need an explicit comparison interval.
       if (!totals.comparisonFrom) {
         totals.comparable = false;
         proof.verification = "UNAVAILABLE";
@@ -432,6 +437,6 @@ function evaluateCollection(state, now, freshnessMs) {
   const deferred = Boolean(base.retryAfterAt && base.retryAfterAt > now);
   return Object.freeze({ ...base, fresh: false, stale: base.proven, deferred, due: !deferred && !base.failed });
 }
-module.exports = { FinancialReceiptError, invalidClaim, COLLECTOR, FULL_CHARTS, RECENT_DAYS, AUDIT_DAYS, HISTORY_FRESH_MS, enabled, enter, date, hash, runId,
+module.exports = { FinancialReceiptError, invalidClaim, COLLECTOR, FULL_CHARTS, RECENT_DAYS, AUDIT_DAYS, HISTORY_FRESH_MS, FLOOR, enabled, enter, date, hash, runId,
   planWindows, windowsFor, claimParams, initialCursor, envelope, resultFor, expectedMatches, restoreContinuation, currentTraversal, historyRead, comparisonRange, comparableTotals, earningsTotals,
   beforePage, withinWindow, commitPage, commitChart, completionProof, coverageUpdate, coverageView, evaluateCollection };

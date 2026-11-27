@@ -17,9 +17,9 @@ async function readFanLtv({db,creatorId,rangeKey='30d',now=new Date()}) {
  WHERE c.id=$1 AND c."deletedAt" IS NULL`,creatorId,now);
  const snapshot=row?.snapshot?.version===1?row.snapshot:null;
  const available=Boolean(snapshot),sameSource=Boolean(snapshot&&snapshot.sourceKey===sourceKey(row));
- const pending=!snapshot||!sameSource||row.stage!=='LIVE'||row.dirty||row.due||snapshot.windowDay!==today
-  ||snapshot.proofGeneration!==row.generation||snapshot.throughAt!==row.throughAt.toISOString();
  const coverage=row?await readLiveEarningsCoverage(db,creatorId,now):null;
+ const pending=!snapshot||!sameSource||row.stage!=='LIVE'||row.dirty||row.due||snapshot.windowDay!==today
+  ||snapshot.proofGeneration!==row.generation||snapshot.throughAt!==row.throughAt.toISOString()||coverage?.publishing===true;
  const bounds=displayRangeBounds(range,now),periodAvailable=sameSource&&snapshot.windowDay===today;
  const allTime=snapshot?{...snapshot.ranges.all,medianCents:snapshot.medianCents,
   historyComplete:snapshot.historyComplete,complete:snapshot.historyComplete&&snapshot.ranges.all.attributionComplete}:null;

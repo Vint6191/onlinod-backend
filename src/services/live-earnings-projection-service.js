@@ -59,6 +59,7 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
     const id = hash([creatorId, n.identityKey || event.eventKey || hash(event), event.moneyObservation || n]);
     const observedAt = date(event.moneyObservation?.revisionAt) || eventCapturedAt;
     let reason = money ? null : "EXACT_TRANSACTION_NET_REQUIRED";
+    let coveredGeneration = null, covered = false;
     if (+observedAt > +now + 30_000 || +occurredAt > +now + 30_000 || +occurredAt < +new Date("2016-01-01T00:00:00Z")) reason = "SOURCE_TIME_INVALID";
     const reversal = /refund|chargeback|revers/i.test(String(n.sourceType || n.notificationType || event.eventType || ""));
     const identifiable = /^[A-Za-z0-9_-]{1,180}$/.test(event.moneyObservation?.transactionId || "");
@@ -67,6 +68,7 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
     const blocked = ["SOURCE_TIME_INVALID","TRANSACTION_ID_REQUIRED_FOR_REVERSAL","MONEY_CURRENCY_UNSUPPORTED"].includes(reason);
     if (money && !reason) {
       const previous = await generation.activeEntry(db, creatorId, money.transactionId);
+      const absence = await generation.snapshotAbsence(db,creatorId,money.transactionId,money.occurredAt);
       // Unversioned corrections cannot override a different financial fact.
       const changed =
         previous &&
@@ -76,7 +78,12 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
           +previous.occurredAt !== +money.occurredAt ||
           previous.category !== categoryFor(money.transactionType)
           || (previous.fanOnlyFansUserId && require("./fan-ltv-model").fanId(money.fanOnlyFansUserId) && previous.fanOnlyFansUserId !== money.fanOnlyFansUserId));
-      if (changed && !money.revisionAt) reason = "TRANSACTION_REVISION_REQUIRED";
+      if (absence && money.revisionAt && +observedAt <= +absence.snapshotAt) {
+        coveredGeneration=absence.id;
+        covered=Boolean(absence.publishedAt);
+        if (!covered) reason="SNAPSHOT_PUBLICATION_PENDING";
+      }
+      else if ((changed || absence) && !money.revisionAt) reason = "TRANSACTION_REVISION_REQUIRED";
       else if (changed && +observedAt === +previous.observedAt) reason = "TRANSACTION_REVISION_CONFLICT";
       else if (!previous || +observedAt >= +previous.observedAt) {
         await generation.writeLive(db, {agencyId, creatorId}, {
@@ -98,19 +105,21 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
     }
     if (reason) pending++;
     await db.$executeRawUnsafe(
-      `INSERT INTO "CreatorMoneyObservation"(id,"agencyId","creatorId","transactionId","occurredAt","capturedAt",status,reason,"resolutionBlockedAt","resolutionError")
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO UPDATE SET status=CASE WHEN EXCLUDED.status='APPLIED' THEN 'APPLIED' ELSE "CreatorMoneyObservation".status END,
-      reason=CASE WHEN EXCLUDED.status='APPLIED' THEN NULL ELSE "CreatorMoneyObservation".reason END`,
+      `INSERT INTO "CreatorMoneyObservation"(id,"agencyId","creatorId","transactionId","occurredAt","capturedAt",status,reason,"resolutionBlockedAt","resolutionError","coveredGeneration")
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(id) DO UPDATE SET status=CASE WHEN EXCLUDED.status IN ('APPLIED','COVERED') THEN EXCLUDED.status ELSE "CreatorMoneyObservation".status END,
+      reason=CASE WHEN EXCLUDED.status IN ('APPLIED','COVERED') THEN NULL ELSE "CreatorMoneyObservation".reason END,
+      "coveredGeneration"=CASE WHEN EXCLUDED.status='APPLIED' THEN NULL ELSE COALESCE(EXCLUDED."coveredGeneration","CreatorMoneyObservation"."coveredGeneration") END`,
       id,
       agencyId,
       creatorId,
       money?.transactionId || (/^[A-Za-z0-9_-]{1,180}$/.test(event.moneyObservation?.transactionId || "") ? event.moneyObservation.transactionId : null),
       occurredAt,
       eventCapturedAt,
-      reason ? "PENDING" : "APPLIED",
+      covered ? "COVERED" : reason ? "PENDING" : "APPLIED",
       reason,
       blocked ? now : null,
-      blocked ? reason : null
+      blocked ? reason : null,
+      coveredGeneration
     );
   }
   await db.$executeRawUnsafe(

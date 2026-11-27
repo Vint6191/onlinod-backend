@@ -523,6 +523,7 @@ function billingLine(creator, pricing, now, policy) {
     revenue30dCents: preview?.revenue30dCents == null ? null : Number(preview.revenue30dCents),
     revenueCapturedAt: preview?.revenueCapturedAt ? new Date(preview.revenueCapturedAt).toISOString() : null,
     revenueSource: preview?.revenueSource || null,
+    revenueReason: preview?.revenueReason || null,
     corePriceCents: core,
     aiChatterEnabled: aiEnabled,
     aiChatterPriceCents: prices.aiChatterPriceCents,

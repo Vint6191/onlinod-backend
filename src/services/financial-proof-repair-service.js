@@ -33,31 +33,13 @@ async function ensureFinancialDebt({ db, agencyId, creatorIds, now = new Date(),
     let gapFrom = legacy ? row.throughAt : new Date(Math.max(+row.throughAt, +(row.confirmedThroughAt || row.throughAt)));
     let end = legacy ? asDate(targetAt) : asDate(requiredThroughAt);
     if (legacy) {
-      // A retained, matched FULL comparison is evidence for the empty start of
-      // a day. No rounding of the first payment timestamp can replace it.
-      const [receipt] = await db.$queryRawUnsafe(`SELECT r.windows,r.proof FROM "FinancialReceiptRun" r
-        LEFT JOIN "CreatorFinancialCollectionState" s ON s."creatorId"=r."creatorId"
-        WHERE r."creatorId"=$1 AND r."agencyId"=$2
-          AND (r.generation=$3 OR r.generation=s."baselineGeneration")
-          AND r.proof->>'complete'='true' AND r.windows->0->>'kind'='FULL'
-          AND r.proof->'windows'->0->>'matched'='true' ORDER BY r."updatedAt" DESC LIMIT 1`, row.creatorId, agencyId, row.generation);
-      const verifiedStart = asDate(receipt?.proof?.windows?.[0]?.comparisonFrom || receipt?.windows?.[0]?.comparisonFrom || receipt?.windows?.[0]?.from);
-      const verifiedEnd = asDate(receipt?.windows?.[0]?.to);
-      if (verifiedStart && verifiedEnd && verifiedStart <= row.fromAt && verifiedEnd >= row.fromAt) {
-        fromAt = verifiedStart;
-        if (+fromAt < +row.fromAt) report.repairedStarts++;
-        reason = "FINANCIAL_PROOF_ADOPTION";
-      } else {
-        reason = "FINANCIAL_PROOF_ADOPTION_FULL";
-        // This is a requested verification boundary, not a manufactured proof.
-        // It also keeps a narrower catch-up from consuming the full-scan debt.
-        gapFrom = new Date(row.fromAt); gapFrom.setUTCHours(0, 0, 0, 0);
-      }
-      await db.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v7',true)");
-      await db.$executeRawUnsafe(`UPDATE "CreatorEarningsLedgerProof" SET "fromAt"=$2::timestamp,"confirmedThroughAt"="throughAt",
-        "proofPolicyVersion"=$3 WHERE "creatorId"=$1 AND "proofPolicyVersion"=$4`, row.creatorId, fromAt.toISOString(),
-      FINANCIAL_PROOF_POLICY_VERSION, row.proofPolicyVersion);
-      report.adopted++;
+      // A new policy is earned by reconstruction/publication. Never relabel an
+      // old generation as current merely because its timestamp is recent.
+      // The maintenance lane first attempts an offline rebuild from receipts.
+      const adoption=require("./financial-snapshot-adoption-service");
+      if (!await adoption.pendingOfflineAdoption(db,row.creatorId))
+        report.queued+=await adoption.queueFullVerification(db,{id:row.creatorId,agencyId},now);
+      continue;
     }
     for (const candidate of [row.shortGapTo, row.strandedThrough, row.lostThrough]) {
       const through = asDate(candidate);
@@ -98,7 +80,7 @@ async function inventory({ db, agencyId = null, cursor = "", upperCreatorId = nu
     ORDER BY p."creatorId" LIMIT $5`, agencyId, cursor, upperCreatorId, FINANCIAL_PROOF_POLICY_VERSION, size);
 }
 
-async function runRepairPage({ db = require("../prisma"), runId = "financial-proof-v1", agencyId = null,
+async function runRepairPage({ db = require("../prisma"), runId = "financial-proof-v2", agencyId = null,
   mode = "dry-run", cursor = "", targetAt = new Date(), expectedRevision = null, limit = PAGE } = {}) {
   if (!["dry-run", "apply"].includes(mode) || !/^[a-zA-Z0-9_.:-]{1,100}$/.test(runId)) throw fault("FINANCIAL_REPAIR_INPUT_INVALID");
   const target = asDate(targetAt); if (!target) throw fault("FINANCIAL_REPAIR_TARGET_INVALID");
@@ -151,7 +133,9 @@ async function runRepairPage({ db = require("../prisma"), runId = "financial-pro
 }
 
 async function runSweep({ db = require("../prisma"), now = new Date(), limit = PAGE } = {}) {
-  const result = await runRepairPage({ db, mode: "apply", targetAt: now, limit });
+  const adoption=await require("./financial-snapshot-adoption-service").runSweep({db,limit});
+  if (!adoption.complete) return adoption;
+  const result = await runRepairPage({ db, runId:"financial-proof-v2", mode: "apply", targetAt: now, limit });
   return { ok: true, processed: result.pageVisited, status: result.status,
     completionMeaning: "ADOPTION_ONLY_PROVIDER_RECOVERY_MUST_COMPLETE", counts: result.counts };
 }

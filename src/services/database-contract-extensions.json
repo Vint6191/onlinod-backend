@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v32_financial_proof_maintenance_catalog",
+  "version": "nod_current_v33_financial_snapshot_reconciliation",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -124,6 +124,10 @@
     {
       "migration": "20261127000000_financial_proof_maintenance_catalog",
       "checksum": "d70463477195266e9fbd199e4f0083c54832f8b347d6af6ded1217bf7b69d91f"
+    },
+    {
+      "migration": "20261127010000_financial_snapshot_reconciliation",
+      "checksum": "df47eb8ad8e44066e868d1c02108e551f69f96667622d44b83c6eafe77e7739f"
     }
   ],
   "extension": {
@@ -3177,6 +3181,30 @@
         "udt_name": "int4",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "proofPolicyVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "1"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "canonicalRepairCursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "canonicalRepairThroughId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
       }
     ],
     "enums": [],
@@ -3200,12 +3228,12 @@
       {
         "name": "onlinod_earnings_writer_fence_v6",
         "args": "",
-        "hash": "5a12c26073a295801d59990b9ee5b32c5edf5be529d40d05d2674c1885b5166d"
+        "hash": "4c011e18f51ef353b55ad50e4b9e9baf3a5d97928dfab61ed5f85b23615c1e1d"
       },
       {
         "name": "onlinod_earnings_writer_fence_v7",
         "args": "",
-        "hash": "77265a0a834dc6418ad0a236543672d9721468f05fca614f96b4282b2ffd559c"
+        "hash": "7fb2b5ce196ecf0f0ac9217bafbbe7d6daa0c28b5956d2129bf19f1f030e87fc"
       },
       {
         "name": "onlinod_enforce_provider_gate_waiter_registration",
@@ -3474,7 +3502,7 @@
         "type": "c",
         "deferrable": false,
         "deferred": false,
-        "definition": "CHECK ((phase = ANY (ARRAY['COPY'::text, 'APPLY'::text, 'RESOLVE'::text, 'READY'::text])))"
+        "definition": "CHECK ((phase = ANY (ARRAY['COPY'::text, 'APPLY'::text, 'WITHDRAW'::text, 'RESOLVE'::text, 'READY'::text])))"
       },
       {
         "table": "CreatorEarningsGeneration",
@@ -3490,7 +3518,7 @@
         "type": "c",
         "deferrable": false,
         "deferred": false,
-        "definition": "CHECK ((state = ANY (ARRAY['BUILDING'::text, 'READY'::text, 'ACTIVE'::text, 'RETIRED'::text])))"
+        "definition": "CHECK ((state = ANY (ARRAY['BUILDING'::text, 'READY'::text, 'REPAIRING'::text, 'ACTIVE'::text, 'RETIRED'::text])))"
       },
       {
         "table": "CreatorEarningsGenerationDay",
@@ -4331,6 +4359,22 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK (((kind <> 'INSTRUCTION_CONTINUATION'::text) OR (\"instructionManifest\" IS NOT NULL)))"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_proofPolicyVersion_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"proofPolicyVersion\" >= 1))"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_canonical_repair_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((state <> 'REPAIRING'::text) OR ((\"publishedAt\" IS NULL) AND (\"canonicalRepairThroughId\" IS NOT NULL))))"
       }
     ],
     "indexes": [
@@ -4422,7 +4466,7 @@
         "keys": "17 1",
         "options": "0 0",
         "expressions": null,
-        "predicate": "(state = ANY (ARRAY['BUILDING'::text, 'READY'::text]))"
+        "predicate": "(state = ANY (ARRAY['BUILDING'::text, 'READY'::text, 'REPAIRING'::text]))"
       },
       {
         "table": "CreatorEarningsGeneration",
@@ -4440,7 +4484,7 @@
         "keys": "3",
         "options": "0",
         "expressions": null,
-        "predicate": "(state = ANY (ARRAY['BUILDING'::text, 'READY'::text]))"
+        "predicate": "(state = ANY (ARRAY['BUILDING'::text, 'READY'::text, 'REPAIRING'::text]))"
       },
       {
         "table": "CreatorEarningsGeneration",

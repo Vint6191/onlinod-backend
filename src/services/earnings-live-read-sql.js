@@ -1,13 +1,14 @@
 "use strict";
-const { FINANCIAL_PROOF_POLICY_VERSION, uncoveredReceiverDebtSql } = require("./earnings-coverage-service");
+const { FINANCIAL_PROOF_POLICY_VERSION, uncoveredReceiverDebtSql, financialPublicationPendingSql } = require("./earnings-coverage-service");
 // Arguments are source-owned SQL aliases/parameter positions, never user input.
 function ledgerAuthoritySql(source) {
   return `  ledger_authority AS MATERIALIZED (
     SELECT c.id,p."fromAt",p."throughAt",p."proofPolicyVersion",p."activeGeneration",l."lastDeliveredAt",
-      CASE WHEN p."proofPolicyVersion"=${FINANCIAL_PROOF_POLICY_VERSION} THEN p."confirmedThroughAt" ELSE p."throughAt" END AS "confirmedThroughAt",
+      ${financialPublicationPendingSql('c.id')} AS publishing,
+      CASE WHEN p."proofPolicyVersion">=1 THEN p."confirmedThroughAt" ELSE p."throughAt" END AS "confirmedThroughAt",
       EXISTS(SELECT 1 FROM "CreatorRecoveryIntent" i WHERE i."creatorId"=c.id AND i.stream='financial' AND i.status<>'COMPLETE') AS recovering,
       EXISTS(SELECT 1 FROM "CreatorRecoveryIntent" i WHERE i."creatorId"=c.id AND i.stream='financial' AND i.status='STOPPED') AS "recoveryStopped",
-      CASE WHEN l."shortGapTo">GREATEST(p."throughAt",CASE WHEN p."proofPolicyVersion"=${FINANCIAL_PROOF_POLICY_VERSION} THEN p."confirmedThroughAt" END)
+      CASE WHEN l."shortGapTo">GREATEST(p."throughAt",CASE WHEN p."proofPolicyVersion">=1 THEN p."confirmedThroughAt" END)
         THEN l."shortGapFrom" ELSE NULL END AS "shortGapFrom",
       EXISTS(SELECT 1 FROM "CreatorRealtimeSession" s WHERE s."creatorId"=c.id AND ${uncoveredReceiverDebtSql()}) AS undelivered,
       EXISTS(SELECT 1 FROM "CreatorMoneyObservation" m WHERE m."creatorId"=c.id AND m.status='PENDING'
@@ -20,7 +21,7 @@ function coverageThroughSql() {
   return `GREATEST(a."throughAt",a."confirmedThroughAt")`;
 }
 function freshSql(now) {
-  return `(a."proofPolicyVersion"=${FINANCIAL_PROOF_POLICY_VERSION} AND NOT a.recovering AND NOT a.unresolved
+  return `(a."proofPolicyVersion"=${FINANCIAL_PROOF_POLICY_VERSION} AND NOT a.publishing AND NOT a.recovering AND NOT a.unresolved
     AND NOT a.undelivered AND a."shortGapFrom" IS NULL
     AND ${coverageThroughSql()}>=(${now}::timestamptz AT TIME ZONE 'UTC')-interval '3 minutes')`;
 }
@@ -82,7 +83,7 @@ async function readLiveEarningsCoverage(db, creatorId, now) {
   const [row] = await db.$queryRawUnsafe(
     `WITH source AS (SELECT id,"agencyId" FROM "CreatorAccount" WHERE id=$1 AND "deletedAt" IS NULL),
     ${ledgerAuthoritySql("source")} SELECT a."fromAt",${coverageThroughSql()} AS "throughAt",${freshSql("$2")} AS fresh,
-      a."proofPolicyVersion",a."activeGeneration",a.recovering,a."recoveryStopped",a.unresolved,a.undelivered,a."shortGapFrom",
+      a."proofPolicyVersion",a."activeGeneration",a.publishing,a.recovering,a."recoveryStopped",a.unresolved,a.undelivered,a."shortGapFrom",
       ${coverageThroughSql()} AS "sourceObservedAt",pg_current_snapshot()::text AS "snapshotRevision"
     FROM ledger_authority a`,
     creatorId,

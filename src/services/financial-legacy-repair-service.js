@@ -5,40 +5,54 @@
 const { createHash } = require("node:crypto");
 const { lockCreatorFacts } = require("./creator-fact-write-authority");
 const PAGE = 100;
-async function repairPage({ db, agencyId, creatorId, afterId = "", now }) {
+async function repairPage({ db, agencyId, creatorId, afterId = "", throughId = null, repairingGenerationId = null, now }) {
   // A verified snapshot applies canonical pages before its final pointer swap.
   // Never restore those pages from the preceding active generation in between.
   // The caller holds the same earnings lock as preparePage/publish/live.
-  const builds = await db.$queryRawUnsafe(`SELECT g.id,
-      EXISTS(SELECT 1 FROM "FinancialReceiptRun" r JOIN "JobInstance" j ON j.id=r."jobId"
-        JOIN "AnalyticsPublication" p ON p."jobId"=j.id AND p."agencyId"=g."agencyId" AND p."creatorId"=g."creatorId"
-        WHERE r.id=g."runId" AND r."creatorId"=g."creatorId" AND r."agencyId"=g."agencyId"
-          AND j.status='PUBLISHING' AND j.params->>'collectionGeneration'=r.generation
-          AND p.state='PENDING' AND p.payload->>'scanRunId'=r.generation) AS pending
-    FROM "CreatorEarningsGeneration" g WHERE g."creatorId"=$1 AND g."agencyId"=$2
-      AND g.state IN ('BUILDING','READY') ORDER BY g.id LIMIT 10`, creatorId, agencyId);
-  if (builds.some(row => row.pending)) return { waiting: true, processed: 0, complete: false, afterId, reason: "FINANCIAL_PUBLICATION_IN_PROGRESS" };
-  if (builds.length) await db.$executeRawUnsafe(`UPDATE "CreatorEarningsGeneration" SET state='RETIRED',"retiredAt"=$2
-    WHERE id=ANY($1::text[]) AND state IN ('BUILDING','READY')`, builds.map(row=>row.id), now);
-  if (builds.length === 10) return { waiting: true, processed: 0, complete: false, afterId, reason: "FINANCIAL_ORPHAN_GENERATIONS_RETIRING" };
+  if (!repairingGenerationId) {
+    const generations=require("./earnings-generation-service");
+    const builds = await db.$queryRawUnsafe(`SELECT g.id,g.state,${generations.unpublishedGenerationOwnedSql()} AS pending
+      FROM "CreatorEarningsGeneration" g WHERE g."creatorId"=$1 AND g."agencyId"=$2
+        AND g.state IN ('BUILDING','READY','REPAIRING') ORDER BY g.id LIMIT 1`, creatorId, agencyId);
+    const build=builds[0];
+    if (build?.state!=="REPAIRING" && build?.pending) return { waiting: true, processed: 0, complete: false, afterId, reason: "FINANCIAL_PUBLICATION_IN_PROGRESS" };
+    if (build) {
+      const retired=await generations.retireUnpublished(db,build.id);
+      if (retired?.state==="REPAIRING") {
+        const restored=await generations.repairUnpublishedPage(db,build.id);
+        return { waiting:true,processed:restored.processed,complete:false,afterId,reason:"FINANCIAL_CANONICAL_REPAIR_IN_PROGRESS" };
+      }
+    }
+  }
   await lockCreatorFacts(db, agencyId, creatorId);
   const rows = await db.$queryRawUnsafe(`SELECT f.*,
       COALESCE(e."netCents",l."netCents") AS "verifiedNet",COALESCE(e.status,l.status) AS "verifiedStatus",
       COALESCE(e.category,l.category) AS "verifiedCategory",
       COALESCE(e."grossCents",l."grossCents") AS "verifiedGross",
       COALESCE(e."occurredAt",l."occurredAt") AS "verifiedOccurredAt",
-      COALESCE(e."observedAt",l."observedAt") AS "verifiedObservedAt"
+      COALESCE(e."observedAt",l."observedAt") AS "verifiedObservedAt",
+      active."snapshotAt" AS "activeSnapshotAt",active."fromAt" AS "activeFromAt",active."throughAt" AS "activeThroughAt",
+      active."fullScan" AS "activeFullScan",active."publishedAt" AS "activePublishedAt",active."proofPolicyVersion" AS "activeProofPolicyVersion"
     FROM "CreatorFinancialTransaction" f
     LEFT JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=f."creatorId" AND p."agencyId"=f."agencyId"
     LEFT JOIN "CreatorEarningsGenerationEntry" e ON e.generation=p."activeGeneration" AND e."transactionId"=f."externalTransactionId"
+    LEFT JOIN "CreatorEarningsGeneration" active ON active.id=p."activeGeneration"
     LEFT JOIN "CreatorEarningsLedgerEntry" l ON p."activeGeneration" IS NULL AND l."creatorId"=f."creatorId"
       AND l."agencyId"=f."agencyId" AND l."transactionId"=f."externalTransactionId"
-    WHERE f."agencyId"=$1 AND f."creatorId"=$2 AND f.id>$3 ORDER BY f.id LIMIT $4`, agencyId, creatorId, afterId, PAGE);
+    WHERE f."agencyId"=$1 AND f."creatorId"=$2 AND f.id>$3 AND ($5::text IS NULL OR f.id<=$5)
+    ORDER BY f.id LIMIT $4`, agencyId, creatorId, afterId, PAGE, throughId);
   if (!rows.length) return { processed: 0, complete: true, afterId };
-  const values = rows.map(row => ({ id: row.id, transactionId: row.externalTransactionId,
+  // Absence from the current ledger is expected for a withdrawn FULL member.
+  // Keep its snapshot revision fence; replacing it with an unverified fact at
+  // `now` would reject a valid later provider revision between those clocks.
+  const values = rows.filter(row=>!(row.verifiedNet==null && row.transactionStatus==="superseded"
+    && row.reasonCode==="VERIFIED_SNAPSHOT_ABSENT" && row.activeFullScan && row.activePublishedAt
+    && row.activeProofPolicyVersion===require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION
+    && row.sourceUpdatedAt && row.sourceUpdatedAt<=row.activeSnapshotAt && row.occurredAt>=row.activeFromAt && row.occurredAt<=row.activeThroughAt))
+    .map(row => ({ id: row.id, transactionId: row.externalTransactionId,
     status: row.verifiedStatus || "unverified", net: row.verifiedNet == null ? null : Number(row.verifiedNet),
     gross: row.verifiedGross == null ? null : Number(row.verifiedGross),
-    occurredAt: row.verifiedOccurredAt || row.occurredAt, observedAt: row.verifiedObservedAt || now,
+    occurredAt: row.verifiedOccurredAt || row.occurredAt, observedAt: row.verifiedObservedAt || (repairingGenerationId?null:now),
     reason: row.verifiedNet == null ? "LEGACY_FINANCIAL_UNVERIFIED" : row.verifiedGross == null ? "GROSS_UNAVAILABLE" : null }));
   const unverifiedValues=values.filter(row=>row.reason==="LEGACY_FINANCIAL_UNVERIFIED");
   const input = JSON.stringify(unverifiedValues);
@@ -80,7 +94,7 @@ async function repairPage({ db, agencyId, creatorId, afterId = "", now }) {
     sales.push(...restored.SALE.map(id=>({id})));tips.push(...restored.TIP.map(id=>({id})));
   }
   const unverified = unverifiedValues.map(row => ({
-    id: createHash("sha256").update(JSON.stringify([creatorId,row.transactionId,"legacy-financial-repair-172"])).digest("hex"),
+    id: createHash("sha256").update(JSON.stringify([creatorId,row.transactionId,"legacy-financial-repair-172",...(repairingGenerationId?[repairingGenerationId]:[])])).digest("hex"),
     transactionId: row.transactionId, occurredAt: row.occurredAt,
   }));
   if (unverified.length) {

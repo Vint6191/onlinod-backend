@@ -80,7 +80,7 @@ async function processRequest({db,item,ownerToken}) {
     const prior=request.jobId?await tx.jobInstance.findUnique({where:{id:request.jobId},select:{status:true,lastError:true,params:true}}):null;
     const attempts=request.targetId===target.id?request.attempts:0;
     if(attempts>=MAX_ATTEMPTS || (request.targetId===target.id && prior?.status==="CANCELLED")) {
-      await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v7',true)");
+      await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v8',true)");
       await tx.$executeRawUnsafe(`UPDATE "CreatorMoneyObservation" SET "resolutionBlockedAt"=$2,"resolutionError"=$3 WHERE id=$1`,target.id,now,prior?.status==="CANCELLED"?"RESOLUTION_CANCELLED":prior?.lastError||"RESOLUTION_ATTEMPTS_EXHAUSTED");
       return wait("RESOLUTION_REVIEW_REQUIRED",1000);
     }

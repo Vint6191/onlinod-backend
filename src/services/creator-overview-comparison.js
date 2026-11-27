@@ -46,7 +46,8 @@ function financialRangeCoverage({ current, coverage, range, now }) {
   const ready = Boolean(current?.ready && current.generation && from && through
     && from <= requested.startAt && through >= requested.endDay);
   const reason = !current?.ready || !coverage ? "NO_BASELINE"
-    : coverage.proofPolicyVersion === 0 ? "POLICY_ADOPTION_REQUIRED"
+    : coverage.proofPolicyVersion !== require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION ? "POLICY_ADOPTION_REQUIRED"
+    : coverage.publishing ? "FINANCIAL_PUBLICATION_PENDING"
     : coverage.recoveryStopped ? "RECOVERY_STOPPED"
     : coverage.recovering ? "RECOVERY_PENDING"
     : coverage.unresolved ? "UNRESOLVED_MONEY"

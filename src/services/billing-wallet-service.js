@@ -121,7 +121,7 @@ async function readRevenueWindow({ db, creatorIds, now }) {
       provenUsableUnits: row.days, freshUsableUnits: row.fresh, now });
     return [creatorId, { revenue30dCents: row.cents, capturedAt: asDate(row.captured) || endDay,
       source: state.fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
-      fresh: state.fresh, collectionState: stateVocabulary(state), complete: state.complete,
+      fresh: state.fresh, collectionState: stateVocabulary(state), reason: row.staleReason || (state.fresh ? null : "STALE_SNAPSHOT"), complete: state.complete,
       proven: state.proven, stale: state.stale, due: state.due, deferred: state.deferred }];
   }));
 }
@@ -148,7 +148,7 @@ function pricingFromRevenue({ profile, revenue, policy }) {
       "A complete earnings ledger for the previous 30 closed UTC days is required before starting or renewing this subscription",
       "BILLING_EARNINGS_30D_UNAVAILABLE",
       409,
-      { revenueCapturedAt: revenue?.capturedAt || null },
+      { revenueCapturedAt: revenue?.capturedAt || null, revenueReason: revenue?.reason || "EARNINGS_RANGE_UNAVAILABLE" },
     );
   }
 
@@ -170,6 +170,7 @@ function pricingFromRevenue({ profile, revenue, policy }) {
     revenue30dCents: revenue.revenue30dCents,
     revenueCapturedAt: revenue.capturedAt,
     revenueSource: revenue.source,
+    revenueReason: null,
     corePriceCents,
     aiChatterEnabled,
     aiChatterPriceCents,
@@ -202,6 +203,7 @@ function pricingPreviewFromRevenue({ profile, revenue, policy }) {
     revenue30dCents: normalized.revenue30dCents,
     revenueCapturedAt: normalized.capturedAt || null,
     revenueSource: normalized.source || "UNAVAILABLE",
+    revenueReason: normalized.reason || "EARNINGS_RANGE_UNAVAILABLE",
     corePriceCents,
     aiChatterEnabled,
     aiChatterPriceCents,

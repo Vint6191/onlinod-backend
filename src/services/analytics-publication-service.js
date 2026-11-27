@@ -238,7 +238,8 @@ async function financialUnit(db, job, row, now) {
   const proof = await require("./financial-receipt-authority").completionProof(db, job);
   if (!proof.complete) return save(db, row, { proof: { receiptRunId: proof.row?.id || null, complete: false }, cursor: {}, stage: "FINALIZE" }, now);
   const built = await require("./earnings-generation-service").preparePage(db, { ...job, financialSourceDeviceId: row.deviceId }, proof.row);
-  return save(db, row, { proof: { receiptRunId: proof.row.id, complete: true, ledgerGeneration: built.generation || "UNSUPPORTED" },
+  return save(db, row, { proof: { receiptRunId: proof.row.id, complete: true, ledgerGeneration: built.generation || "UNSUPPORTED",
+    ledgerProofPolicyVersion:require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION },
     cursor: {}, stage: built.ready || built.unsupported ? "FINALIZE" : "FINANCIAL_ROWS" }, now);
 }
 
@@ -347,8 +348,10 @@ async function runAnalyticsPublicationUnit({ db, publicationId, claim = null }) 
         return { publicationPending: true, inputChanged: true, job: { id: job.id, status: "PUBLISHING" } };
       }
     }
-    // Upgrade already-accepted V19 finalizers through the same bounded build.
-    if (job.jobKey === "financial_transactions_scan" && row.stage === "FINALIZE" && !row.proof?.ledgerGeneration) {
+    // Resume already-accepted finalizers through the current bounded build.
+    // A former READY checkpoint did not reconcile omitted membership.
+    if (job.jobKey === "financial_transactions_scan" && row.stage === "FINALIZE"
+      && (!row.proof?.ledgerGeneration || row.proof.ledgerProofPolicyVersion!==require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION)) {
       const receipt = await require("./financial-receipt-authority").completionProof(tx, job);
       if (receipt.complete) {
         await financialUnit(tx, job, row, now);

@@ -1,5 +1,6 @@
 "use strict";
 const c = require("./common");
+const { pruneDialogHistory } = require("./garbage-collection");
 const THREAD_BYTES = 16384,
   MESSAGE_OVERHEAD = 1536,
   RECEIPT_BYTES = 4096,
@@ -213,27 +214,11 @@ class DialogRepository {
       return this.state(ctx, scope, thread);
     });
   }
-  async prune(ctx) {
+  async prune(ctx, { skipLocked = false } = {}) {
     return c.transaction(this.db, async (tx) => {
-      await c.one(tx, "SELECT scope_id FROM dialog_archive_scope WHERE scope_id=$1 FOR UPDATE", ctx.scopeId);
-      const receipts = await c.rows(
-        tx,
-        "DELETE FROM dialog_archive_receipt WHERE (scope_id,command_id) IN (SELECT scope_id,command_id FROM dialog_archive_receipt WHERE scope_id=$1 AND expires_at<now() ORDER BY expires_at LIMIT 64) RETURNING command_id",
-        ctx.scopeId
-      );
-      const pages = await c.rows(
-        tx,
-        "DELETE FROM dialog_archive_page WHERE (scope_id,dialog_id,episode,cursor) IN (SELECT scope_id,dialog_id,episode,cursor FROM dialog_archive_page WHERE scope_id=$1 AND created_at<now()-interval '2 days' ORDER BY created_at LIMIT 64) RETURNING cursor",
-        ctx.scopeId
-      );
-      const freed = (receipts.length + pages.length) * RECEIPT_BYTES;
-      if (freed)
-        await c.exec(
-          tx,
-          "UPDATE dialog_archive_scope SET used_bytes=GREATEST(0,used_bytes-$2),status=CASE WHEN used_bytes-$2<quota_bytes-16384 THEN 'ACTIVE' ELSE status END WHERE scope_id=$1",
-          ctx.scopeId,
-          freed
-        );
+      const locked = await c.one(tx, `SELECT scope_id FROM dialog_archive_scope WHERE scope_id=$1 FOR UPDATE${skipLocked ? " SKIP LOCKED" : ""}`, ctx.scopeId);
+      if (!locked) return { skipped: true, receipts: 0, pages: 0, freedBytes: 0 };
+      return pruneDialogHistory(tx, ctx.scopeId);
     });
   }
   async getStatus(ctx) {
@@ -339,24 +324,7 @@ class DialogRepository {
         }
         let thread = await this.thread(ctx, dialogId, tx);
         const f = input.frontier;
-        const expiredReceipts = await c.rows(
-          tx,
-          "DELETE FROM dialog_archive_receipt WHERE (scope_id,command_id) IN (SELECT scope_id,command_id FROM dialog_archive_receipt WHERE scope_id=$1 AND expires_at<now() ORDER BY expires_at LIMIT 32) RETURNING command_id",
-          ctx.scopeId
-        );
-        const expiredPages = await c.rows(
-          tx,
-          "DELETE FROM dialog_archive_page WHERE (scope_id,dialog_id,episode,cursor) IN (SELECT scope_id,dialog_id,episode,cursor FROM dialog_archive_page WHERE scope_id=$1 AND created_at<now()-interval '2 days' ORDER BY created_at LIMIT 32) RETURNING cursor",
-          ctx.scopeId
-        );
-        const reclaimed = (expiredReceipts.length + expiredPages.length) * RECEIPT_BYTES;
-        if (reclaimed)
-          await c.exec(
-            tx,
-            "UPDATE dialog_archive_scope SET used_bytes=GREATEST(0,used_bytes-$2) WHERE scope_id=$1",
-            ctx.scopeId,
-            reclaimed
-          );
+        await pruneDialogHistory(tx, ctx.scopeId, 32);
         if (f) {
           c.text(f.episode);
           if (f.storageEpoch) c.check(f.storageEpoch === scope.epoch, "HISTORY_INPUT_CONFLICT");

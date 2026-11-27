@@ -25,14 +25,24 @@ async function processPage({ db, item, ownerToken }) {
           AND r.generation IS DISTINCT FROM s."baselineGeneration" AND r.generation IS DISTINCT FROM s."lastCatchupGeneration"))
         AND NOT EXISTS(SELECT 1 FROM "JobInstance" j WHERE j.id=r."jobId" AND j.params->>'collectionGeneration'=r.generation
           AND j.status IN ('SCHEDULED','CLAIMED','PAUSED','PUBLISHING'))
+        AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" g JOIN "SystemSetting" s
+          ON s.key='repair:financial-snapshot:v2' AND s.value->'current'->>'generationId'=g.id
+          WHERE g."runId"=r.id AND g.state IN ('BUILDING','READY','REPAIRING','RETIRED') AND s."updatedAt">clock_timestamp()-interval '1 day')
       ORDER BY r."createdAt",r.id LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, item.agencyId, item.creatorId, cutoff);
     owned(await work.lockDomainWorkClaimForCommit({ db: tx, item, ownerToken }));
     if (await pauseDeletedAgencyProjection({ db: tx, lifecycle, item, ownerToken })) return { waiting: true, deleted: 0 };
     if (!run) {
       const next = await tx.financialReceiptRun.findFirst({ where: { agencyId: item.agencyId, creatorId: item.creatorId, compactedAt: null, createdAt: { gte: cutoff } }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], select: { createdAt: true } });
-      if (next) owned(await work.yieldDomainWorkClaim({ db: tx, item, ownerToken, availableAt: new Date(Math.max(+now + 1000, +next.createdAt + KEEP_MS + 1000)) }));
+      const [protectedRun]=await tx.$queryRawUnsafe(`SELECT s."updatedAt"+interval '1 day' AS "untilAt"
+        FROM "SystemSetting" s JOIN "CreatorEarningsGeneration" g ON g.id=s.value->'current'->>'generationId'
+        JOIN "FinancialReceiptRun" r ON r.id=g."runId"
+        WHERE s.key='repair:financial-snapshot:v2' AND r."agencyId"=$1 AND r."creatorId"=$2
+          AND r."createdAt"<$3 AND g.state IN ('BUILDING','READY','REPAIRING','RETIRED')
+          AND s."updatedAt">clock_timestamp()-interval '1 day'`,item.agencyId,item.creatorId,cutoff);
+      const due=[next&&+next.createdAt+KEEP_MS+1000,protectedRun&&+protectedRun.untilAt+1000].filter(Number.isFinite);
+      if (due.length) owned(await work.yieldDomainWorkClaim({ db: tx, item, ownerToken, availableAt: new Date(Math.max(+now + 1000, Math.min(...due))) }));
       else owned(await work.ackDomainWorkClaim({ db: tx, item, ownerToken }));
-      return { deleted: 0, completed: !next };
+      return { deleted: 0, completed: !due.length };
     }
     await require("./financial-receipt-authority").enter(tx);
     if (!run.detailsRetiredAt) await tx.financialReceiptRun.update({ where: { id: run.id }, data: { detailsRetiredAt: now } });

@@ -23,7 +23,10 @@ const router = express.Router();
 
 function sendError(res, err, fallbackCode = "BILLING_FAILED") {
   const status = Math.max(400, Math.min(599, Number(err?.status || 500) || 500));
-  return res.status(status).json({ ok: false, code: err?.code || fallbackCode, error: String(err?.message || "Billing request failed") });
+  const revenueReasons=["POLICY_ADOPTION_REQUIRED","FINANCIAL_PUBLICATION_PENDING","RECOVERY_PENDING","UNRESOLVED_MONEY",
+    "DELIVERY_PENDING","DELIVERY_GAP","STALE_SNAPSHOT","EARNINGS_RANGE_UNAVAILABLE"];
+  return res.status(status).json({ ok: false, code: err?.code || fallbackCode, error: String(err?.message || "Billing request failed"),
+    ...(err?.code==="BILLING_EARNINGS_30D_UNAVAILABLE" ? {revenueReason:revenueReasons.includes(err.revenueReason)?err.revenueReason:"EARNINGS_RANGE_UNAVAILABLE"} : {}) });
 }
 
 function ownerOnly(req, res, next) {

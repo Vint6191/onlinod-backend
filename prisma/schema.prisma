@@ -6666,6 +6666,7 @@ model CreatorMoneyObservation {
 }
 
 model CreatorEarningsGeneration {
+ proofPolicyVersion Int @default(1)
  mode String @default("SNAPSHOT")
  id String @id
  agencyId String
@@ -6675,6 +6676,8 @@ model CreatorEarningsGeneration {
  state String @default("BUILDING")
  phase String @default("COPY")
  cursor String @default("")
+ canonicalRepairCursor String @default("")
+ canonicalRepairThroughId String?
  fromAt DateTime
  throughAt DateTime
  snapshotAt DateTime

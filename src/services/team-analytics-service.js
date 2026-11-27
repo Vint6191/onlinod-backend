@@ -670,6 +670,30 @@ async function loadMoneyEvidenceStatus({ agencyId, range, allowedCreatorIds = nu
   return { hasUnverifiedFinancialFacts: row?.hasUnverifiedFinancialFacts === true, hasUnknownGross: row?.hasUnknownGross === true };
 }
 
+async function financialPublicationState({ agencyId, allowedCreatorIds = null }) {
+  const scope = normalizedCreatorScope(allowedCreatorIds);
+  if (scope && !scope.length) return { pending: false, revision: "[]" };
+  const { financialPublicationPendingSql } = require("./earnings-coverage-service");
+  // Sample readiness and durable Team revisions in the same SQL snapshot.
+  // A FULL can begin and finish between the surrounding aggregate reads, so
+  // two idle booleans alone do not prove that those reads saw one publication.
+  // Current entity revisions survive delivery retention and canonical rollback.
+  const [row] = await teamScaleQuery("money_publication", `SELECT
+    COALESCE(bool_or(${financialPublicationPendingSql('c.id')}),false) AS pending,
+    COALESCE(jsonb_agg(jsonb_build_array(c.id,COALESCE(e.revision,0)::text,
+      p."activeGeneration",p."proofPolicyVersion") ORDER BY c.id),'[]'::jsonb)::text AS revision
+    FROM "CreatorAccount" c
+    LEFT JOIN "CreatorEntityCurrent" e ON e."creatorId"=c.id AND e."agencyId"=c."agencyId"
+      AND e."entityType"='TEAM' AND e."entityId"=c.id
+    LEFT JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=c.id AND p."agencyId"=c."agencyId"
+    WHERE c."agencyId"=$1 AND c."deletedAt" IS NULL
+      ${scope ? 'AND c.id=ANY($2::text[])' : ''}`, scope ? [String(agencyId), scope] : [String(agencyId)]);
+  if (typeof row?.pending !== "boolean" || typeof row?.revision !== "string") {
+    throw analyticsUnavailable("money_publication");
+  }
+  return row;
+}
+
 function rowNumber(row, key, fallback = 0) {
   return num(row?.[key], fallback);
 }
@@ -1090,6 +1114,9 @@ function responseSummaryFromAggregate(row, source, coverageFrom) {
 async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
   const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   const range = resolveRange(rangeKey, authorityNow);
+  // Enclose coverage as well as aggregates: old ready flags must not be paired
+  // with a first boundary sampled after a concurrently completed publication.
+  const publicationAtStart = includeMoney ? await financialPublicationState({ agencyId, allowedCreatorIds }) : null;
   const [projectionCoverage, historicalCoverage, retentionPolicy, members, moneyRootCoverageStatus, moneyReadSummaryStatus, dialogGenerationStatus, responseRepairStatus] = await Promise.all([
     loadProjectionCoverage({ agencyId }),
     loadHistoricalCoverage({ agencyId }),
@@ -1131,6 +1158,13 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
     loadAudienceCoverageSummarySql({ agencyId, range, rawRange, allowedCreatorIds, includeMoney, exactRawActivity }),
     includeMoney ? loadMoneyEvidenceStatus({ agencyId, range, allowedCreatorIds }) : Promise.resolve({}),
   ]);
+  // Canonical sales/tips and their Team projections are rebuilt in bounded
+  // pages before the earnings generation is published. A drained Team queue
+  // alone cannot certify the intermediate membership as a complete result.
+  const publicationAtEnd = includeMoney && !publicationAtStart.pending
+    ? await financialPublicationState({ agencyId, allowedCreatorIds }) : publicationAtStart;
+  const publicationPending = includeMoney && (publicationAtStart.pending || publicationAtEnd.pending
+    || publicationAtStart.revision !== publicationAtEnd.revision);
 
   const metricsByMember = new Map();
   for (const member of members) metricsByMember.set(String(member.id), emptyMetric());
@@ -1307,12 +1341,14 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
   const moneyCoverage = includeMoney ? {
     ...baseMoneyCoverage,
     status: moneyRootCoverageStatus?.currentReady && classificationUnresolved === 0
-      && !moneyEvidence.hasUnverifiedFinancialFacts && !moneyEvidence.hasUnknownGross ? baseMoneyCoverage.status : "PARTIAL",
+      && !moneyEvidence.hasUnverifiedFinancialFacts && !moneyEvidence.hasUnknownGross
+      && !publicationPending ? baseMoneyCoverage.status : "PARTIAL",
     ...moneyEvidence,
+    financialPublicationPending: publicationPending,
     rootClassification: moneyRootCoverageStatus?.semanticState || moneyRootCoverageStatus?.state || "MISSING",
     unresolvedRootGenerations: classificationUnresolved,
     readSummaryGeneration: moneyReadSummaryStatus?.coverage?.state || "MISSING",
-    readSummaryCurrent: moneyReadSummaryStatus?.ready === true,
+    readSummaryCurrent: moneyReadSummaryStatus?.ready === true && !publicationPending,
     readSummaryOutstanding: moneyReadSummaryStatus?.outstanding,
   } : baseMoneyCoverage;
   const rawDistinctCoverage = coverageState(range, projectionDetail.detailRetainedFrom);

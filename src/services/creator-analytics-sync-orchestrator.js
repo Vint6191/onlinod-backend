@@ -85,6 +85,10 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     // lock as accept/complete; dedupe alone cannot reject obsolete work.
     let currentCollectorState = await loadCollectorPlanningState(tx, collectorType, creatorId, collectorState);
     now = await dbAuthorityNow({ db: tx, fallbackNow: now });
+    const recovery = collectorType === COLLECTOR_TYPES.FINANCIAL && params.recoveryIntentId
+      ? await tx.creatorRecoveryIntent.findFirst({ where: { id: params.recoveryIntentId, creatorId, agencyId,
+        stream: "financial", status: { not: "COMPLETE" } } }) : null;
+    const fullFinancialRepair = recovery?.reason === "FINANCIAL_PROOF_ADOPTION_FULL";
     if (collectorType === COLLECTOR_TYPES.CAMPAIGNS) currentCollectorState = await recoverPublishedMembershipProof({ db: tx, state: currentCollectorState, now });
     const initial = lifecycleParams(params);
     const baseline = collectorPlanningProofAt(collectorType, "full", currentCollectorState, now);
@@ -94,7 +98,7 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
       baselineReady=Boolean(proof);
     }
     if (initial && baselineReady) return { created: false, reason: "baseline_verified" };
-    if (!initial && !baselineReady) return { created: false, reason: "baseline_unverified" };
+    if (!initial && !baselineReady && !fullFinancialRepair) return { created: false, reason: "baseline_unverified" };
     if (!params.recoveryIntentId && catchupFreshnessMs != null && !collectorCatchupDue(collectorType, currentCollectorState, catchupFreshnessMs, now)) {
       return { created: false, reason: "fresh" };
     }
@@ -103,10 +107,6 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     currentCollectorState = retry.state;
     if (retry.deferred || retry.terminal) return { created: false, reason: retry.deferred ? retry.reason || "deferred" : "failed_terminal", retryAfterAt: retry.retryAfterAt };
 
-    const recovery = collectorType === COLLECTOR_TYPES.FINANCIAL && params.recoveryIntentId
-      ? await tx.creatorRecoveryIntent.findFirst({ where: { id: params.recoveryIntentId, creatorId, agencyId,
-        stream: "financial", status: { not: "COMPLETE" } } }) : null;
-    const fullFinancialRepair = recovery?.reason === "FINANCIAL_PROOF_ADOPTION_FULL";
     params = { ...params, ...buildCollectionCommand({ collectorType, collectionMode: initial || fullFinancialRepair ? "full" : "catchup", reason: params.reason, now }) };
     if (fullFinancialRepair) { params.financialMode = "full"; delete params.financialFrontierVersion; }
     let collectionPlan = null;
@@ -394,6 +394,11 @@ function retryDisposition(state, now = new Date()) {
 }
 
 async function collectorRetryDisposition({ db, collectorType, state, agencyId, creatorId, now, recoveryIntentId = null }) {
+  if (collectorType===COLLECTOR_TYPES.FINANCIAL && recoveryIntentId) {
+    const upgrade=await db.creatorRecoveryIntent.findFirst({where:{id:recoveryIntentId,creatorId,agencyId,
+      stream:"financial",reason:"FINANCIAL_PROOF_ADOPTION_FULL",status:"PENDING",jobId:null}});
+    if(upgrade)return {state,deferred:false,terminal:false,retryAfterAt:null};
+  }
   // A completed-but-partial notification traversal is a finite outcome. A
   // missing retry date must not become permission to start again from HEAD.
   const partialNotification = collectorType === COLLECTOR_TYPES.NOTIFICATIONS
@@ -484,10 +489,10 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     if (candidateRetryAt && +candidateRetryAt > +now && (!nextRetryAt || +candidateRetryAt < +nextRetryAt)) nextRetryAt = candidateRetryAt;
     if (retry.terminal) blocked.push({ stream, reason: "failed_terminal", code: states[stream]?.lastErrorCode || "COLLECTOR_REPAIR_REQUIRED" });
     if (retry.deferred || retry.terminal) { skipped.push(`${stream}:${retry.terminal ? "failed_terminal" : retry.reason || "deferred"}`); continue; }
-    if (!readiness[stream]) { skipped.push(`${stream}:baseline_unverified`); continue; }
     const intent = intents[stream];
     if (!intent) { skipped.push(`${stream}:live_no_recovery_debt`); continue; }
     const fullFinancialRepair = stream === "financial" && intent.reason === "FINANCIAL_PROOF_ADOPTION_FULL";
+    if (!readiness[stream] && !fullFinancialRepair) { skipped.push(`${stream}:baseline_unverified`); continue; }
     const jobKey = stream === "notifications" ? NOTIFICATION_JOB_KEY : stream === "financial" ? FINANCIAL_JOB_KEY : CAMPAIGN_JOB_KEY;
     const params = {
       ...buildCollectionCommand({ collectorType, collectionMode:fullFinancialRepair?"full":"catchup", reason:intent.reason, now }),

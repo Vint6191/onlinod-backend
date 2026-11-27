@@ -524,14 +524,16 @@ async function ensureAnalyticsWindowFreshness({
   // A user refresh requests a new verification of the selected period, even
   // when the historical cache is within its ordinary background freshness TTL.
   const normalizedReason = String(reason).toUpperCase();
-  if(normalizedReason === "HOME_INTERACTIVE_REFRESH") {
+  const billingLedger = normalizedReason === "BILLING" && typeof db.$queryRawUnsafe === "function"
+    ? await require("./earnings-live-read-sql").readLiveEarningsCoverage(db,creatorId,currentNow) : null;
+  if(normalizedReason === "HOME_INTERACTIVE_REFRESH" || billingLedger) {
     // Home and the model's manual financial control share the same planning
     // authority, including paused jobs and commands already being published.
     const scheduled=await require("./financial-transaction-scan-control-service").startManualFinancialTransactionScan({
       db,creator:{id:creatorId,agencyId},now:currentNow,
     });
     const created=scheduled.action==="created";
-    return {ok:true,created:Number(created),reused:created?0:1,jobs:scheduled.job?[scheduled.job]:[],windows:1,dueDays:0,deferredDays:0,staleDays:0,fresh:false};
+    return {ok:true,displayRangeKey,startDay:from,endDay:to,created:Number(created),reused:created?0:1,jobs:scheduled.job?[scheduled.job]:[],windows:1,dueDays:0,deferredDays:0,staleDays:0,fresh:false};
   }
   const evaluatedDays = days.map((day) => ({ day, state: coverageState(byDay.get(dateKey(day)), day, currentNow,
     forceDay(normalizedReason, day, currentNow, force)) }));

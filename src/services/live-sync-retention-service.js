@@ -6,7 +6,7 @@ const options={maxWait:1500,timeout:5000,deadlineMs:7000,lockTimeoutMs:1000,stat
 // SKIP LOCKED and bounded deletes keep active devices/publications independent.
 async function page(db,kind) {
   return runRootCommit(db,async({tx})=>{
-    await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v7',true)");
+    await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v8',true)");
     let result;
     if(kind==="receipts") result=await tx.$executeRawUnsafe(`WITH old AS (
       SELECT r."sessionId",r.seq FROM "CreatorRealtimeReceipt" r JOIN "CreatorRealtimeSession" s ON s.id=r."sessionId"
@@ -43,20 +43,28 @@ async function page(db,kind) {
         AND "capturedSeq"<="ackedSeq" AND NOT loss ORDER BY "updatedAt",id LIMIT $1 FOR UPDATE SKIP LOCKED)
       UPDATE "CreatorRealtimeSession" s SET "retiredAt"=clock_timestamp() FROM old WHERE s.id=old.id`,PAGE);
     else if(kind==="abandoned") {
+      const generations=require("./earnings-generation-service");
+      const eligible=`(g.state='REPAIRING' OR (g.state IN ('BUILDING','READY')
+        AND g."createdAt"<clock_timestamp()-interval '1 day' AND NOT ${generations.unpublishedGenerationOwnedSql()}))`;
       const [g]=await tx.$queryRawUnsafe(`SELECT g.id,g."creatorId" FROM "CreatorEarningsGeneration" g
-        WHERE state IN ('BUILDING','READY') AND "createdAt"<clock_timestamp()-interval '1 day'
-        AND NOT EXISTS(SELECT 1 FROM "FinancialReceiptRun" r JOIN "JobInstance" j ON j.id=r."jobId"
-          WHERE r.id=g."runId" AND j.status IN ('SCHEDULED','CLAIMED','PUBLISHING','PAUSED') AND j.params->>'collectionGeneration'=r.generation)
-        ORDER BY "createdAt",id LIMIT 1`);
+        WHERE ${eligible} ORDER BY g."createdAt",g.id LIMIT 1`);
       result=0;
       if(g) {
         const [owner]=await tx.$queryRawUnsafe("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS owned",`live-earnings:${g.creatorId}`);
-        if(owner.owned) result=await tx.$executeRawUnsafe(`UPDATE "CreatorEarningsGeneration" SET state='RETIRED',"retiredAt"=clock_timestamp()
-          WHERE id=$1 AND state IN ('BUILDING','READY')`,g.id);
+        if(owner.owned) {
+          // Candidate discovery is only a hint. A provider/adoption owner may
+          // have resumed before this lock; re-read its durable authority now.
+          const [current]=await tx.$queryRawUnsafe(`SELECT g.id FROM "CreatorEarningsGeneration" g WHERE g.id=$1 AND ${eligible}`,g.id);
+          if(current) {
+            const retired=await generations.retireUnpublished(tx,current.id);
+            if(retired?.state==="REPAIRING") result=Math.max(1,(await generations.repairUnpublishedPage(tx,current.id)).processed);
+            else if(retired?.state==="RETIRED") result=1;
+          }
+        }
       }
     } else if(kind==="legacy") {
       // Legacy tables become unreachable only after the first successful switch.
-      await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v7',true)");
+      await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v8',true)");
       const [p]=await tx.$queryRawUnsafe(`SELECT id,"creatorId" FROM "CreatorEarningsGeneration"
         WHERE "legacyPending" AND "publishedAt" IS NOT NULL ORDER BY "publishedAt",id LIMIT 1 FOR UPDATE SKIP LOCKED`);
       result=0;
@@ -72,7 +80,9 @@ async function page(db,kind) {
     } else if(kind==="generations") {
       const [g]=await tx.$queryRawUnsafe(`SELECT g.* FROM "CreatorEarningsGeneration" g WHERE g.state='RETIRED'
         AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" p WHERE p."activeGeneration"=g.id)
-        AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" b WHERE b."baseGeneration"=g.id AND b.state IN ('BUILDING','READY'))
+        AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" b WHERE b."baseGeneration"=g.id AND b.state IN ('BUILDING','READY','REPAIRING'))
+        AND NOT EXISTS(SELECT 1 FROM "SystemSetting" s WHERE s.key='repair:financial-snapshot:v2'
+          AND s.value->'current'->>'generationId'=g.id AND s."updatedAt">clock_timestamp()-interval '1 day')
         ORDER BY g."retiredAt",g.id LIMIT 1 FOR UPDATE OF g SKIP LOCKED`);
       result=0;
       if(g) {

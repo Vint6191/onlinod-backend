@@ -297,7 +297,8 @@ async function processPage({ db, item, ownerToken }) {
 
 async function financialProjectionState(db, creatorId) {
   const [row] = await db.$queryRawUnsafe(`SELECT
-    EXISTS(SELECT 1 FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty) AS pending,
+    (EXISTS(SELECT 1 FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty)
+      OR ${require("./earnings-coverage-service").financialPublicationPendingSql('$1')}) AS pending,
     NOT (EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1 AND "completedAt" IS NULL)
     OR EXISTS(SELECT 1 FROM "CreatorMediaUsageSourceState" WHERE "creatorId"=$1 AND "factProtocol"=0)
     OR EXISTS(SELECT 1 FROM "MaintenanceLaneState" m WHERE m.key=$2 AND m."completedAt" IS NULL

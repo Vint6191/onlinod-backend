@@ -2,7 +2,18 @@
 
 // Financial proof has its own version, independent of syncPolicyVersion.
 // Version 0 preserves the provider scan, not its old global heartbeat extension.
-const FINANCIAL_PROOF_POLICY_VERSION = 1;
+const FINANCIAL_PROOF_POLICY_VERSION = 2;
+
+// SQL references are source-owned expressions. Canonical fact projections are
+// applied in bounded units before the ledger pointer swap. All secondary money
+// readers share this fence while a replacement is incomplete or still uses
+// the former membership policy; saved amounts remain independently available.
+function financialPublicationPendingSql(creatorId) {
+  return `(EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" fp
+      WHERE fp."creatorId"=${creatorId} AND fp."proofPolicyVersion"<>${FINANCIAL_PROOF_POLICY_VERSION})
+    OR EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" fg
+      WHERE fg."creatorId"=${creatorId} AND (fg.state='REPAIRING' OR (fg."fullScan" AND fg.state IN ('BUILDING','READY')))))`;
+}
 
 // An outstanding sequence is tied to its receiver. Another receiver can close
 // that debt only with independently delivered intervals covering the entire
@@ -22,7 +33,7 @@ function uncoveredReceiverDebtSql(proof = 'p', receiver = 's') {
 
 async function advanceDelivered(db, creatorIds) {
   if (!creatorIds.length) return 0;
-  await db.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v7',true)");
+  await db.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v8',true)");
   // Walk delivered receiver intervals from the proven boundary. An empty
   // receiver cannot acknowledge another receiver's undelivered sequence,
   // including a retired incarnation. A later provider proof can independently
@@ -57,4 +68,4 @@ async function advanceDelivered(db, creatorIds) {
       AND c.frontier>GREATEST(p."throughAt",p."confirmedThroughAt")`, creatorIds, FINANCIAL_PROOF_POLICY_VERSION);
 }
 
-module.exports = { advanceDelivered, FINANCIAL_PROOF_POLICY_VERSION, uncoveredReceiverDebtSql };
+module.exports = { advanceDelivered, FINANCIAL_PROOF_POLICY_VERSION, uncoveredReceiverDebtSql, financialPublicationPendingSql };
