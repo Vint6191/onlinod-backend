@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v31_custom_instruction_continuation",
+  "version": "nod_current_v32_financial_proof_maintenance_catalog",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -120,6 +120,10 @@
     {
       "migration": "20261126040000_custom_instruction_continuation",
       "checksum": "4ac1f22e149937456cad9509c2653f01dd4ae1d8f5426beb2376d1466386b880"
+    },
+    {
+      "migration": "20261127000000_financial_proof_maintenance_catalog",
+      "checksum": "d70463477195266e9fbd199e4f0083c54832f8b347d6af6ded1217bf7b69d91f"
     }
   ],
   "extension": {

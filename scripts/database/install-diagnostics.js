@@ -120,6 +120,13 @@ function diagnosticFor(error) {
     diagnostic.problemCount = problems.length;
     diagnostic.problemKinds = [...new Set(problems.map(value => String(value).split(":")[0]).filter(value =>
       ["tables", "columns", "enums", "views", "functions", "triggers", "constraints", "indexes", "unexpected-table", "control", "BASELINE_REQUIRED", "trigger", "index", "constraint"].includes(value)))];
+    // These identifiers belong to the shared install/startup/readiness contract,
+    // not to database rows. Keep the failing control actionable without logging
+    // arbitrary object names or values returned by the database.
+    const controls = new Set(["topology", "provider", "campaigns", "campaign_dispatch", "maintenance_dispatch"]);
+    const controlProblems = [...new Set(problems.filter(value => typeof value === "string" && value.startsWith("control:"))
+      .map(value => value.slice("control:".length)).filter(value => controls.has(value)))];
+    if (controlProblems.length) diagnostic.controlProblems = controlProblems;
   }
   const cleanup = chain.find(item => item.installCleanupFailure)?.installCleanupFailure;
   if (cleanup) diagnostic.cleanupFailure = diagnosticFor(cleanup).code;

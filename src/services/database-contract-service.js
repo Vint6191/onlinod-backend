@@ -1,5 +1,6 @@
 "use strict";
 const { currentContract, validMigrationPrefix } = require("./database-migration-chain");
+const { MAINTENANCE_ADMISSION_GENERATION, MAINTENANCE_LANES } = require("./maintenance-lane-registry");
 const contract = currentContract();
 
 function identity(row) { return JSON.stringify(Object.fromEntries(Object.keys(row).sort().map(key => [key, row[key]]))); }
@@ -41,7 +42,10 @@ async function readDatabaseContract(db) {
       AND "value"->>'claimGenerationActive'='true' AND ("value"->>'writerGeneration')::int>0) AS campaigns,
     (SELECT array_agg("laneName"::text ORDER BY "ordinal") =
       ARRAY['CAMPAIGN_FACT','CAMPAIGN_VALUE','CAMPAIGN_ATTRIBUTION','CAMPAIGN_CLOCK','CAMPAIGN_BACKFILL']::text[]
-      FROM "MaintenanceAdmissionClassState" WHERE "generation"='campaign_projection_execution_v2') AS campaign_dispatch`);
+      FROM "MaintenanceAdmissionClassState" WHERE "generation"='campaign_projection_execution_v2') AS campaign_dispatch,
+    (SELECT jsonb_agg(jsonb_build_array("laneName","ordinal") ORDER BY "ordinal") = $1::jsonb
+      FROM "MaintenanceAdmissionClassState" WHERE "generation"=$2) AS maintenance_dispatch`,
+    JSON.stringify(MAINTENANCE_LANES.map(({ name, ordinal }) => [name, ordinal])), MAINTENANCE_ADMISSION_GENERATION);
   for (const [key, value] of Object.entries(controls[0] || {})) if (!value) problems.push(`control:${key}`);
   return { ready: problems.length === 0, version: contract.version, problems };
 }
