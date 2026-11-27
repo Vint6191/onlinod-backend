@@ -260,6 +260,44 @@ async function creatorAnalyticsInitialSyncReady({ db = prisma, creatorId, now = 
   return true;
 }
 
+// A user refresh must update the financial generation read by Overview/Home.
+// Daily chart backfill is still useful for an uncovered legacy range, but its
+// snapshot cannot replace a published transaction ledger. Keep both public
+// refresh entry points on the same collector owner used by Home's refresh.
+async function refreshCreatorAnalytics({ db = prisma, creatorId, agencyId, requestedByUserId = null,
+  rangeKey = "30d", now = new Date() } = {}) {
+  if (!creatorId || !agencyId) throw new Error("ANALYTICS_PLANNER_SCOPE_REQUIRED");
+  const range = require("./analytics-range-contract").normalizeCreatorOverviewRangeKey(rangeKey);
+  // Subscriber planning shares the automation fence. Compound refresh and the
+  // recurring planner take it before collector locks; otherwise each could
+  // hold one lock while waiting for the other's. Management takes this same
+  // prefix before its creator/authority rows, and re-entry here is intentional.
+  // Collectors retain Notifications -> Financial -> Campaigns order.
+  return require("./automation-write-commit-fence-service").runWithAutomationWriteCommitFence({
+    db, agencyId, creatorId, work: automationTx =>
+    withCollectorStateLock({ db: automationTx, type: COLLECTOR_TYPES.NOTIFICATIONS, creatorId, work: notificationTx =>
+    withCollectorStateLock({ db: notificationTx, type: COLLECTOR_TYPES.FINANCIAL, creatorId, work: financialTx =>
+      withCollectorStateLock({ db: financialTx, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId, work: async tx => {
+        const at = await dbAuthorityNow({ db: tx, fallbackNow: now });
+        // Honor the explicit refresh before automatic repair can create a
+        // narrower catch-up. An already active/paused/publication job is still
+        // reused by the shared financial collector owner.
+        const financial = await require("./financial-transaction-scan-control-service").startManualFinancialTransactionScan({
+          db: tx, creator: { id: creatorId, agencyId }, requestedByUserId, now: at,
+        });
+        const analyticsCatchups = await ensureRecurringCreatorAnalyticsCatchups({ db: tx, creatorId, agencyId,
+          now: at, priority: 95, _planningLocksHeld: true });
+        const subscribers = await require("./subscriber-directory-service").scheduleSubscriberScan({
+          db: tx, agencyId, creatorId, userId: requestedByUserId, manual: true, force: true,
+          priority: 90, reason: "creator_analytics_refresh",
+        });
+        const created = financial.action === "created";
+        return { rangeKey: range, analyticsCatchups, subscribers,
+          earnings: { rangeKey: range, dueDays: 0, windows: financial.job ? 1 : 0,
+            created: Number(created), reused: Number(!created), jobs: financial.job ? [financial.job] : [] } };
+      } }) }) }) });
+}
+
 async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agencyId, now = new Date(), priority = 95 } = {}) {
   now = await dbAuthorityNow({ db, fallbackNow: now });
   if (!creatorId || !agencyId) return { ready: false, stage: "invalid", created: false, reason: "missing_scope" };
@@ -540,6 +578,7 @@ module.exports = {
   CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
   ensureInitialCreatorAnalyticsSync,
   ensureRecurringCreatorAnalyticsCatchups,
+  refreshCreatorAnalytics,
   advanceCreatorAnalyticsInitialSyncAfterCompletion,
   recentKnownNotificationIdsFromState,
   financialInitialCoverageReady,

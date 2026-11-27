@@ -41,7 +41,11 @@ function fixture({ expireAtFinal = false } = {}) {
   const trace = [];
   let fences = 0;
   let rolledBack = false;
-  const tx = { $queryRawUnsafe: async (sql) => {
+  const tx = { $executeRawUnsafe: async (sql, ...args) => {
+    if (args[0] === "onlinod:automation-write-commit:v1") trace.push("automation-workspace");
+    if (args[0] === "onlinod:automation-creator-commit:v1") trace.push("automation-creator");
+    return 1;
+  }, $queryRawUnsafe: async (sql) => {
     if (/FROM "Agency"/.test(sql)) { trace.push("agency"); return [{ id: item.agencyId }]; }
     if (/FROM "CreatorAccount"/.test(sql)) { trace.push("creator"); return [{ id: item.creatorId }]; }
     if (/FROM "CreatorRecoveryIntent"/.test(sql)) return [];
@@ -58,7 +62,7 @@ function fixture({ expireAtFinal = false } = {}) {
   return { db, tx, item, now, trace, get rolledBack() { return rolledBack; } };
 }
 
-test("Analytics planning locks tenant then creator then live work; failure after planning rolls back", async (t) => {
+test("Analytics planning locks tenant, automation, creator and live work; failure after planning rolls back", async (t) => {
   const earnings = require("./analytics-collection-planner");
   const analytics = require("./creator-analytics-sync-orchestrator");
   t.mock.method(earnings, "ensureOperationalAnalyticsFreshness", async ({ db }) => {
@@ -70,7 +74,7 @@ test("Analytics planning locks tenant then creator then live work; failure after
   const f = fixture({ expireAtFinal: true });
   await assert.rejects(() => service.planRecurringCreatorAnalytics({ db: f.db, item: f.item, now: f.now }), { code: "ANALYTICS_PLANNING_CLAIM_LOST" });
   assert.equal(f.rolledBack, true);
-  assert.deepEqual(f.trace.slice(0, 4), ["agency", "creator", "work-lock", "clock"]);
+  assert.deepEqual(f.trace.slice(0, 6), ["agency", "automation-workspace", "automation-creator", "creator", "work-lock", "clock"]);
   assert.equal(events.length, 0);
 });
 
@@ -102,6 +106,7 @@ test('fast earnings-only cycle preserves lifecycle/claim fences and skips other 
   });
   const r = await service.planRecurringCreatorAnalytics({ db: f.db, item: f.item, now: f.now, includeCatchups: false });
   assert.equal(planned, 1); assert.equal(r.created, 1);
+  assert.equal(f.trace.some(entry => entry.startsWith("automation-")), false);
   assert.equal(f.trace.filter(x => x === 'work-lock').length, 2);
   assert.equal(f.trace.at(-1), 'commit');
 });

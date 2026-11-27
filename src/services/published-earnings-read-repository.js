@@ -41,21 +41,25 @@ async function readPublishedEarningsDays({ db, creatorId, from, to, now }) {
       WHERE d."creatorId"=$1 AND d."sourceTimezone"='UTC' AND d."date" BETWEEN ($2::timestamptz AT TIME ZONE 'UTC')::date AND ($3::timestamptz AT TIME ZONE 'UTC')::date
         AND (v."status"='COMPLETE' OR (d."date"=($4::timestamptz AT TIME ZONE 'UTC')::date AND v."status"='PARTIAL'))
     )
-    SELECT d.*,to_jsonb(l) AS live,days.date AS "stateDate",COALESCE(d."coverageStatus",c."status"::text,'MISSING') AS "coverageStatus",d."publishedObservedAt" AS "coverageVerifiedAt",
+    SELECT d.*,to_jsonb(l) AS live,l."collectedAt" AS "liveCollectedAt",l.observed AS "liveObservedAt",
+      days.date AS "stateDate",COALESCE(d."coverageStatus",c."status"::text,'MISSING') AS "coverageStatus",d."publishedObservedAt" AS "coverageVerifiedAt",
       c."retryAfterAt" AS "coverageRetryAfterAt",c."lastErrorCode" AS "coverageErrorCode"
     FROM generate_series(($2::timestamptz AT TIME ZONE 'UTC'),($3::timestamptz AT TIME ZONE 'UTC'),interval '1 day') days(date)
     LEFT JOIN "AnalyticsCoverage" c ON c."creatorId"=$1 AND c."dataType"='EARNINGS' AND c."sourceTimezone"='UTC' AND c."coverageDate"=days.date
     LEFT JOIN published d ON d."date"=days.date LEFT JOIN ledger_daily l ON l.date=days.date ORDER BY days.date`, creatorId, from, to, today, now);
   // Retry/partial hints survive even when amounts are unavailable. They can
   // never certify money: only the joined published row supplies proof status.
-  return rows.map(({ live,stateDate,coverageStatus,coverageVerifiedAt,coverageRetryAfterAt,coverageErrorCode,publishedObservedAt,...daily }) => {
+  return rows.map(({ live,liveCollectedAt,liveObservedAt,stateDate,coverageStatus,coverageVerifiedAt,coverageRetryAfterAt,coverageErrorCode,publishedObservedAt,...daily }) => {
     if(live) {
       const categories={};for(const key of ["subscriptions","messages","tips","posts","streams","referrals"])
         categories[key+"Cents"]=live.categoryTotals?.other ? null : integer(live.categoryTotals?.[key] || 0);
       return {daily:{id:`ledger:${creatorId}:${new Date(stateDate).toISOString().slice(0,10)}`,creatorId,date:stateDate,
         sourceTimezone:"UTC",currency:"USD",...categories,totalCents:integer(live.totalCents),hourlyPoints:live.hourlyPoints,
-        collectedAt:new Date(live.collectedAt)},
-        coverage:{coverageDate:stateDate,status:+new Date(stateDate)===+today?"PARTIAL":"COMPLETE",lastVerifiedAt:new Date(live.observed),
+        // Keep SQL timestamps in typed columns. JSONB removes the UTC offset
+        // from timestamp-without-time-zone values; reparsing those strings
+        // would shift the receipt time by the Node process's local timezone.
+        collectedAt:liveCollectedAt},
+        coverage:{coverageDate:stateDate,status:+new Date(stateDate)===+today?"PARTIAL":"COMPLETE",lastVerifiedAt:liveObservedAt,
           retryAfterAt:coverageRetryAfterAt,lastErrorCode:live.fresh?null:"LIVE_DELIVERY_OR_RECONCILIATION_PENDING",
           proofKind:"FINANCIAL_LEDGER_V1",liveFresh:live.fresh}};
     }

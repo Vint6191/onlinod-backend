@@ -331,28 +331,8 @@ async function apply(db, agencyId, creatorId, userId, member, p) {
       manual: true,
     });
   } else if (p.family === "analytics_refresh") {
-    const earnings = await require("./analytics-collection-planner").ensureAnalyticsFreshness({
-      db,
-      agencyId,
-      creatorId,
-      rangeKey: input.rangeKey,
-      reason: "INTERACTIVE_REFRESH",
-      priority: 100,
-      now,
-    });
-    await require("./creator-analytics-sync-orchestrator").ensureRecurringCreatorAnalyticsCatchups({
-      db,
-      agencyId,
-      creatorId,
-      priority: 95,
-      now,
-    });
-    const subscribers = await require("./subscriber-directory-service").scheduleSubscriberScan({
-      ...common,
-      manual: true,
-      force: true,
-      priority: 90,
-      reason: "creator_analytics_refresh",
+    const { earnings, subscribers } = await require("./creator-analytics-sync-orchestrator").refreshCreatorAnalytics({
+      db, agencyId, creatorId, requestedByUserId: userId, rangeKey: input.rangeKey, now,
     });
     value = { rangeKey: earnings.rangeKey, subscriberJobId: subscribers.job?.id || subscribers.run?.jobId || null };
   }

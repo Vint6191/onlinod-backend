@@ -80,12 +80,12 @@ test("campaign transport is page-oriented and notification engagement is accepte
   assert.match(routes, /code: "INVALID_CAMPAIGN_ID"/);
   assert.match(routes, /router\.get\("\/creators\/:creatorId\/ledger-coverage", legacyStatsGone\)/);
   assert.match(routes, /router\.post\("\/creators\/:creatorId\/messages-daily", legacyStatsGone\)/);
-  assert.match(routes, /ensureRecurringCreatorAnalyticsCatchups/);
+  assert.match(routes, /refreshCreatorAnalytics/);
   const creatorRefreshStart = routes.indexOf('router.post("/creators/:creatorId/refresh"');
   const overviewStart = routes.indexOf('router.get("/creators/:creatorId/overview-v2"');
   assert.ok(creatorRefreshStart >= 0 && overviewStart > creatorRefreshStart);
   assert.match(routes, /router\.post\("\/agencies\/:agencyId\/refresh", legacyStatsGone\)/);
-  assert.match(routes.slice(creatorRefreshStart, overviewStart), /ensureAnalyticsFreshness\(/);
+  assert.match(routes.slice(creatorRefreshStart, overviewStart), /refreshCreatorAnalytics\(/);
   assert.doesNotMatch(routes.slice(creatorRefreshStart, overviewStart), /jobKey: "catchup_notifications_scan"/);
   assert.doesNotMatch(routes, /notificationWindows/);
   assert.doesNotMatch(routes, /backfillWindow/);

@@ -1,5 +1,6 @@
 "use strict";
 const { z } = require("zod");
+const { CREATOR_OVERVIEW_RANGE_KEYS } = require("./analytics-range-contract");
 const id = z.string().trim().min(1).max(180),
   text = z.string().max(120),
   ids = z.array(id).max(500);
@@ -118,7 +119,7 @@ const schemas = {
     sfs_discover: z.object({ force: z.boolean().optional(), source: text.optional() }),
   },
   analytics_refresh: {
-    refresh: z.object({ rangeKey: z.enum(["today", "yesterday", "7d", "14d", "30d", "90d", "all"]) }),
+    refresh: z.object({ rangeKey: z.enum(CREATOR_OVERVIEW_RANGE_KEYS) }),
   },
 };
 const operation = z

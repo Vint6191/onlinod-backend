@@ -52,7 +52,7 @@ async function lockPrefix(tx, agencyId, c) {
   if (
     c.action.startsWith("automation.") ||
     (c.action === "operation.control" &&
-      (c.payload.family.startsWith("automation_") || ["hidden", "subscriber"].includes(c.payload.family)))
+      (c.payload.family.startsWith("automation_") || ["hidden", "subscriber", "analytics_refresh"].includes(c.payload.family)))
   )
     await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId: c.targetId || null });
   if (c.action === "creator.retire") await lockTeamControlPlaneTopology({ tx, agencyId, agencyAlreadyLocked: true });

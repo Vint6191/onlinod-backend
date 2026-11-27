@@ -500,7 +500,8 @@ test("planner merges an exact claimed scan across generation buckets under a cre
   assert.equal(result.job.id, "job-existing");
   assert.equal(result.job.priority, 100);
   assert.equal(createCalls, 0);
-  for (let i = lockCalls.length - 1; i >= 0; i--) if (lockCalls[i][0].includes("set_config('lock_timeout'")) lockCalls.splice(i, 1);
+  assert.equal(lockCalls.filter(([sql]) => sql === "SET CONSTRAINTS ALL IMMEDIATE").length, 1);
+  for (let i = lockCalls.length - 1; i >= 0; i--) if (lockCalls[i][0].includes("set_config('lock_timeout'") || lockCalls[i][0] === "SET CONSTRAINTS ALL IMMEDIATE") lockCalls.splice(i, 1);
   assert.equal(lockCalls.length, 1);
   assert.match(lockCalls[0][0], /pg_advisory_xact_lock/);
   assert.equal(lockCalls[0][1], "analytics-plan:creator-1");

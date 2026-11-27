@@ -8,6 +8,7 @@ exports.runAnalytics = async function runAnalytics(f) {
   const { modules: m, desktop, scratch, output, auth, api, agencyId, deviceId, creatorId: c, creatorIds, must, pass, results } = f;
   const load = createRequire(path.join(desktop, "package.json"));
   const runtime = createRequire(path.join(process.env.ONLINOD_BROWSER_RUNTIME || process.env.ONLINOD_SQL_PROOF_RUNTIME, "package.json"));
+  const earningsOnly = process.env.ONLINOD_ANALYTICS_PROOF_SCOPE === "earnings";
   const logs = [], calls = [], errors = [], requests = [], providerCalls = [];
   const log = Object.fromEntries(["debug", "info", "warn", "error"].map(level => [level, (...args) => logs.push({ level, args: JSON.parse(JSON.stringify(args, (_key, value) => value instanceof Error ? { message: value.message, code: value.code } : value)) })]));
   const authStore = { ...auth, readSession: () => ({ ...auth.readSession(), deviceId }), getDeviceId: () => deviceId,
@@ -44,7 +45,7 @@ exports.runAnalytics = async function runAnalytics(f) {
   const fan = id => ({ id: String(id), username: "fan_" + id, name: "Fan " + id,
     ...(String(id) !== "21051" ? { totalSpentCents: String(id) === "21001" ? 15000 : String(id) === "21002" ? 2000 : 0 } : {}),
     subscribedOnData: { isActive: true, type: "FREE" }, canReceiveChatMessage: true });
-  const campaigns = Array.from({ length: 51 }, (_, i) => ({ id: String(31001 + i), name: "Source " + String(i + 1).padStart(2, "0"), is_active: true,
+  const campaigns = Array.from({ length: earningsOnly ? 0 : 51 }, (_, i) => ({ id: String(31001 + i), name: "Source " + String(i + 1).padStart(2, "0"), is_active: true,
     created_at: ago(15), claimers_count: i === 0 ? 51 : i === 1 ? 1 : 0, clicks_count: i === 0 ? 120 : 2, trackingCode: "code_" + (i + 1) }));
   const members = id => id === "31001" ? Array.from({ length: 51 }, (_, i) => ({ id: "claimer_a_" + i, user: fan(21001 + i), createdAt: ago(12) }))
     : id === "31002" ? [{ id: "claimer_b", user: fan(21001), createdAt: ago(10) }] : [];
@@ -167,21 +168,25 @@ import{CreatorAnalyticsWorkspace}from ${JSON.stringify(path.join(renderer, "feat
 import{acceptRendererAuthorizationProjection}from ${JSON.stringify(path.join(renderer, "shared/rpc/authorization-scope.ts"))};
 import ${JSON.stringify(path.join(renderer, "styles.css"))};
 const client=new QueryClient({defaultOptions:{queries:{retry:false,gcTime:0}}});let root;
-function App({input}){const[view,setView]=useState('home');const props={session:input.session,creators:input.creators,activeCreator:input.creators.find(c=>c.id===input.projection.activeCreatorId)};return <><nav aria-label="Acceptance workspace"><button onClick={()=>setView('home')}>Home</button><button onClick={()=>setView('analytics')}>Analytics</button></nav>{view==='home'?<HomeDashboard {...props} authorizationRevision={1}/>:<CreatorAnalyticsWorkspace {...props}/>}</>}
+function App({input}){const[view,setView]=useState('home');const[rangeKey,onRangeChange]=useState('7d');const[pagePosition,onPageChange]=useState({scope:'',after:''});const props={session:input.session,creators:input.creators,activeCreator:input.creators.find(c=>c.id===input.projection.activeCreatorId)};return <><nav aria-label="Acceptance workspace"><button onClick={()=>setView('home')}>Home</button><button onClick={()=>setView('analytics')}>Analytics</button></nav>{view==='home'?<HomeDashboard {...props} authorizationRevision={1} rangeKey={rangeKey} onRangeChange={onRangeChange} pagePosition={pagePosition} onPageChange={onPageChange}/>:<CreatorAnalyticsWorkspace {...props}/>}</>}
 export function mount(input){window.nod={events:{onDesktopAuthorizationEvent:()=>()=>{},onCreatorRuntimeEvent:()=>()=>{}},rpc:{call:async(method,payload)=>{const r=await window.actualRpc(method,payload);if(r.error)throw Object.assign(Error(r.error.message),{code:r.error.code});return r.result;}}};acceptRendererAuthorizationProjection(input.projection);root=createRoot(document.getElementById('root'));root.render(<React.StrictMode><QueryClientProvider client={client}><App input={input}/></QueryClientProvider></React.StrictMode>);}
 export async function refresh(){await client.invalidateQueries();}`);
     await load("esbuild").build({ entryPoints: [fixture], outfile: script, bundle: true, platform: "browser", format: "iife", globalName: "ActualAnalytics",
       jsx: "automatic", nodePaths: [path.join(desktop, "node_modules")], alias: { "@nod/shared": path.join(desktop, "packages/shared/src/index.ts") },
-      loader: { ".css": "css", ".png": "dataurl", ".svg": "dataurl" }, define: { "process.env.NODE_ENV": '"development"' } });
+      loader: { ".css": "css", ".png": "dataurl", ".svg": "dataurl", ".ttf": "dataurl" }, define: { "process.env.NODE_ENV": '"development"' } });
     server = http.createServer((req, res) => {
       const file = req.url === "/app.js" ? script : req.url === "/app.css" ? script.replace(/js$/, "css") : null;
       res.setHeader("Content-Type", file ? file.endsWith(".js") ? "application/javascript" : "text/css" : "text/html");
       res.end(file ? fs.readFileSync(file) : '<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/app.css"></head><body><div id="root"></div><script src="/app.js"></script></body></html>');
     });
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-    const chromiumModule = runtime("@sparticuz/chromium");
-    const chromium = chromiumModule.default || chromiumModule;
-    browser = await runtime("playwright").chromium.launch({ executablePath: process.env.ONLINOD_CHROMIUM_PATH || await chromium.executablePath(), args: chromium.args, headless: true });
+    let browserOptions = { executablePath: process.env.ONLINOD_CHROMIUM_PATH, args: ["--no-sandbox"], headless: true };
+    if (!browserOptions.executablePath) {
+      const chromiumModule = runtime("@sparticuz/chromium");
+      const chromium = chromiumModule.default || chromiumModule;
+      browserOptions = { executablePath: await chromium.executablePath(), args: chromium.args, headless: true };
+    }
+    browser = await runtime("playwright").chromium.launch(browserOptions);
     page = await browser.newPage({ viewport: { width: 1536, height: 1050 } });
     page.on("pageerror", error => errors.push(error.message));
     page.on('console', entry => { if (entry.type() === 'error' && /same key|unique.*key/i.test(entry.text())) errors.push(entry.text()); });
@@ -209,6 +214,73 @@ export async function refresh(){await client.invalidateQueries();}`);
       if (!await table.getByText(name, { exact: true }).count()) await page.getByRole('button', { name: 'Next sources', exact: true }).click();
       await table.getByText(name, { exact: true }).waitFor();
     };
+    if (earningsOnly) {
+      const net = () => page.locator('.hq-number-row').filter({ has: page.getByText('Net earnings', { exact: true }) }).locator('.hq-number-value');
+      const selectCreator = async name => {
+        await app('Analytics');
+        await page.getByRole('button', { name: 'View analytics for ' + name, exact: true }).click();
+        await page.getByLabel('Analytics period', { exact: true }).selectOption('7d');
+      };
+      results.emptyHome = await home.getSummary({ rangeKey: '7d' });
+      assert.equal(results.emptyHome.revenue.totalCents, null);
+      await selectCreator('model_one');
+      await until(async () => await net().count() === 1 && await net().textContent() === '—', 'Unknown money must stay unknown');
+      pass('Uncollected money is unknown in actual Home and Creator Analytics');
+      await home.refresh({ rangeKey: '7d' }); coordinator.start(); worker.start();
+      await until(async () => {
+        results.home = await home.getSummary({ rangeKey: '7d' });
+        results.homeCreators = await home.getCreators({ rangeKey: '7d' });
+        results.firstOverview = await overview();
+        return results.home.revenue.totalCents === 3600 && results.home.revenue.coverage.reportingCreators === 2
+          && results.homeCreators.creators.find(row => row.id === c)?.revenueCents === 3600
+          && results.homeCreators.creators.find(row => row.id !== c)?.revenueCents === 0
+          && results.firstOverview.finance.netCents === 3600;
+      }, 'Worker publication did not reach both actual read services', 300000);
+      await until(async () => await net().textContent() === '$36.00', 'Published money did not appear automatically', 45000);
+      assert.equal(results.firstOverview.finance.refundGrossCents, 2000);
+      pass('Actual worker, HTTP receipts, PostgreSQL publication, Desktop services and React show the same $36');
+      await page.getByRole('button', { name: '← Creators', exact: true }).click();
+      await page.getByRole('button', { name: 'View analytics for model_two', exact: true }).click();
+      await page.getByLabel('Analytics period', { exact: true }).selectOption('7d');
+      await until(async () => await net().textContent() === '$0.00', 'Verified empty model must display zero');
+      await page.getByRole('button', { name: '← Creators', exact: true }).click();
+      await page.getByRole('button', { name: 'View analytics for model_one', exact: true }).click();
+      await page.getByLabel('Analytics period', { exact: true }).selectOption('7d');
+      await until(async () => await net().textContent() === '$36.00', 'Creator selection must restore its own exact amount');
+      pass('Current creator directory isolates verified zero from populated model');
+      refunded = false;
+      const requestsBefore = calls.length;
+      await page.getByRole('button', { name: 'Refresh data', exact: true }).click();
+      await until(async () => {
+        results.correctedOverview = await overview();
+        return results.correctedOverview.finance.netCents === 5200;
+      }, 'Actual Refresh data did not update the active financial ledger', 120000);
+      await until(async () => await net().textContent() === '$52.00', 'Corrected money did not reach React automatically', 45000);
+      assert(calls.slice(requestsBefore).some(call => call.method === 'creatorAnalytics.refreshCreator'));
+      assert.equal(results.correctedOverview.finance.refundGrossCents, 0);
+      assert.equal(results.correctedOverview.finance.transactions, 4);
+      await until(async () => {
+        results.correctedHome = await home.getSummary({ rangeKey: '7d' });
+        results.correctedCreators = await home.getCreators({ rangeKey: '7d' });
+        return results.correctedHome.revenue.totalCents === 5200
+          && results.correctedCreators.creators.find(row => row.id === c)?.revenueCents === 5200;
+      }, 'Home cache did not converge to the corrected ledger', 30000);
+      pass('Real Refresh data command publishes the corrected $52 once and all money views converge');
+      await page.getByLabel('Analytics period', { exact: true }).selectOption('30d');
+      await until(async () => await net().textContent() === '$52.00', 'Period switch lost the confirmed amount');
+      await page.getByLabel('Analytics period', { exact: true }).selectOption('7d');
+      await until(async () => await net().textContent() === '$52.00', 'Returning period lost confirmed amount');
+      await worker.stop(); await coordinator.destroy();
+      const killed = await f.stop('SIGKILL'); assert.equal(killed.signal, 'SIGKILL'); await f.boot();
+      creatorService.invalidateBootstrap(); publishAuthority(); makeWorker(); coordinator.start(); worker.start();
+      results.afterRestart = await overview(); assert.equal(results.afterRestart.finance.netCents, 5200);
+      await page.evaluate(() => window.ActualAnalytics.refresh());
+      await until(async () => await net().textContent() === '$52.00', 'Restart lost the published money');
+      assert.deepEqual(errors, []); results.browserVersion = await browser.version();
+      pass('Backend SIGKILL, worker/SQLite reopen and range switch retain exact published earnings');
+      await captureScreenshot({ path: path.join(output, 'earnings-final.png'), fullPage: true });
+      return;
+    }
     results.emptyHome = await home.getSummary({ rangeKey: "7d" }); assert.equal(results.emptyHome.revenue.totalCents, null);
     await captureScreenshot({ path: path.join(output, "home-empty.png"), fullPage: true, animations: "disabled", timeout: 45000 });
     pass("Empty current Home and actual creator bootstrap preserve unknown earnings");

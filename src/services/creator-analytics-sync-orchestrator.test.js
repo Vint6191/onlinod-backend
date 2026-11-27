@@ -27,6 +27,10 @@ function db(){return{
  creatorNotificationSyncState:{findUnique:async()=>notes},
  creatorFinancialCollectionState:{findUnique:async()=>financialState},
  creatorCampaignCollectionState:{findUnique:async()=>campaignState},
+ creatorRecoveryIntent:{findFirst:async({where})=>Object.values(intents).find(row=>Object.entries(where).every(([key,value])=>{
+   if(value && typeof value==='object' && 'not' in value)return row[key]!==value.not;
+   return value==null ? row[key]==null : row[key]===value;
+ }))||null},
 };}
 const input=d=>({db:d,creatorId:'c',agencyId:'a',now});
 const debt=stream=>({id:'debt-'+stream,creatorId:'c',agencyId:'a',stream,reason:'OFFLINE_GAP',gapFrom:old,targetAt:now,policyVersion:2,status:'PENDING'});

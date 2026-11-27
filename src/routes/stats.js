@@ -14,9 +14,7 @@ const { resolveEffectivePermissions } = require("../services/team-access-control
 const { requireCreatorAccess, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { readCampaignFans } = require("../services/creator-analytics-ledger-service");
 const { readCreatorOverview, readCreatorCurrentTask, readCreatorTaskActivity, readCreatorTaskActivityDays } = require("../services/creator-overview-service");
-const { ensureRecurringCreatorAnalyticsCatchups } = require("../services/creator-analytics-sync-orchestrator");
-const { scheduleSubscriberScan } = require("../services/subscriber-directory-service");
-const { ensureAnalyticsFreshness } = require("../services/analytics-collection-planner");
+const { refreshCreatorAnalytics } = require("../services/creator-analytics-sync-orchestrator");
 const { normalizeCreatorOverviewRangeKey } = require("../services/analytics-range-contract");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { capabilityFreshnessWindow } = require("../services/capability-freshness-authority-service");
@@ -167,8 +165,8 @@ router.get("/creators/:creatorId/ledger-overview", legacyStatsGone);
 router.get("/creators/:creatorId/ledger-coverage", legacyStatsGone);
 router.post("/creators/:creatorId/messages-daily", legacyStatsGone);
 
-// Current Creator Analytics refresh: one earnings freshness demand plus the
-// already-canonical non-earnings catch-up/subscriber control planes.
+// Both the compatibility HTTP route and the durable desktop command refresh
+// the same financial generation consumed by Overview and Home.
 router.post("/creators/:creatorId/refresh", async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, req.params.creatorId);
@@ -185,27 +183,10 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
       });
     }
     const now = new Date();
-    const [earnings, analyticsCatchups, subscribers] = await Promise.all([
-      ensureAnalyticsFreshness({
-        db: prisma,
-        creatorId: creator.id,
-        agencyId: creator.agencyId,
-        rangeKey: range,
-        reason: "INTERACTIVE_REFRESH",
-        priority: 100,
-        now,
-      }),
-      ensureRecurringCreatorAnalyticsCatchups({ creatorId: creator.id, agencyId: creator.agencyId, now, priority: 95 }),
-      scheduleSubscriberScan({
-        agencyId: creator.agencyId,
-        creatorId: creator.id,
-        userId: actorUserId(req),
-        manual: true,
-        force: true,
-        priority: 90,
-        reason: "creator_analytics_refresh",
-      }),
-    ]);
+    const { earnings, analyticsCatchups, subscribers } = await refreshCreatorAnalytics({
+      db: prisma, creatorId: creator.id, agencyId: creator.agencyId,
+      requestedByUserId: actorUserId(req), rangeKey: range, now,
+    });
     return res.json({
       ok: true,
       rangeKey: earnings.rangeKey,

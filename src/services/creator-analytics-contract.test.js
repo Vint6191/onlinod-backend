@@ -67,10 +67,15 @@ test("snapshot-era Stats surfaces are explicit 410 tombstones and current overvi
 test("current creator refresh is the sole Stats refresh control plane", () => {
   const creator = routeBody(stats, "post", "/creators/:creatorId/refresh");
   assert.match(creator, /requireRefreshPermission\(res, ctx\.member\)/);
-  assert.match(creator, /ensureAnalyticsFreshness\(/);
-  assert.match(creator, /reason: "INTERACTIVE_REFRESH"/);
-  assert.match(creator, /ensureRecurringCreatorAnalyticsCatchups\(/);
-  assert.match(creator, /scheduleSubscriberScan\(/);
+  assert.match(creator, /refreshCreatorAnalytics\(/);
+  assert.match(creator, /requestedByUserId: actorUserId\(req\)/);
+  const orchestrator = fs.readFileSync(path.join(root, "services/creator-analytics-sync-orchestrator.js"), "utf8");
+  const refresh = orchestrator.slice(orchestrator.indexOf("async function refreshCreatorAnalytics("),
+    orchestrator.indexOf("async function ensureInitialCreatorAnalyticsSync("));
+  assert.match(refresh, /ensureRecurringCreatorAnalyticsCatchups\(/);
+  assert.match(refresh, /startManualFinancialTransactionScan\(/);
+  assert.match(refresh, /scheduleSubscriberScan\(/);
+  assert.doesNotMatch(refresh, /ensureAnalyticsFreshness\(/);
   assert.doesNotMatch(creator, /jobKey: "fetch_earnings"/);
   assert.doesNotMatch(creator, /TRACKED_RANGES/);
   assert.match(routeBody(stats, "post", "/agencies/:agencyId/refresh"), /legacyStatsGone/);

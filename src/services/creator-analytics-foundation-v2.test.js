@@ -42,7 +42,12 @@ test("creator analytics V2 keeps every business fact in typed relational models"
     "CreatorLocalMessageCoverage",
   ];
   for (const model of primaryModels) {
-    assert.doesNotMatch(modelBody(model), /\bJson\??\b/, `${model} must not store business JSON`);
+    const body = modelBody(model);
+    const jsonFields = [...body.matchAll(/^\s*(\w+)\s+Json\??\b/gm)].map(match => match[1]);
+    // Money values stay relational; correlation retains the structured proof
+    // that binds an immutable notification identity to its payout evidence.
+    assert.deepEqual(jsonFields, ["CreatorSale", "CreatorTip"].includes(model) ? ["financialCorrelation"] : [],
+      `${model} may only store the explicit financial correlation proof as JSON`);
   }
   assert.doesNotMatch(schema, /model CreatorActivityEvent\b/);
 });

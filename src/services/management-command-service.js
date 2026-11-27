@@ -174,6 +174,19 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
   if (!agencyId || !userId || actorMember?.userId !== userId || !actorMember?.id)
     throw fail("MANAGEMENT_COMMAND_ACTOR_REQUIRED", "Current membership is required", 403);
   const c = parseManagementCommand(input, { cancel });
+  // These owners only plan/pause child jobs and publish a transactional control
+  // receipt. They never change CreatorAccount. Keep the ordinary SHARE fence
+  // from assertManagementCommitAuthority instead of blocking the KEY SHARE
+  // acquired by concurrent job inserts. FOR UPDATE here inverted Home's
+  // collector -> job-FK order against the command's creator -> collector order.
+  const financialControl = !cancel && c.action === "operation.control"
+    && ["financial", "analytics_refresh"].includes(c.payload.family);
+  // Subscriber START is the same database-only owner called by a compound
+  // analytics refresh. It can meet a refreshed generation after waiting on
+  // that shared fence and must re-evaluate its original revision in a new
+  // Serializable attempt, rather than leak a raw write conflict to the UI.
+  const replayablePlanningControl = financialControl || (!cancel && c.action === "operation.control"
+    && c.payload.family === "subscriber");
   if (
     !cancel &&
     ["network.create", "network.update", "creator.beginConnection"].includes(c.action) &&
@@ -201,7 +214,7 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
         throw fail("MANAGEMENT_COMMAND_CONFLICT", "Command ID belongs to a different intent");
       const creatorIds = cancel ? [] : await creatorScope(tx, agencyId, c, prior?.reference);
       if(!cancel) await human.lockPrefix(tx,agencyId,c);
-      if(!cancel && human.has(c)) for(const creatorId of creatorIds) await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE',creatorId,agencyId);
+      if(!cancel && human.has(c) && !financialControl) for(const creatorId of creatorIds) await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE',creatorId,agencyId);
       // Match account setters' User-lock order, including across agencies. No User
       // FOR SHARE -> advisory-lock inversion when the existing setter joins.
       if (!cancel && (c.action === "account.profile" || c.action === "account.avatar")) await lockEligibleAccountUser(tx, userId);
@@ -326,7 +339,11 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
       }
       return { ok: true, commandId: c.commandId, action: c.action, replayed: false, resultUnavailable: false, result };
     },
-    { profile: "SECRET_WRITE", authority: { kind: "MANAGEMENT_COMMAND", agencyId, userId }, maxAttempts: 1 }
+    // Only reviewed database-only planning controls may replay a known rolled
+    // back serialization conflict. The whole authority/expectedRevision check,
+    // audit and receipt run again; the original intent is never rewritten.
+    // Job/control hints are emitted by the commit kernel only after success.
+    { profile: "SECRET_WRITE", authority: { kind: "MANAGEMENT_COMMAND", agencyId, userId }, maxAttempts: replayablePlanningControl ? 3 : 1 }
   );
 }
 module.exports = { executeManagementCommand };

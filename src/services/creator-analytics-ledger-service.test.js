@@ -1933,7 +1933,8 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
       campaigns: [],
     },
   });
-  for (let i = calls.length - 1; i >= 0; i--) if (calls[i][0].includes("set_config('lock_timeout'")) calls.splice(i, 1);
+  assert.equal(calls.filter(([sql]) => sql === "SET CONSTRAINTS ALL IMMEDIATE").length, 1);
+  for (let i = calls.length - 1; i >= 0; i--) if (calls[i][0].includes("set_config('lock_timeout'") || calls[i][0] === "SET CONSTRAINTS ALL IMMEDIATE") calls.splice(i, 1);
   assert.equal(calls.length, 4);
   assert.equal(calls[0][0], "SELECT set_config('onlinod.campaign_observation_version', '1', true)");
   assert.equal(calls[1][0], "SELECT set_config('onlinod.campaign_directory_count_version', '1', true)");
@@ -2000,7 +2001,8 @@ test("earnings ingest serializes writers and never lets an older observation ove
       rows: [{ date: "2026-08-05", sourceTimezone: "UTC", totalCents: 100, currency: "USD" }],
     },
   });
-  for (let i = locks.length - 1; i >= 0; i--) if (locks[i].sql.includes("set_config('lock_timeout'")) locks.splice(i, 1);
+  assert.equal(locks.filter(({ sql }) => sql === "SET CONSTRAINTS ALL IMMEDIATE").length, 1);
+  for (let i = locks.length - 1; i >= 0; i--) if (locks[i].sql.includes("set_config('lock_timeout'") || locks[i].sql === "SET CONSTRAINTS ALL IMMEDIATE") locks.splice(i, 1);
   assert.equal(locks.length, 1);
   assert.match(locks[0].sql, /pg_advisory_xact_lock/);
   assert.equal(writes, 0);
@@ -2059,7 +2061,8 @@ test("an incomplete message ledger cannot downgrade a complete day from another 
     observedAt: "2026-08-06T12:00:00.000Z",
     rows: [{ date: "2026-08-05", sourceTimezone: "UTC", incomingMessages: 1, outgoingMessages: 1, totalMessages: 2, uniqueDialogs: 1, uniqueIncomingFans: 1, uniqueOutgoingFans: 1 }],
   });
-  for (let i = locks.length - 1; i >= 0; i--) if (locks[i].sql.includes("set_config('lock_timeout'")) locks.splice(i, 1);
+  assert.equal(locks.filter(({ sql }) => sql === "SET CONSTRAINTS ALL IMMEDIATE").length, 1);
+  for (let i = locks.length - 1; i >= 0; i--) if (locks[i].sql.includes("set_config('lock_timeout'") || locks[i].sql === "SET CONSTRAINTS ALL IMMEDIATE") locks.splice(i, 1);
   assert.equal(locks.length, 1);
   assert.equal(writes, 0);
   assert.equal(result.unchanged, 1);

@@ -40,9 +40,14 @@ async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new D
     throw Object.assign(new Error("Analytics planning requires a root transactional database"), { code: "ANALYTICS_PLANNING_TRANSACTION_REQUIRED" });
   }
   return afterPlanningCommit(() => runDbTransaction(db, async (tx) => {
-    // Match lifecycle ordering: Agency -> Creator -> exact work claim -> collector.
+    // A compound plan also schedules Subscribers. Acquire that owner's fence
+    // before Creator/collector locks, matching manual refresh and subscriber
+    // commands. Taking it only at the final subscriber step inverted refresh.
     // SHARE protects eligibility against soft deletion/status change until commit.
     const agencies = await tx.$queryRawUnsafe('SELECT "id" FROM "Agency" WHERE "id"=$1 AND "deletedAt" IS NULL FOR SHARE', item.agencyId);
+    if (agencies.length && includeCatchups) await require("./automation-write-commit-fence-service").lockAutomationWriteCommitFence({
+      db: tx, agencyId: item.agencyId, creatorId: item.creatorId || item.objectId,
+    });
     const creators = agencies.length ? await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "status"=\'READY\' AND "deletedAt" IS NULL FOR SHARE', item.creatorId || item.objectId, item.agencyId) : [];
     if (!creators.length) return { retired: true, created: 0, skipped: 0 };
     const ownership = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow: now });
