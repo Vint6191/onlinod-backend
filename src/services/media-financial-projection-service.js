@@ -11,6 +11,7 @@ const work = require("./domain-work-authority-service");
 const { lockCreatorFacts } = require("./creator-fact-write-authority");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { pauseDeletedAgencyProjection } = require("./analytics-projection-lifecycle-service");
+const mediaEvidence = require("./media-message-evidence-service");
 const WORK_CLASS = "MEDIA_FINANCIAL_PROJECTION", ADOPTION_KEY = "media_financial_adoption_v2", PAGE = 500, SEMANTICS_VERSION = 2;
 const COUNTS = ["sentCount", "soldCount", "notOpenedCount", "freeCount", "revenueCents", "revenueUnknownCount"];
 const paid = new Set(["", "done", "loading", "completed", "complete", "success", "paid"]);
@@ -132,8 +133,14 @@ async function withdrawCanonicalMediaSales({ db, agencyId, creatorId, saleIds })
   return affected.size ? publishMessageStates({ db, agencyId, creatorId, affected }) : [];
 }
 
-function effectiveFact(observed, state, allocation) {
+function effectiveFact(observed, state, evidence) {
   const result = { ...observed, revenueCents: 0, revenueUnknownCount: 0 };
+  if (evidence?.excluded.has(observed.mediaId)) {
+    // Keep the original message/media evidence for audit and replay, while
+    // removing its derived creator usage. A financial proof never makes a
+    // fan-owned attachment into creator inventory.
+    return { ...result, ...Object.fromEntries(COUNTS.map(field => [field, 0])), uniqueBuyers: 0, lastSoldAt: null };
+  }
   if (state?.proofActive) {
     result.soldCount = 1; result.freeCount = 0; result.notOpenedCount = 0; result.uniqueBuyers = 1;
     result.lastSoldAt = state.purchasedAt ? new Date(state.purchasedAt).toISOString() : observed.lastSoldAt;
@@ -145,7 +152,8 @@ function effectiveFact(observed, state, allocation) {
   }
   if (!result.soldCount) return result;
   const net = state?.proofActive ? money(state.netCents) : null;
-  const count = observed.allocationCount || allocation?.count, index = observed.allocationIndex ?? allocation?.index;
+  const count = evidence ? evidence.creatorMediaIds.length : observed.allocationCount;
+  const index = evidence ? evidence.creatorIndex.get(observed.mediaId) : observed.allocationIndex;
   if (net === 0) return result;
   if (net == null || !Number.isSafeInteger(count) || count < 1 || !Number.isSafeInteger(index) || index < 0 || index >= count) {
     result.revenueUnknownCount = 1; return result;
@@ -180,15 +188,16 @@ async function applyContributionDeltas(db, scope, rows) {
     WHERE a."agencyId"=$1 AND a."creatorId"=$2 AND a."mediaId"=d."mediaId"`, scope.agencyId, scope.creatorId, JSON.stringify([...deltas.values()]));
 }
 
-async function projectFactPage(db, scope, facts, suppliedStates = null) {
+async function projectFactPage(db, scope, facts, suppliedStates = null, suppliedEvidence = null) {
   if (!facts.length) return 0;
   const states = suppliedStates || await statesForFacts(db, scope, facts), changed = [], byContribution = new Map();
+  const evidence = suppliedEvidence || await mediaEvidence.evidenceForFacts(db, scope, facts);
   // Old171 did not record attachment count/ordinal. A partial historical page
   // cannot prove the allocation denominator. Refund0 and linkage withdrawal
   // apply now; positive NET remains explicitly unknown until current exact
   // message evidence supplies its complete attachment ordinals.
   for (const row of facts) {
-    const observed = row.observedPayload || row.payload, payload = effectiveFact(observed, states.get(key(row)));
+    const observed = row.observedPayload || row.payload, payload = effectiveFact(observed, states.get(key(row)), evidence.get(key(row)));
     if (row.observedPayload && hashCanonicalJson(row.payload) === hashCanonicalJson(payload)) continue;
     changed.push({ ...row, observed, payload });
     const k = JSON.stringify([row.sourceKey, row.mediaId]);
@@ -297,7 +306,13 @@ async function processPage({ db, item, ownerToken }) {
       await tx.$executeRawUnsafe(`UPDATE "CreatorMediaFinancialAdoptionState" SET "factSource"=$2,"factMessage"=$3,"factMedia"=$4,
         phase=$5,"completedAt"=CASE WHEN $5='COMPLETE' THEN clock_timestamp() ELSE NULL END WHERE "creatorId"=$1`, item.creatorId, last?.sourceKey || adopt.factSource, last?.sourceMessageId || adopt.factMessage, last?.mediaId || adopt.factMedia, rows.length < PAGE ? "COMPLETE" : "FACTS");
     } else {
-      const [state] = await tx.$queryRawUnsafe('SELECT * FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty ORDER BY "sourceKey","messageId" LIMIT 1', item.creatorId);
+      const [evidence] = await tx.$queryRawUnsafe('SELECT * FROM "CreatorMediaMessageEvidence" WHERE "creatorId"=$1 AND dirty ORDER BY "sourceKey","messageId" LIMIT 1', item.creatorId);
+      const [state] = evidence ? [] : await tx.$queryRawUnsafe('SELECT * FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty ORDER BY "sourceKey","messageId" LIMIT 1', item.creatorId);
+      if (evidence) {
+        const rows = await tx.$queryRawUnsafe(`SELECT * FROM "CreatorMediaUsageFact" WHERE "agencyId"=$1 AND "creatorId"=$2 AND "sourceKey"=$3 AND "sourceMessageId"=$4 AND "mediaId">$5 ORDER BY "mediaId" LIMIT $6`, item.agencyId, item.creatorId, evidence.sourceKey, evidence.messageId, evidence.cursor, PAGE);
+        processed = await projectFactPage(tx, scope, rows, null, new Map([[key(evidence), mediaEvidence.prepared(evidence)]]));
+        await tx.$executeRawUnsafe('UPDATE "CreatorMediaMessageEvidence" SET cursor=$4,dirty=$5 WHERE "creatorId"=$1 AND "sourceKey"=$2 AND "messageId"=$3', item.creatorId, evidence.sourceKey, evidence.messageId, rows.at(-1)?.mediaId || evidence.cursor, rows.length === PAGE);
+      }
       if (state) {
         const rows = await tx.$queryRawUnsafe(`SELECT * FROM "CreatorMediaUsageFact" WHERE "agencyId"=$1 AND "creatorId"=$2 AND "sourceKey"=$3 AND "sourceMessageId"=$4 AND "mediaId">$5 ORDER BY "mediaId" LIMIT $6`, item.agencyId, item.creatorId, state.sourceKey, state.messageId, state.cursor, PAGE);
         processed = await projectFactPage(tx, scope, rows, new Map([[key(state), state]]));
@@ -305,6 +320,7 @@ async function processPage({ db, item, ownerToken }) {
       }
     }
     const [pending] = await tx.$queryRawUnsafe(`SELECT EXISTS(SELECT 1 FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty)
+      OR EXISTS(SELECT 1 FROM "CreatorMediaMessageEvidence" WHERE "creatorId"=$1 AND dirty)
       OR EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1 AND "completedAt" IS NULL) AS pending`, item.creatorId);
     if (processed || !pending.pending) await require("./media-entity-change-service").publishMediaResult({ db: tx, ...scope, kind: "FINANCIAL_PROJECTED",
       state: { workId: item.id, requestedRevision: String(item.requestedRevision), cursor: adopt?.saleCursor || adopt?.factMedia || "", completed: !pending.pending } });
@@ -316,14 +332,19 @@ async function processPage({ db, item, ownerToken }) {
 
 async function financialProjectionState(db, creatorId) {
   const [row] = await db.$queryRawUnsafe(`SELECT
+    EXISTS(SELECT 1 FROM "CreatorMediaMessageEvidence" WHERE "creatorId"=$1 AND (dirty OR "pendingFacts")) AS "evidencePending",
     (EXISTS(SELECT 1 FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty)
+      OR EXISTS(SELECT 1 FROM "CreatorMediaMessageEvidence" WHERE "creatorId"=$1 AND (dirty OR "pendingFacts"))
       OR ${require("./earnings-coverage-service").financialPublicationPendingSql('$1')}) AS pending,
     NOT (EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1 AND ("completedAt" IS NULL OR "semanticsVersion"<2))
     OR EXISTS(SELECT 1 FROM "CreatorMediaUsageSourceState" WHERE "creatorId"=$1 AND "factProtocol"=0)
     OR EXISTS(SELECT 1 FROM "MaintenanceLaneState" m WHERE m.key=$2 AND m."completedAt" IS NULL
       AND $1<=m.cursor->>'upperId' AND NOT EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1))
     ) AS available`, creatorId, ADOPTION_KEY);
-  const available = row?.available === true;
+  // Evidence correction can redistribute or retract existing attachment
+  // amounts across several bounded commits. A partially repaired sum is never
+  // an available canonical amount, even while the previous counters remain.
+  const available = row?.available === true && row?.evidencePending !== true;
   return { available, ready: available && row?.pending === false, pending: row?.pending === true };
 }
 async function financialProjectionReady(db, creatorId) {

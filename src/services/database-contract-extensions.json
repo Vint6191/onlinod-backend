@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v40_campaign_source_validation_and_traffic_currency",
+  "version": "nod_current_v41_vault_message_media_evidence",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -180,6 +180,10 @@
     {
       "migration": "20261128080000_campaign_source_validation",
       "checksum": "7cd2cae921d9afaef97eaa5b71c9cbbfaca984d1915080a8388c216777bbbb84"
+    },
+    {
+      "migration": "20261128090000_vault_message_media_evidence",
+      "checksum": "9d4c83911dd5a6c6dc4a4b30348a7aae8c7e0503164626ea60612f1835bca6ed"
     }
   ],
   "extension": {
@@ -350,6 +354,10 @@
       },
       {
         "name": "TeamTipAlias",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorMediaMessageEvidence",
         "persistence": "p"
       }
     ],
@@ -3713,6 +3721,110 @@
         "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": "0"
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "sourceKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "messageId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "dialogId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "creatorMediaIds",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "excludedMediaIds",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "version",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "1"
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "manifestHash",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "dirty",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "true"
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "cursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "pendingFacts",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "true"
       }
     ],
     "enums": [],
@@ -5264,6 +5376,22 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK ((kind = ANY (ARRAY['TASK'::text, 'REFERENCE'::text, 'MANUAL_REMINDER'::text, 'AUTO_REMINDER'::text, 'CANCELLATION'::text, 'REVISION_REQUEST'::text, 'INSTRUCTION_PART'::text, 'INSTRUCTION_CONTINUATION'::text])))"
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "CreatorMediaMessageEvidence_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "CreatorMediaMessageEvidence_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", \"sourceKey\", \"messageId\")"
       }
     ],
     "indexes": [
@@ -6490,6 +6618,33 @@
         "options": "0 0 0 0",
         "expressions": null,
         "predicate": "(\"costCents\" <> 0)"
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "CreatorMediaMessageEvidence_pkey",
+        "unique": true,
+        "keys": "2 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "CreatorMediaMessageEvidence_dirty_idx",
+        "unique": false,
+        "keys": "2 10 3 4",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaMessageEvidence",
+        "name": "CreatorMediaMessageEvidence_pending_idx",
+        "unique": false,
+        "keys": "2",
+        "options": "0",
+        "expressions": null,
+        "predicate": "(dirty OR \"pendingFacts\")"
       }
     ]
   }

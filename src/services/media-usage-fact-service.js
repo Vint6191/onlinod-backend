@@ -5,6 +5,7 @@ const { hashCanonicalJson } = require("./realtime-receipt-hash");
 const { publishMediaResult } = require("./media-entity-change-service");
 const MAX_FACTS = 2000, MAX_LEGACY_MEDIA = 2000, MAX_RUNS = 8;
 const financialMedia = require("./media-financial-projection-service");
+const mediaEvidence = require("./media-message-evidence-service");
 const COUNTS = financialMedia.COUNTS;
 
 function fail(code, sourceKey, reason, status = 409) {
@@ -38,16 +39,22 @@ function normalizeUsageFactSource(input) {
   if (!Array.isArray(input.facts) || input.facts.length > MAX_FACTS || Buffer.byteLength(JSON.stringify(input)) > 4 * 1024 * 1024) {
     fail("MEDIA_LIBRARY_USAGE_SOURCE_TOO_LARGE", sourceKey, "bounded fact page required", 413);
   }
-  const runId = crypto.createHash("sha256").update(JSON.stringify([sourceKey, coverage.localRevision])).digest("hex");
+  const messageMediaEvidence = mediaEvidence.normalizeMessageMediaEvidence(input.messageMediaEvidence, sourceKey);
+  const runId = crypto.createHash("sha256").update(JSON.stringify(input.messageMediaEvidence === undefined
+    ? [sourceKey, coverage.localRevision]
+    : [sourceKey, coverage.localRevision, "media-message-evidence-v1"])).digest("hex");
   if (!page || page.runId !== runId || !Number.isSafeInteger(page.pageNumber) || page.pageNumber < 1
     || typeof page.done !== "boolean" || !/^[a-f0-9]{64}$/.test(page.pageHash || "")
     || !(page.previousHash === null || /^[a-f0-9]{64}$/.test(page.previousHash || ""))
     || page.pageHash !== hashCanonicalJson(input.facts)
     || (page.done && (!Number.isSafeInteger(page.totalFacts) || page.totalFacts < 0))
-    || (!page.done && (page.totalFacts !== undefined || input.facts.length === 0))) {
+    || (input.messageMediaEvidence !== undefined
+      ? page.mediaEvidenceHash !== hashCanonicalJson(input.messageMediaEvidence)
+      : page.mediaEvidenceHash !== undefined)
+    || (!page.done && (page.totalFacts !== undefined || (input.facts.length === 0 && messageMediaEvidence.length === 0)))) {
     fail("MEDIA_USAGE_FACT_INVALID", sourceKey, "page manifest");
   }
-  let prior = null;
+  let prior = null, priorAllocation = null;
   const facts = input.facts.map(fact => {
     if (!fact || !text(fact.messageId, 240) || !text(fact.mediaId, 240) || fact.sentCount !== 1
       || ![0, 1].includes(fact.soldCount) || ![0, 1].includes(fact.notOpenedCount) || ![0, 1].includes(fact.freeCount)
@@ -61,6 +68,13 @@ function normalizeUsageFactSource(input) {
     if ((fact.allocationCount !== undefined || fact.allocationIndex !== undefined)
       && (!Number.isSafeInteger(fact.allocationCount) || fact.allocationCount < 1 || fact.allocationCount > 100000
         || !Number.isSafeInteger(fact.allocationIndex) || fact.allocationIndex < 0 || fact.allocationIndex >= fact.allocationCount)) fail("MEDIA_USAGE_FACT_INVALID", sourceKey, "allocation ordinal");
+    if (fact.allocationCount !== undefined) {
+      if (priorAllocation?.messageId === fact.messageId
+        && (priorAllocation.count !== fact.allocationCount || priorAllocation.index >= fact.allocationIndex)) {
+        fail("MEDIA_USAGE_ALLOCATION_CONFLICT", sourceKey, "message attachment ordinals overlap or disagree");
+      }
+      priorAllocation = { messageId: fact.messageId, count: fact.allocationCount, index: fact.allocationIndex };
+    }
     if (fact.purchaseEvidence !== undefined && !["PROVIDER","CANONICAL","NONE"].includes(fact.purchaseEvidence)) fail("MEDIA_USAGE_FACT_INVALID", sourceKey, "purchase evidence");
     return { messageId: fact.messageId, mediaId: fact.mediaId, ...counters(fact),
       ...(fact.allocationCount === undefined ? {} : { allocationCount: fact.allocationCount, allocationIndex: fact.allocationIndex }),
@@ -69,7 +83,7 @@ function normalizeUsageFactSource(input) {
   return { protocolVersion: 2, sourceKey, sourceRevision: input.sourceRevision, capturedAt: new Date(input.capturedAt),
     coverage: { version: 1, complete: coverage.complete, localRevision: coverage.localRevision, messageCount: coverage.messageCount,
       oldestMessageAt: coverage.oldestMessageAt && timestamp(coverage.oldestMessageAt), newestMessageAt: coverage.newestMessageAt && timestamp(coverage.newestMessageAt) },
-    facts, factPage: { ...page } };
+    facts, messageMediaEvidence, factPage: { ...page } };
 }
 
 function advanceRun(state, source) {
@@ -112,6 +126,9 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source }) {
   const run = advanceRun(state, source);
   if (run.duplicate) return { accepted: false, stale: true, acceptedItems: 0, missingMediaIds: [], awaitingCompleteSource: state?.factProtocol === 0,
     awaitingCompleteReason: state?.coverage?.awaitingCompleteReason || "COMPLETE_MANIFEST_REQUIRED" };
+  const evidenceChanged = await mediaEvidence.publishMessageMediaEvidence(tx, {
+    agencyId, creatorId, sourceKey: source.sourceKey, evidence: source.messageMediaEvidence || [],
+  });
   // A source absent from the old atomic state+aggregate writer has no legacy
   // aggregate to replace. The v2 hot path never counts/scans its source history.
   const legacy = state?.factProtocol === 0;
@@ -139,6 +156,24 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source }) {
     WHERE f."agencyId"=$1 AND f."creatorId"=$2 AND f."sourceKey"=$3`, agencyId, creatorId, source.sourceKey, JSON.stringify(source.facts)) : [];
   const previous = new Map(existing.map(row => [key({ messageId: row.sourceMessageId, mediaId: row.mediaId }), row]));
   const financialStates = await financialMedia.statesForFacts(tx, scope, source.facts.map(fact => ({ ...fact, sourceKey: source.sourceKey })));
+  const messageEvidence = await mediaEvidence.evidenceForFacts(tx, scope, source.facts.map(fact => ({ ...fact, sourceKey: source.sourceKey })));
+  // Legacy producers supply per-attachment ordinals without a complete message
+  // manifest. They may add missing stable facts, but cannot change an existing
+  // denominator or reuse another attachment's ordinal and mint package money.
+  const unproven = source.facts.filter(fact => fact.allocationCount !== undefined
+    && !messageEvidence.has(JSON.stringify([source.sourceKey, fact.messageId])));
+  if (unproven.length) {
+    const [conflict] = await tx.$queryRawUnsafe(`SELECT 1 AS conflict FROM "CreatorMediaUsageFact" f
+      JOIN jsonb_to_recordset($4::jsonb) x("messageId" text,"mediaId" text,"allocationCount" int,"allocationIndex" int)
+        ON f."sourceMessageId"=x."messageId"
+      WHERE f."agencyId"=$1 AND f."creatorId"=$2 AND f."sourceKey"=$3
+        AND COALESCE(f."observedPayload",f.payload) ? 'allocationCount'
+        AND ((COALESCE(f."observedPayload",f.payload)->>'allocationCount')::int<>x."allocationCount"
+          OR (f."mediaId"=x."mediaId" AND (COALESCE(f."observedPayload",f.payload)->>'allocationIndex')::int<>x."allocationIndex")
+          OR (f."mediaId"<>x."mediaId" AND (COALESCE(f."observedPayload",f.payload)->>'allocationIndex')::int=x."allocationIndex"))
+      LIMIT 1`, agencyId, creatorId, source.sourceKey, JSON.stringify(unproven));
+    if (conflict) fail("MEDIA_USAGE_ALLOCATION_CONFLICT", source.sourceKey, "complete validated message evidence required for allocation changes");
+  }
   const changed = [], baselines = new Map(), pendingLegacy = new Set();
   for (const incoming of source.facts) {
     const old = previous.get(key(incoming)), oldObserved = old?.observedPayload || old?.payload;
@@ -155,7 +190,7 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source }) {
     if (observed.allocationCount === undefined && oldObserved?.allocationCount !== undefined) observed = {
       ...observed, allocationCount: oldObserved.allocationCount, allocationIndex: oldObserved.allocationIndex,
     };
-    const fact = financialMedia.effectiveFact(observed, state);
+    const fact = financialMedia.effectiveFact(observed, state, messageEvidence.get(JSON.stringify([source.sourceKey, incoming.messageId])));
     if (old && hashCanonicalJson(old.payload) === hashCanonicalJson(fact)
       && hashCanonicalJson(oldObserved) === hashCanonicalJson(observed)) continue;
     const row = contributionById.get(fact.mediaId);
@@ -181,6 +216,8 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source }) {
         "sourceRevision"=EXCLUDED."sourceRevision","lastSeenRunId"=EXCLUDED."lastSeenRunId","updatedAt"=EXCLUDED."updatedAt"`,
     agencyId, creatorId, source.sourceKey, JSON.stringify(changed.map(({ fact, observed }) => ({ id: crypto.randomUUID(), messageId: fact.messageId, mediaId: fact.mediaId, payload: fact, observed, purchased: Boolean(fact.soldCount) }))), source.sourceRevision, source.factPage.runId);
   }
+  await mediaEvidence.refreshEvidenceCompleteness(tx, { agencyId, creatorId, sourceKey: source.sourceKey,
+    messageIds: [...new Set([...source.facts.map(fact => fact.messageId), ...(source.messageMediaEvidence || []).map(row => row.messageId)])] });
   if (activate) for (const row of legacyRows) {
     pendingLegacy.add(row.mediaId);
     if (!baselines.has(row.mediaId)) baselines.set(row.mediaId, counters(row.factBaseline || zero()));
@@ -232,6 +269,9 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source }) {
     await publishMediaResult({ db: tx, agencyId, creatorId, kind: "USAGE_FACTS", entityId: `usage:${source.sourceKey}`,
       state: { runId: source.factPage.runId, pageHash: source.factPage.pageHash, baseline: [...baselines] } });
   }
+  if (evidenceChanged && !projected.length) await publishMediaResult({ db: tx, agencyId, creatorId,
+    kind: "USAGE_FACTS", entityId: `usage:${source.sourceKey}`,
+    state: { runId: source.factPage.runId, mediaEvidenceHash: source.factPage.mediaEvidenceHash } });
   return { accepted: true, stale: false, acceptedItems: changed.length, missingMediaIds: mediaIds.filter(id => !activeIds.has(id)),
     awaitingCompleteSource: legacy && !activate, awaitingCompleteReason: run.coverage.awaitingCompleteReason };
 }

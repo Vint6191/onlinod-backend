@@ -48,7 +48,7 @@ function contribution(m) {
     totalPrice: m.price,
   };
 }
-function comparable(m) {
+function comparable(m, includeMediaEvidence = true) {
   return {
     platformCreatorId: m.platformCreatorId,
     platformFanId: m.platformFanId,
@@ -56,10 +56,39 @@ function comparable(m) {
     sender: m.sender,
     text: m.text,
     mediaIds: m.mediaIds,
+    ...(includeMediaEvidence && m.mediaEvidence ? { mediaEvidence: m.mediaEvidence } : {}),
     price: m.price,
     createdAt: m.createdAt,
     changedAt: m.changedAt,
   };
+}
+function normalizeMediaEvidence(value, mediaIds) {
+  if (value == null) return null;
+  const proof = c.object(value);
+  c.check(proof.version === 1 && proof.complete === true
+    && Array.isArray(proof.creatorMediaIds) && Array.isArray(proof.excludedMediaIds)
+    && proof.creatorMediaIds.length <= 100 && proof.excludedMediaIds.length <= 100,
+  "DIALOG_MEDIA_EVIDENCE_INVALID", 400);
+  const creatorMediaIds = proof.creatorMediaIds.map(c.platformId).sort();
+  const excludedMediaIds = proof.excludedMediaIds.map(c.platformId).sort();
+  c.check(new Set(creatorMediaIds).size === creatorMediaIds.length
+    && new Set(excludedMediaIds).size === excludedMediaIds.length
+    && !creatorMediaIds.some(id => excludedMediaIds.includes(id))
+    && creatorMediaIds.every(id => mediaIds.includes(id))
+    && !excludedMediaIds.some(id => mediaIds.includes(id)), "DIALOG_MEDIA_EVIDENCE_INVALID", 400);
+  return { version: 1, complete: true, creatorMediaIds, excludedMediaIds };
+}
+function mergeMediaEvidence(previous, incoming) {
+  if (!previous && !incoming) return null;
+  const excludedMediaIds = [...new Set([...(previous?.excludedMediaIds || []), ...(incoming?.excludedMediaIds || [])])].sort();
+  // An old PC or delayed provider response cannot revive a previously proven
+  // fan attachment as creator-owned. It needs a separate reviewed correction.
+  c.check(!(incoming?.creatorMediaIds || []).some(id => (previous?.excludedMediaIds || []).includes(id)),
+    "DIALOG_MEDIA_OWNERSHIP_CONFLICT", 409);
+  const creatorMediaIds = [...new Set([...(previous?.creatorMediaIds || []), ...(incoming?.creatorMediaIds || [])])]
+    .filter(id => !excludedMediaIds.includes(id)).sort();
+  c.check(creatorMediaIds.length <= 100 && excludedMediaIds.length <= 100, "DIALOG_MEDIA_EVIDENCE_TOO_LARGE", 413);
+  return { version: 1, complete: true, creatorMediaIds, excludedMediaIds };
 }
 function normalize(ctx, dialogId, raw) {
   c.check(
@@ -103,6 +132,10 @@ function normalize(ctx, dialogId, raw) {
     changedAt: raw.changedAt ? c.iso(raw.changedAt) : null,
     source: raw.source === "delta_scan" ? "delta_scan" : "full_scan",
   };
+  if (raw.mediaEvidence != null) {
+    c.check(m.sender === "creator", "DIALOG_MEDIA_EVIDENCE_AUTHOR_INVALID", 400);
+    m.mediaEvidence = normalizeMediaEvidence(raw.mediaEvidence, m.mediaIds);
+  }
   c.bounded(m, 98304);
   return m;
 }
@@ -394,9 +427,14 @@ class DialogRepository {
         );
         for (const candidate of normalized) {
           const old = priorById.get(candidate.messageId);
-          if (old && input.presentFields)
+          if (old && input.presentFields) {
             for (const key of ["text", "mediaIds", "price", "createdAt"])
               if (!input.presentFields.includes(key)) candidate[key] = old.data[key];
+            if (!input.presentFields.includes("mediaIds")) {
+              if (old.data.mediaEvidence) candidate.mediaEvidence = old.data.mediaEvidence;
+              else delete candidate.mediaEvidence;
+            }
+          }
           // The new server archive starts at activation; this is not an implicit local-history import.
           if (!old && new Date(candidate.createdAt) < new Date(scope.collection_from) && !input.targeted) {
             summary.duplicates++;
@@ -410,6 +448,17 @@ class DialogRepository {
           const { providerPurchaseObservedAt: observationAt, ...observedMessage } = candidate;
           const next = stale ? { ...old.data } : { ...observedMessage };
           delete next.providerPurchaseObservedAt;
+          if (candidate.sender === "creator") {
+            // Attachments are historical observations. A sparse message update
+            // cannot erase them. Only explicit fan-ownership evidence removes
+            // an ID; an unknown legacy ID never becomes certified by this union.
+            const mediaEvidence = mergeMediaEvidence(old?.data.mediaEvidence, candidate.mediaEvidence);
+            const excluded = new Set(mediaEvidence?.excludedMediaIds || []);
+            next.mediaIds = [...new Set([...(old?.data.mediaIds || []), ...candidate.mediaIds])]
+              .filter(id => !excluded.has(id));
+            c.check(next.mediaIds.length <= 100, "DIALOG_MEDIA_TOO_LARGE", 413);
+            if (mediaEvidence) next.mediaEvidence = mediaEvidence;
+          }
           if (old)
             c.check(
               next.createdAt === c.iso(old.created_at) && next.sender === old.sender,
@@ -563,6 +612,8 @@ class DialogRepository {
           ...patch,
           newestMessageId: upper?.id || null,
           newestMessageAt: upper?.at || null,
+          ...(thread.state.hasCreatorMediaEvidence === true || writes.some(row => row.data.sender === "creator" && row.data.mediaEvidence)
+            ? { hasCreatorMediaEvidence: true } : {}),
         };
         if (f) {
           nextState.scanCursorId = nextState.scanHasMore ? f.nextCursor || null : null;
@@ -703,7 +754,10 @@ class DialogRepository {
         (row) =>
           !input.unchangedMessages ||
           (candidates.has(row.message_id) &&
-            c.hash(comparable(candidates.get(row.message_id))) === row.content_hash &&
+            // Acquiring ownership proof for an unchanged legacy message must
+            // not defeat the bounded known-page overlap and rescan all history.
+            // The commit fingerprint still includes the proof and publishes it.
+            c.hash(comparable(candidates.get(row.message_id), false)) === c.hash(comparable(row.data, false)) &&
             Boolean(candidates.get(row.message_id).opened) === row.provider_opened)
       )
       .map((row) => row.message_id);

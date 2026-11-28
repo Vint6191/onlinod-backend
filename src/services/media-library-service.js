@@ -1,6 +1,6 @@
 "use strict";
 const { runDbTransaction } = require("./db-transaction-service");
-const { mediaOffset, exactMediaCount, readMediaPage } = require("./media-read-page");
+const { mediaOffset, exactMediaCount, readMediaPage, readMediaSnapshot } = require("./media-read-page");
 
 
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
@@ -523,6 +523,12 @@ async function deleteMediaAssets({ agencyId, creatorId, mediaIds, db = prisma })
 }
 
 async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
+  // Totals and their availability witness must refer to the same projection
+  // commit, including callers outside the HTTP viewer transaction.
+  return readMediaSnapshot(db, tx => readMediaSalesSummarySnapshot({ agencyId, creatorId, db: tx }));
+}
+
+async function readMediaSalesSummarySnapshot({ agencyId, creatorId, db }) {
   const id = await requireCreator(db, agencyId, creatorId);
   // One statement gives the sums and distinct opaque usage sources one MVCC
   // snapshot. No buyer keys or source rows are materialized in application RAM.
@@ -558,9 +564,11 @@ async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
       opened: exactMediaCount(totals.totalSales),
       notOpened: exactMediaCount(totals.notOpened),
       free: exactMediaCount(totals.free),
-      unresolved: 0,
+      // Asset usage aggregates do not contain resolution-debt or deleted-fan
+      // identity counts. Absence of that evidence must not certify zero.
+      unresolved: null,
       uniqueBuyers: exactMediaCount(totals.uniqueBuyers),
-      deletedBuyers: 0,
+      deletedBuyers: null,
       lastSaleAt: iso(totals.lastSaleAt),
     },
   };
@@ -594,7 +602,12 @@ function assetToSalesAsset(asset, moneyState = {ready:true,available:true,pendin
   };
 }
 
-async function listMediaSalesAssets({ agencyId, creatorId, offset = 0, limit = 100, mediaType = null, moneyAllowed = true, db = prisma }) {
+async function listMediaSalesAssets(input) {
+  return readMediaSnapshot(input.db === undefined ? prisma : input.db,
+    tx => readMediaSalesAssetsSnapshot({ ...input, db: tx }));
+}
+
+async function readMediaSalesAssetsSnapshot({ agencyId, creatorId, offset = 0, limit = 100, mediaType = null, moneyAllowed = true, db }) {
   const id = await requireCreator(db, agencyId, creatorId);
   const skip = mediaOffset(offset);
   const take = integer(limit, 100, 1, 500);

@@ -26,7 +26,7 @@ function matchesWhere(row, where = {}) {
   return true;
 }
 
-function fakeDb() {
+function fakeDb(moneyState = { available: true, pending: false }) {
   const catalog = [
     {
       id: "c1", mediaId: "m1", mediaType: "video", catalogActive: true,
@@ -47,8 +47,8 @@ function fakeDb() {
   return commitDatabaseFixture({
     async $queryRawUnsafe(sql, ...params) {
       if (sql.includes('FROM "CreatorMediaMessageFinancialState"')) {
-        assert.deepEqual(params,["creator-1","media_financial_adoption_v1"]);
-        return [{ready:true}];
+        assert.deepEqual(params,["creator-1","media_financial_adoption_v2"]);
+        return [moneyState];
       }
       if (sql.includes('FROM "DialogScanState"')) {
         const [agency,creator,selection,generation,startedAt] = params;
@@ -152,6 +152,18 @@ test("catalog media stays pending until initial Messages and dialog scans are au
   assert.equal(result.pipeline, null);
   assert.equal(result.analytics[0].usageState, "PENDING");
   assert.equal(result.analytics[0].neverUsed, false);
+});
+
+test("pending ownership evidence suppresses saved revenue availability throughout Vault Directory", async () => {
+  const result = await getVaultDirectoryIntelligence({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["m1"], includePipeline: false,
+    db: fakeDb({ available: false, pending: true }),
+  });
+  for (const view of [result.summary, ...result.analytics, ...result.topAssets]) {
+    assert.equal(view.revenueAvailable, false);
+    assert.equal(view.revenueComplete, false);
+    assert.equal(view.revenuePending, true);
+  }
 });
 
 test("protection check returns every requested active Media Library id", async () => {

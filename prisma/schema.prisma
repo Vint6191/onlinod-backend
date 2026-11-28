@@ -480,6 +480,7 @@ model CreatorAccount {
   mediaUsageFacts CreatorMediaUsageFact[]
   mediaSaleLinks CreatorMediaSaleLink[]
   mediaFinancialStates CreatorMediaMessageFinancialState[]
+  mediaMessageEvidence CreatorMediaMessageEvidence[]
   mediaFinancialAdoption CreatorMediaFinancialAdoptionState[]
   notificationFrontierPages CreatorNotificationFrontierPage[]
 
@@ -4259,6 +4260,27 @@ model CreatorMediaMessageFinancialState {
   creator CreatorAccount @relation(fields: [agencyId,creatorId], references: [agencyId,id], onDelete: Cascade)
   @@id([creatorId,sourceKey,messageId])
   @@index([creatorId,dirty,sourceKey,messageId], map: "CreatorMediaMessageFinancialState_dirty_idx")
+}
+
+// Complete provider attachment observations are independent from financial
+// truth. Explicit fan ownership stays fenced across stale Desktop replays.
+model CreatorMediaMessageEvidence {
+  agencyId String
+  creatorId String
+  sourceKey String
+  messageId String
+  dialogId String
+  creatorMediaIds Json
+  excludedMediaIds Json
+  version Int @default(1)
+  manifestHash String
+  dirty Boolean @default(true)
+  pendingFacts Boolean @default(true)
+  cursor String @default("")
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId,creatorId], references: [agencyId,id], onDelete: Cascade)
+  @@id([creatorId,sourceKey,messageId])
+  @@index([creatorId,dirty,sourceKey,messageId], map: "CreatorMediaMessageEvidence_dirty_idx")
 }
 
 model CreatorMediaFinancialAdoptionState {

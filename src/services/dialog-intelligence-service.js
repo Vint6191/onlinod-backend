@@ -1669,20 +1669,34 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
   const isMessageBatch = chunk.kind === "dialog_message_batch";
   if (chunk.kind !== "dialog_message_page" && !isMessageBatch) throw new Error("Unsupported dialog intelligence chunk");
   const params = object(job.params);
-  const runId = clean(chunk.runId ?? params.scanRunId, 160);
-  const dialogId = clean(chunk.dialogId ?? params.dialogId, 180);
+  // The lease owns one run and one dialog. A compact local-commit receipt is
+  // evidence for that scope; its producer cannot redirect the receipt to a
+  // different pending purchase or to another run of the same creator.
+  const runId = clean(params.scanRunId, 160);
+  const dialogId = clean(params.dialogId, 180);
   const chunkKey = clean(chunk.chunkKey, 320);
   if (!job.agencyId || !job.creatorId || !runId || !dialogId || !chunkKey) throw new Error("Dialog chunk scope is incomplete");
+  if ((chunk.runId !== undefined && chunk.runId !== runId)
+    || (chunk.dialogId !== undefined && chunk.dialogId !== dialogId)) {
+    throw Object.assign(new Error("Dialog chunk does not belong to the leased run and dialog"), { code: "DIALOG_CHUNK_SCOPE_MISMATCH", status: 409, retryable: false });
+  }
+
+  const run = await db.dialogScanRun.findFirst({ where: { id: runId, creatorId: job.creatorId, agencyId: job.agencyId } });
+  if (!run) throw new Error("Dialog scan run not found");
+  if (run.dialogId !== dialogId || run.jobId !== job.id) {
+    throw Object.assign(new Error("Dialog run is no longer owned by this job"), { code: "DIALOG_CHUNK_SCOPE_MISMATCH", status: 409, retryable: false });
+  }
 
   const existing = await db.dialogScanChunkCommit.findUnique({ where: { runId_chunkKey: { runId, chunkKey } } });
   if (existing) {
+    if (existing.agencyId !== job.agencyId || existing.creatorId !== job.creatorId || existing.dialogId !== dialogId) {
+      throw Object.assign(new Error("Dialog receipt does not belong to the leased scope"), { code: "DIALOG_CHUNK_SCOPE_MISMATCH", status: 409, retryable: false });
+    }
     // Lost responses remain replayable, but the saved result contains only
     // compact local-commit metadata. Raw conversations never enter PostgreSQL.
     return { duplicate: true, replayedCommit: true, chunkId: existing.id, ...object(existing.result) };
   }
 
-  const run = await db.dialogScanRun.findFirst({ where: { id: runId, creatorId: job.creatorId, agencyId: job.agencyId } });
-  if (!run) throw new Error("Dialog scan run not found");
   const observedAt = new Date();
 
   // Desktop commits complete OF pages to dialog-messages.sqlite before it
@@ -1746,10 +1760,12 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
   if (isTargeted) {
     const expectedTarget = clean(currentContinuation.targetMessageId ?? params.targetMessageId, 240);
     const expectedReceipt = clean(currentContinuation.targetReceiptId, 80);
-    const unavailable = chunk.targetMissing === true && [404, 410].includes(Number(object(chunk.progress).status));
+    const unavailable = chunk.targetMissing === true && [404, 410].includes(object(chunk.progress).status)
+      && !messageIds.includes(targetMessageId);
+    const committedTarget = chunk.targetMissing !== true && messageIds.includes(targetMessageId);
     if (!targetMessageId || targetMessageId !== expectedTarget
       || (expectedReceipt && clean(chunk.targetReceiptId, 80) !== expectedReceipt)
-      || (!messageIds.includes(targetMessageId) && !unavailable)) {
+      || (!committedTarget && !unavailable)) {
       throw Object.assign(new Error("Target result requires the exact locally committed message or an explicit 404/410"), { code: "DIALOG_TARGET_COMMIT_PROOF_MISSING" });
     }
   }
@@ -1810,6 +1826,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
   if (isTargeted && targetMessageId) {
     await db.dialogReconciliationTarget.updateMany({
       where: {
+        agencyId: job.agencyId,
         creatorId: job.creatorId,
         dialogId,
         messageId: targetMessageId,

@@ -964,15 +964,20 @@ router.patch("/control", workspaceSettingsRequired, async (req, res) => {
 
 router.get("/creators/:creatorId/diagnostics", async (req, res) => {
   try {
-    const [states, runs, jobs] = await Promise.all([
-      prisma.dialogScanState.findMany({ where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId }, orderBy: { updatedAt: "desc" }, take: 250 }),
-      prisma.dialogScanRun.findMany({ where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId }, orderBy: { createdAt: "desc" }, take: 50 }),
-      prisma.jobInstance.findMany({
-        where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, jobKey: DIALOG_INTELLIGENCE_JOB_KEY },
-        orderBy: { createdAt: "desc" }, take: 50,
-        select: { id: true, status: true, progress: true, continuation: true, claimedByDeviceId: true, leaseUntil: true, leaseRevision: true, attempts: true, lastError: true, lastProgressAt: true, createdAt: true },
-      }),
-    ]);
+    const scope = { agencyId: req.auth.agencyId, creatorId: req.params.creatorId };
+    const jobScope = { ...scope, jobKey: DIALOG_INTELLIGENCE_JOB_KEY };
+    const jobSelect = { id: true, status: true, progress: true, continuation: true, claimedByDeviceId: true, leaseUntil: true, leaseRevision: true, attempts: true, lastError: true, lastProgressAt: true, createdAt: true };
+    const [states, recentRuns, recentJobs, activeRun, activeJob] = await runDbTransaction(prisma, tx => Promise.all([
+      tx.dialogScanState.findMany({ where: scope, orderBy: { updatedAt: "desc" }, take: 250 }),
+      tx.dialogScanRun.findMany({ where: scope, orderBy: { createdAt: "desc" }, take: 50 }),
+      tx.jobInstance.findMany({ where: jobScope, orderBy: { createdAt: "desc" }, take: 50, select: jobSelect }),
+      // A long-running or paused collection must not disappear from controls
+      // merely because fifty newer targeted jobs have already completed.
+      tx.dialogScanRun.findFirst({ where: { ...scope, status: { in: ["QUEUED", "RUNNING", "PAUSED"] } }, orderBy: { createdAt: "desc" } }),
+      tx.jobInstance.findFirst({ where: { ...jobScope, status: { in: ["SCHEDULED", "CLAIMED"] } }, orderBy: { createdAt: "desc" }, select: jobSelect }),
+    ]), { isolationLevel: "RepeatableRead", timeout: 15000 });
+    const includeActive = (active, recent) => active ? [active, ...recent.filter(row => row.id !== active.id)] : recent;
+    const runs = includeActive(activeRun, recentRuns), jobs = includeActive(activeJob, recentJobs);
     return res.json({ ok: true, states, runs, jobs });
   } catch (error) { return serviceError(res, error, "DIALOG_DIAGNOSTICS_FAILED"); }
 });

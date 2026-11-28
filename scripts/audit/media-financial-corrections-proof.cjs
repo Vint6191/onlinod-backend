@@ -36,7 +36,9 @@ function fact(messageId,mediaId,{sold=true,count=1,index=0,evidence='CANONICAL',
  await publish({messageId:'12',netCents:900,transactionStatus:'done'});await drain();
  current=(await read()).entities.find(row=>row.entityType==='MESSAGE_PURCHASE'&&row.entityId==='42:11');assert.equal(current.tombstone,true);
  await submit('late-positive171',[fact('11','a',{legacy:true})]);assert.equal((await asset('a')).soldCount,0);assert.equal((await asset('a')).revenueCents,0);
- await submit('independent-provider',[fact('11','a',{evidence:'PROVIDER'}),fact('12','c')]);await drain();await db.creatorMediaAsset.updateMany({where:own,data:{catalogActive:true}});
+ // The independent open proof changes purchase authority, not the immutable
+ // two-attachment package. A partial PC must keep its original allocation.
+ await submit('independent-provider',[fact('11','a',{evidence:'PROVIDER',count:2,index:0}),fact('12','c')]);await drain();await db.creatorMediaAsset.updateMany({where:own,data:{catalogActive:true}});
  assert.equal((await asset('a')).soldCount,1);assert.equal((await asset('a')).revenueUnknownCount,1);assert.equal((await asset('c')).revenueCents,900);
  let summary=(await media.getMediaSalesSummary({...own,db})).summary;assert.equal(summary.revenueCents,900);assert.equal(summary.revenueComplete,false);
  const sales=await media.listMediaSalesAssets({...own,db});assert.equal(sales.items.find(item=>item.mediaId==='a').revenueComplete,false);
@@ -44,7 +46,7 @@ function fact(messageId,mediaId,{sold=true,count=1,index=0,evidence='CANONICAL',
  // Existing171 rows have no observedPayload or allocation metadata, and old
  // reverse positive11 survives a correction to12. Adoption must repair both.
  const legacySale={...sale,id:'legacy-sale',externalTransactionId:'legacy-tx',eventFingerprint:'b'.repeat(64),messageId:'22',netCents:777,transactionStatus:'done'};
- await commit(async tx=>{await tx.creatorSale.create({data:legacySale});await tx.creatorEarningsLedgerEntry.create({data:{...own,transactionId:'legacy-tx',occurredAt:now,observedAt:now,category:'messages',netCents:0n,status:'undo'}});
+ await commit(async tx=>{await require(root+'/src/services/earnings-generation-service').lock(tx,s.creatorId);await tx.creatorSale.create({data:legacySale});await tx.creatorEarningsLedgerEntry.create({data:{...own,transactionId:'legacy-tx',occurredAt:now,observedAt:now,category:'messages',netCents:0n,status:'undo'}});
   for(const [suffix,messageId,category,status] of [['tip','24','tips','done'],['superseded','25','messages','superseded']]){
    const id='legacy-'+suffix,transactionId='legacy-'+suffix+'-tx';
    await tx.creatorSale.create({data:{...sale,id,externalTransactionId:transactionId,eventFingerprint:crypto.createHash('sha256').update(id).digest('hex'),messageId,transactionStatus:status}});

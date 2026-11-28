@@ -116,6 +116,7 @@ function chunkDbFixture() {
   const calls = { messageUpserts: 0, commitCreates: 0, targetResolves: 0, projections: 0 };
   const run = {
     id: "run-1", agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-1",
+    jobId: "job-1",
     mode: "initial", status: "RUNNING", pagesProcessed: 4, messagesProcessed: 100,
     mediaProcessed: 0, continuation: { mode: "initial", cursor: "cursor-4", page: 4 },
   };
@@ -212,6 +213,8 @@ test("standalone targeted commit and completion preserve batch-owned history, an
   for (const invalid of [
     { ...chunk, mode: "initial" }, { ...chunk, messageIds: ["wrong"] },
     { ...chunk, messageIds: [], targetMissing: true, progress: { status: 403 } },
+    { ...chunk, targetMissing: true, progress: { status: 403 } },
+    { ...chunk, targetMissing: true, progress: { status: 404 } },
   ]) await assert.rejects(service.applyDialogIntelligenceChunk({ db: f.db, job, chunkResult: invalid }), /Target/);
   const applied = await service.applyDialogIntelligenceChunk({ db: f.db, job, chunkResult: chunk });
   assert.equal(applied.completeAfterCommit, true); assert.equal(applied.jobContinuationOverride, null);
@@ -219,6 +222,27 @@ test("standalone targeted commit and completion preserve batch-owned history, an
   await service.completeDialogIntelligenceJob({ db: f.db, job, result: applied.completionResult });
   assert.deepEqual(f.state, before); assert.equal(f.run.status, "COMPLETED");
   assert.equal(f.calls.messageUpserts, 0, "raw messages never enter the backend ledger");
+});
+
+test("target purchase receipts remain bound to the leased run and dialog before replay", async () => {
+  const prismaModule = require.resolve("../prisma");
+  require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
+  delete require.cache[require.resolve("./dialog-intelligence-service")];
+  const { applyDialogIntelligenceChunk } = require("./dialog-intelligence-service");
+  const f = chunkDbFixture(); f.run.mode = "targeted";
+  const job = { id: "job-1", agencyId: "agency-1", creatorId: "creator-1", params: {
+    scanRunId: "run-1", dialogId: "dialog-1", mode: "targeted", targetMessageId: "message-target",
+  } };
+  const chunk = { kind: "dialog_message_page", runId: "run-1", dialogId: "dialog-1", mode: "targeted", chunkKey: "scoped-target",
+    targetMessageId: "message-target", messageIds: ["message-target"], hasMore: false };
+  for (const override of [{ runId: "other-run" }, { dialogId: "other-dialog" }, { dialogId: { toString: () => "dialog-1" } }]) {
+    await assert.rejects(applyDialogIntelligenceChunk({ db: f.db, job, chunkResult: { ...chunk, ...override } }), { code: "DIALOG_CHUNK_SCOPE_MISMATCH" });
+  }
+  assert.equal(f.calls.commitCreates, 0); assert.equal(f.targets[0].status, "PENDING");
+  await applyDialogIntelligenceChunk({ db: f.db, job, chunkResult: chunk });
+  f.run.jobId = "new-job";
+  await assert.rejects(applyDialogIntelligenceChunk({ db: f.db, job, chunkResult: chunk }), { code: "DIALOG_CHUNK_SCOPE_MISMATCH" });
+  assert.equal(f.calls.commitCreates, 1);
 });
 
 test("a target queued after the final page requeues the same job with a new lease revision", async () => {
@@ -319,6 +343,7 @@ test("a 50-message OF page increments durable run and dialog counters by 50", as
     params: { scanRunId: "run-1", dialogId: "dialog-1", mode: "initial", generation: 1 },
     continuation: { driverPhase: "execute", jobContinuation: { mode: "initial", cursor: null, page: 0 } },
   };
+  fixture.run.jobId = job.id;
   const result = await applyDialogIntelligenceChunk({
     db: fixture.db,
     job,
@@ -367,6 +392,7 @@ test("initial history batch advances durable counters once for multiple locally 
     params: { scanRunId: "run-1", dialogId: "dialog-1", mode: "initial", generation: 1 },
     continuation: { driverPhase: "execute", jobContinuation: { mode: "initial", cursor: null, page: 0 } },
   };
+  fixture.run.jobId = job.id;
   const result = await applyDialogIntelligenceChunk({
     db: fixture.db,
     job,

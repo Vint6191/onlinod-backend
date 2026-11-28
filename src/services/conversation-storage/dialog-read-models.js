@@ -14,6 +14,7 @@ function mediaRow(r) {
     created_at: c.iso(r.created_at),
     updated_at: r.data.updatedAt || c.iso(r.first_seen_at),
     purchase_evidence: r.provider_opened ? "PROVIDER" : r.canonical_opened ? "CANONICAL" : "NONE",
+    ...(r.data.mediaEvidence ? { media_evidence: r.data.mediaEvidence } : {}),
   };
 }
 function emptyCrmStats() {
@@ -168,8 +169,8 @@ class DialogReadModels {
     // Sizes are read before bodies; neither a large archive nor a corrupt row can make this fetch unbounded.
     const meta = await c.rows(
       this.db,
-      `SELECT dialog_id,message_id,octet_length((data->'mediaIds')::text)+1024 bytes FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=ANY($2::text[]) AND sender='creator'
-      AND data->'mediaIds'<>'[]'::jsonb AND (dialog_id,message_id)>($3,$4) ORDER BY dialog_id,message_id LIMIT $5`,
+      `SELECT dialog_id,message_id,octet_length((data->'mediaIds')::text)+coalesce(octet_length((data->'mediaEvidence')::text),0)+1024 bytes FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=ANY($2::text[]) AND sender='creator'
+      AND (data->'mediaIds'<>'[]'::jsonb OR data->'mediaEvidence'->>'complete'='true') AND (dialog_id,message_id)>($3,$4) ORDER BY dialog_id,message_id LIMIT $5`,
       ctx.scopeId,
       input.dialogIds,
       input.after?.dialogId || "",
@@ -189,7 +190,7 @@ class DialogReadModels {
     const rows = keys.length
       ? await c.rows(
           this.db,
-          `SELECT m.dialog_id,m.message_id,m.price_cents,m.provider_opened,m.canonical_opened,m.created_at,m.first_seen_at,jsonb_build_object('mediaIds',m.data->'mediaIds','updatedAt',m.data->'updatedAt') data FROM dialog_archive_message m JOIN jsonb_to_recordset($2::jsonb) x(dialog_id text,message_id text) USING(dialog_id,message_id) WHERE m.scope_id=$1 ORDER BY m.dialog_id,m.message_id`,
+          `SELECT m.dialog_id,m.message_id,m.price_cents,m.provider_opened,m.canonical_opened,m.created_at,m.first_seen_at,jsonb_build_object('mediaIds',m.data->'mediaIds','mediaEvidence',m.data->'mediaEvidence','updatedAt',m.data->'updatedAt') data FROM dialog_archive_message m JOIN jsonb_to_recordset($2::jsonb) x(dialog_id text,message_id text) USING(dialog_id,message_id) WHERE m.scope_id=$1 ORDER BY m.dialog_id,m.message_id`,
           ctx.scopeId,
           JSON.stringify(keys.map(([dialog_id, message_id]) => ({ dialog_id, message_id })))
         )
@@ -207,7 +208,7 @@ class DialogReadModels {
     return (
       await c.rows(
         this.db,
-        "SELECT dialog_id FROM dialog_archive_thread WHERE scope_id=$1 AND dialog_id>$2 AND (stats->>'mediaCount')::bigint>0 ORDER BY dialog_id LIMIT 100",
+        "SELECT dialog_id FROM dialog_archive_thread WHERE scope_id=$1 AND dialog_id>$2 AND ((stats->>'mediaCount')::bigint>0 OR state->>'hasCreatorMediaEvidence'='true') ORDER BY dialog_id LIMIT 100",
         ctx.scopeId,
         input.afterDialogId || ""
       )
@@ -239,18 +240,20 @@ class DialogReadModels {
       oldestMessageAt: state?.oldest_message_at || null,
       newestMessageAt: state?.newest_message_at || null,
     };
-    const facts = [];
+    const facts = [], messageMediaEvidence = [];
     let next = input.after || null;
     for (const row of page.messageRows) {
       const ids = JSON.parse(row.media_ids_json).sort(),
         price = Math.round(row.price * 100),
         purchased = row.opened === 1 && price > 0;
+      if (row.media_evidence) messageMediaEvidence.push({ dialogId: row.dialog_id, messageId: row.message_id, ...row.media_evidence });
+      if (!ids.length) next = { messageId: row.message_id, mediaId: "" };
       for (let index = 0; index < ids.length; index++) {
         const mediaId = ids[index];
         if (input.after && row.message_id === input.after.messageId && mediaId <= input.after.mediaId) continue;
         if (facts.length >= 1000) {
           await this.assertMediaUsageRevision(ctx, { dialogIds: [input.dialogId], revision: page.revision });
-          return { facts, coverage, revision: page.revision, capturedAt, next, done: false };
+          return { facts, messageMediaEvidence, coverage, revision: page.revision, capturedAt, next, done: false };
         }
         facts.push({
           messageId: row.message_id,
@@ -270,7 +273,7 @@ class DialogReadModels {
       }
     }
     await this.assertMediaUsageRevision(ctx, { dialogIds: [input.dialogId], revision: page.revision });
-    return { facts, coverage, revision: page.revision, capturedAt, next, done: page.done };
+    return { facts, messageMediaEvidence, coverage, revision: page.revision, capturedAt, next, done: page.done };
   }
   async listDialogMediaFacts(ctx, input) {
     const rows = await c.rows(
@@ -310,18 +313,21 @@ class DialogReadModels {
     if (input.assetId) add("(data->'mediaIds') @> ?::jsonb", JSON.stringify([c.platformId(input.assetId)]));
     if (input.from) add("created_at>=?::timestamptz", c.iso(input.from));
     if (input.to) add("created_at<=?::timestamptz", c.iso(input.to));
-    const offset = c.integer(input.offset, 0, 10000),
-      limit = Math.min(200, c.integer(input.limit, 100, 1000));
-    const count = Number(
-      (await c.one(this.db, `SELECT count(*) n FROM dialog_archive_message WHERE ${where.join(" AND ")}`, ...params)).n
-    );
-    const rows = await c.rows(
-      this.db,
-      `SELECT dialog_id,message_id,price_cents,provider_opened,canonical_opened,created_at,first_seen_at,jsonb_build_object('mediaIds',data->'mediaIds','updatedAt',data->'updatedAt') data FROM dialog_archive_message WHERE ${where.join(" AND ")} ORDER BY created_at DESC,message_id DESC,dialog_id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-      ...params,
-      limit,
-      offset
-    );
+    // The archive may contain far more than 10,000 creator messages. Bound the
+    // page, not its source position; leave room for nextOffset to remain exact.
+    const offset = c.integer(input.offset, 0, Number.MAX_SAFE_INTEGER - 200),
+      limit = Math.max(1, Math.min(200, c.integer(input.limit, 100, 1000)));
+    const { count, rows } = await this.db.$transaction(async tx => {
+      const count = c.integer((await c.one(tx,
+        `SELECT count(*) n FROM dialog_archive_message WHERE ${where.join(" AND ")}`, ...params)).n,
+      0, Number.MAX_SAFE_INTEGER);
+      const rows = await c.rows(
+        tx,
+        `SELECT dialog_id,message_id,price_cents,provider_opened,canonical_opened,created_at,first_seen_at,jsonb_build_object('mediaIds',data->'mediaIds','updatedAt',data->'updatedAt') data FROM dialog_archive_message WHERE ${where.join(" AND ")} ORDER BY created_at DESC,message_id DESC,dialog_id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        ...params, limit, offset
+      );
+      return { count, rows };
+    }, { isolationLevel: "RepeatableRead", maxWait: 5000, timeout: 15000 });
     const result = {
       rows: rows.map(mediaRow),
       count,
