@@ -27,6 +27,7 @@ const {
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { isOnlineBumpSend, commitOnlineBumpWrite } = require("./bump-write-window-service");
 const { isMessageDelivery, preserveMessageSettlement, mintActionMessageSettlement } = require("./automation-message-settlement-service");
+const { isCommentDelivery, preserveCommentSettlement, mintActionCommentSettlement } = require("./automation-comment-settlement-service");
 const { CREATOR_WRITE_LANE_STATUSES } = require("./automation-delivery-statuses");
 const { deliveryRequiresReconciliation, unresolvedDeliveryWhere, deliveryOutcomeSnapshotWhere } = require("./automation-outcome-contract");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
@@ -178,6 +179,14 @@ function validDate(value, fallback = null) {
 }
 function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
 function nextDayStart(date = new Date()) { const out = dayStart(date); out.setDate(out.getDate() + 1); return out; }
+
+function deliveryPacingSettings(delivery, control) {
+  return control.modules[delivery.moduleKey]?.settings || {
+    minimumIntervalMs: control.workspace.settings.globalWriteMinIntervalMs,
+    maximumIntervalMs: control.workspace.settings.globalWriteMaxIntervalMs,
+    randomJitter: control.workspace.settings.randomJitter,
+  };
+}
 
 
 async function assertDeliveryControl(delivery, { allowRunningUnfollow = false, db = prisma } = {}) {
@@ -774,21 +783,7 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
         continue;
       }
       if (await deferOrSkipFollowBackClaim(candidate, control, now)) continue;
-      const actionSettings = candidate.moduleKey === "bumps"
-        ? control.modules.bumps.settings
-        : candidate.moduleKey === "follow_back"
-          ? control.modules.follow_back.settings
-          : candidate.moduleKey === "likes"
-            ? control.modules.likes.settings
-            : candidate.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY
-              ? control.modules.follow.settings
-              : candidate.moduleKey === SFS_MODULE_KEY
-                ? control.modules.sfs.settings
-                : {
-                  minimumIntervalMs: control.workspace.settings.globalWriteMinIntervalMs,
-                  maximumIntervalMs: control.workspace.settings.globalWriteMaxIntervalMs,
-                  randomJitter: control.workspace.settings.randomJitter,
-                };
+      const actionSettings = deliveryPacingSettings(candidate, control);
       const pacingRetryAt = await claimPacingRetryAt({
         delivery: candidate,
         workspaceSettings: control.workspace.settings,
@@ -1221,8 +1216,14 @@ async function prepareWriteActionDelivery(input) {
     if (input.messageSettlementVersion === 1 && !isMessageDelivery(delivery)) {
       throw new ActionDeliveryError("ACTION_MESSAGE_SETTLEMENT_SCOPE_INVALID", "Message receipt protocol requires a Bump send", 400);
     }
+    if (input.commentSettlementVersion === 1 && !isCommentDelivery(delivery)) {
+      throw new ActionDeliveryError("ACTION_COMMENT_SETTLEMENT_SCOPE_INVALID", "Comment receipt protocol requires an SFS comment send", 400);
+    }
+    if (isCommentDelivery(delivery) && input.commentSettlementVersion !== 1) {
+      throw new ActionDeliveryError("ACTION_COMMENT_SETTLEMENT_VERSION_REQUIRED", "Update Desktop before issuing another SFS comment: durable exact receipts are required", 409);
+    }
     if (delivery.status === "COMMITTING" && delivery.writeCommitAt) {
-      if (input.messageSettlementVersion === 1) throw new ActionDeliveryError("DELIVERY_ALREADY_COMMITTING", "Message send already crossed the write commit boundary");
+      if (input.messageSettlementVersion === 1 || input.commentSettlementVersion === 1) throw new ActionDeliveryError("DELIVERY_ALREADY_COMMITTING", "Send already crossed the write commit boundary");
       return { ok: true, duplicate: true, id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, writeCommitRevision: delivery.writeCommitRevision, writeCommitAt: delivery.writeCommitAt };
     }
     if (deliveryRequiresReconciliation(delivery)) throw new ActionDeliveryError("DELIVERY_RECONCILIATION_REQUIRED", "Delivery must prove the previous external write outcome before another write permit");
@@ -1278,6 +1279,15 @@ async function prepareWriteActionDelivery(input) {
     // Re-read the DB clock after potentially slow consumer validation. The Agency
     // share lock acquired before membership prevents a concurrent hold/refund.
     now = (await assertBillingWriteAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId })).now;
+    // Claim-time pacing is discovery only. A different admitted attempt or a
+    // changed interval must be rechecked under the shared physical-write fence.
+    const retryAt = await claimPacingRetryAt({ delivery, workspaceSettings: control.workspace.settings,
+      actionSettings: deliveryPacingSettings(delivery, control), now, db: tx });
+    if (retryAt) {
+      const error = new ActionDeliveryError("write_pacing", `Next automation write may start after ${retryAt.toISOString()}`);
+      error.retryable = true; error.retryAt = retryAt; error.retryAfterMs = retryAt.getTime() - now.getTime();
+      throw error;
+    }
     // Transaction-local proof for the DB release fence. Set only after current
     // consumer/access/field validation; old replicas cannot mint a new permit.
     await tx.$executeRawUnsafe(
@@ -1308,7 +1318,8 @@ async function prepareWriteActionDelivery(input) {
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_COMMIT_PERMIT_STALE", "Delivery changed before write commit permit");
     const committing = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
     return { ok: true, duplicate: false, id: committing.id, status: committing.status, leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt,
-      ...(input.messageSettlementVersion === 1 ? await mintActionMessageSettlement({ db: tx, delivery: committing, deviceId: input.deviceId }) : {}) };
+      ...(input.messageSettlementVersion === 1 ? await mintActionMessageSettlement({ db: tx, delivery: committing, deviceId: input.deviceId }) : {}),
+      ...(input.commentSettlementVersion === 1 ? await mintActionCommentSettlement({ db: tx, delivery: committing, deviceId: input.deviceId }) : {}) };
     }, { timeout: 30_000 });
     // Denial is returned through COMMIT so the terminal/retry transition and fan
     // reservation cleanup survive; the HTTP error is emitted only afterwards.
@@ -1394,11 +1405,32 @@ async function completeActionDelivery(input) {
   const now = new Date();
   const clientResult = object(input.result);
   const effectTime = buildAutomationEffectTimeEvidence(delivery, clientResult, now);
-  const result = preserveMessageSettlement(delivery, sanitizeAutomationSettlementResult(clientResult, effectTime));
+  const result = preserveCommentSettlement(delivery, preserveMessageSettlement(delivery, sanitizeAutomationSettlementResult(clientResult, effectTime)));
   const outcomeCode = clean(input.outcomeCode, 120) || clean(result.code, 120) || null;
   // Preserve the accepted SFS outcome in the durable receipt used by cleanup
   // handoff and retirement, including clients that send outcomeCode separately.
   if(delivery.moduleKey===SFS_MODULE_KEY&&outcomeCode)result.code=outcomeCode.trim().toLowerCase();
+  if (isCommentDelivery(delivery)) {
+    const preflightSkip = input.status === "SKIPPED" && !delivery.writeCommitAt
+      && outcomeCode === "already_commented" && result.preflight === true;
+    const ownership = object(result.commentOwnership);
+    const expectedPostId = clean(object(delivery.payload).postId || delivery.targetId, 180);
+    const operationId = delivery.idempotencyKey || delivery.id;
+    const ownershipMatches = result.commentOwnership === undefined || (ownership.kind === "PROVIDER_COMMENT_ACK"
+      && ownership.operationId === operationId && ownership.commentId === result.commentId
+      && (ownership.postId === undefined || ownership.postId === expectedPostId));
+    const exactLegacyAck = delivery.status === "COMMITTING" && delivery.writeCommitAt
+      && !object(delivery.result).commentSettlement
+      && input.status !== "SKIPPED" && outcomeCode === "commented"
+      && Number.isInteger(Number(result.status)) && Number(result.status) >= 200 && Number(result.status) < 300
+      && expectedPostId && expectedPostId === clean(delivery.targetId, 180)
+      && clean(result.commentId, 180) && clean(result.postId, 180) === expectedPostId
+      && result.endpointKey === "posts.comments.create" && result.recoveredByVerification === false
+      && (result.operationId === undefined || result.operationId === operationId) && ownershipMatches;
+    if (!preflightSkip && !exactLegacyAck) {
+      throw new ActionDeliveryError("ACTION_COMMENT_EXACT_RECEIPT_REQUIRED", "A comment requires its exact provider acknowledgement; matching text or author cannot settle this operation");
+    }
+  }
   let terminalStatus = input.status === "SKIPPED" ? "SKIPPED" : "COMPLETED";
   if (delivery.moduleKey === SFS_MODULE_KEY && delivery.actionType === "SFS_FOLLOW_TARGET" && String(outcomeCode || "").trim().toLowerCase() !== "followed") {
     terminalStatus = "SKIPPED";
@@ -1500,14 +1532,14 @@ async function failActionDelivery(input) {
     && (safetyRecovery || delivery.attempts < delivery.maxAttempts)));
   const nextStatus = reconcile ? "RECONCILE_REQUIRED" : (retryable ? "RETRY_SCHEDULED" : "FAILED");
   const nextNotBefore = (retryable || reconcile) ? new Date(now.getTime() + retryDelayMs(delivery.attempts, failureCode, input.retryAfterMs)) : delivery.notBefore;
-  const result = preserveMessageSettlement(delivery, {
+  const result = preserveCommentSettlement(delivery, preserveMessageSettlement(delivery, {
     ...object(delivery.result), ...inputResult,
     reportedEndpointSemantics: inputResult.endpointSemantics || null, reportedIdempotent: inputResult.idempotent === true, reportedProvenNoEffect: inputResult.provenNoEffect === true,
     endpointSemantics, writeReachedWire: reachedWire, provenNoEffect, failureCode, failureCategory, reportedFailureCategory,
     outcomeState: reconcile ? "RECONCILE_REQUIRED" : (provenNoEffect ? "PROVEN_NO_EFFECT" : "TERMINAL"),
     ...(reconcile ? { reconciliationStartedAt: object(delivery.result).reconciliationStartedAt || delivery.writeCommitAt?.toISOString?.() || now.toISOString() } : {}),
     failedAt: now.toISOString(), retryable,
-  });
+  }));
   const updated = await runDbTransaction(prisma, async (tx) => {
     await lockCleanupMutation(tx,delivery);
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });

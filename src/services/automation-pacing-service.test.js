@@ -30,7 +30,9 @@ test("write slot ignores future delete reservations and spaces queued sends", as
   const db = sequenceDb([
     { status: "QUEUED", notBefore: new Date("2026-07-15T10:00:30.000Z"), claimedAt: null },
     { finishedAt: new Date("2026-07-15T09:59:00.000Z") },
+    null,
     { status: "QUEUED", notBefore: new Date("2026-07-15T10:00:30.000Z"), claimedAt: null },
+    null,
     null,
   ]);
   const result = await nextAutomationWriteSlot({
@@ -44,6 +46,25 @@ test("write slot ignores future delete reservations and spaces queued sends", as
     { actionType: { not: "DELETE_MESSAGE" } },
     { notBefore: { lte: new Date("2026-07-15T10:00:00.000Z") } },
   ]);
+});
+
+test("216 physical attempts consume global and action pacing after every provider outcome", async () => {
+  const now = new Date("2026-11-28T10:00:10Z");
+  for (const status of ["FAILED", "RETRY_SCHEDULED", "CANCELED", "RECONCILE_REQUIRED", "COMMITTING"]) {
+    const db = sequenceDb([null, null, { status, writeCommitAt: new Date("2026-11-28T10:00:05Z") }, { status, writeCommitAt: new Date("2026-11-28T10:00:00Z") }]);
+    const retryAt = await claimPacingRetryAt({ delivery: { id: "same-retry", agencyId: "a", creatorId: "c", actionType: "LIKE_POST" },
+      workspaceSettings: { globalWriteMinIntervalMs: 15000 }, actionSettings: { minimumIntervalMs: 30000 }, now, db });
+    assert.equal(retryAt.toISOString(), "2026-11-28T10:00:30.000Z", status);
+    assert.equal(db.calls[2].where.id, undefined, "do not discard the current delivery's previous physical permit");
+    assert.deepEqual(db.calls[2].where.writeCommitAt, { not: null });
+    assert.equal(db.calls[3].where.actionType, "LIKE_POST");
+  }
+});
+
+test("216 no physical permit and no completed work leave the pacing lane immediately available", async () => {
+  const db = sequenceDb([null, null, null, null]);
+  assert.equal(await claimPacingRetryAt({ delivery: { id: "prewire", agencyId: "a", creatorId: "c", actionType: "LIKE_POST" },
+    workspaceSettings: { globalWriteMinIntervalMs: 15000 }, actionSettings: { minimumIntervalMs: 30000 }, now: new Date("2026-11-28T10:00:00Z"), db }), null);
 });
 
 test("claim-time pacing rechecks actual completion time", async () => {

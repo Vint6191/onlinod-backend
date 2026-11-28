@@ -20,9 +20,20 @@ function interval(settings = {}, minimumKey, maximumKey) {
 }
 function dateMs(value) { return value instanceof Date && Number.isFinite(value.getTime()) ? value.getTime() : 0; }
 
+async function latestCommittedWrite({ agencyId, creatorId, actionType = null, db = prisma }) {
+  // A physical write permit consumes pacing even when the provider rejects it,
+  // its reply is lost, or the work is later canceled. Pre-wire failures have no
+  // writeCommitAt and do not consume this lane. Include the delivery itself:
+  // an idempotent retry must respect its previous physical attempt too.
+  return db.automationDelivery.findFirst({
+    where: { agencyId, creatorId, originKind: "AUTOMATION", writeCommitAt: { not: null }, ...(actionType ? { actionType } : {}) },
+    orderBy: { writeCommitAt: "desc" }, select: { writeCommitAt: true },
+  });
+}
+
 async function latestWriteState({ agencyId, creatorId, actionType = null, now = new Date(), db = prisma }) {
   const typeFilter = actionType ? { actionType } : {};
-  const [planned, completed] = await Promise.all([
+  const [planned, completed, committed] = await Promise.all([
     db.automationDelivery.findFirst({
       where: {
         agencyId,
@@ -42,13 +53,14 @@ async function latestWriteState({ agencyId, creatorId, actionType = null, now = 
       orderBy: [{ finishedAt: "desc" }, { updatedAt: "desc" }],
       select: { finishedAt: true },
     }),
+    latestCommittedWrite({ agencyId, creatorId, actionType, db }),
   ]);
   const activeBase = planned
     ? Math.max(dateMs(planned.notBefore), dateMs(planned.claimedAt), ["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"].includes(planned.status) ? now.getTime() : 0)
     : 0;
   return {
-    hasState: Boolean(planned || completed),
-    baseMs: Math.max(activeBase, dateMs(completed?.finishedAt)),
+    hasState: Boolean(planned || completed || committed),
+    baseMs: Math.max(activeBase, dateMs(completed?.finishedAt), dateMs(committed?.writeCommitAt)),
   };
 }
 
@@ -75,7 +87,7 @@ async function nextAutomationWriteSlot({
 }
 
 async function claimPacingRetryAt({ delivery, workspaceSettings, actionSettings, now = new Date(), db = prisma }) {
-  const [globalCompleted, actionCompleted] = await Promise.all([
+  const [globalCompleted, actionCompleted, globalCommitted, actionCommitted] = await Promise.all([
     db.automationDelivery.findFirst({
       where: {
         agencyId: delivery.agencyId,
@@ -101,12 +113,16 @@ async function claimPacingRetryAt({ delivery, workspaceSettings, actionSettings,
       orderBy: { finishedAt: "desc" },
       select: { finishedAt: true },
     }),
+    latestCommittedWrite({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, db }),
+    latestCommittedWrite({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, actionType: delivery.actionType, db }),
   ]);
   const globalMin = Math.max(0, Math.floor(number(workspaceSettings?.globalWriteMinIntervalMs, 0)));
   const actionMin = Math.max(0, Math.floor(number(actionSettings?.minimumIntervalMs, 0)));
   const retryAtMs = Math.max(
     dateMs(globalCompleted?.finishedAt) + globalMin,
     dateMs(actionCompleted?.finishedAt) + actionMin,
+    dateMs(globalCommitted?.writeCommitAt) + globalMin,
+    dateMs(actionCommitted?.writeCommitAt) + actionMin,
   );
   return retryAtMs > now.getTime() ? new Date(retryAtMs) : null;
 }
@@ -115,4 +131,5 @@ module.exports = {
   ACTIVE_WRITE_STATUSES,
   nextAutomationWriteSlot,
   claimPacingRetryAt,
+  latestCommittedWrite,
 };

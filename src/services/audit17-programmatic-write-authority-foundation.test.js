@@ -816,10 +816,37 @@ test("Audit17 CUSTOM_MANUAL_SEND may rebind changed business payload only while 
     assert.equal(getRow().status, "RETRY_SCHEDULED");
     assert.equal(getRow().writeCommitAt, null);
 
+    await assert.rejects(() => authority.reserveProgrammaticWrite({ ...manual, payloadFingerprint: "sha256:manual-after", payload: { ...manual.payload, expectedPriceCents: 500, actualPriceCents: 500 } }),
+      error => error.code === "PROGRAMMATIC_WRITE_NOT_DUE");
+    assert.equal(getRow().payloadFingerprint, "sha256:manual-before", "retry denial cannot rebind the business payload");
+    getRow().notBefore = new Date(Date.now() - 1);
+
     const rebound = await authority.reserveProgrammaticWrite({ ...manual, payloadFingerprint: "sha256:manual-after", payload: { ...manual.payload, expectedPriceCents: 500, actualPriceCents: 500 } });
     assert.equal(rebound.delivery.status, "CLAIMED");
     assert.equal(getRow().payloadFingerprint, "sha256:manual-after");
     assert.equal(getRow().payload.expectedPriceCents, 500);
+  });
+});
+
+test("216 programmatic retry deadline cannot be bypassed at reserve, start or prepare", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    const input = { ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision };
+    getRow().notBefore = new Date(Date.now() + 3600000);
+    await assert.rejects(() => authority.startProgrammaticWrite(input), error => error.code === "PROGRAMMATIC_WRITE_NOT_DUE");
+    assert.equal(getRow().status, "CLAIMED");
+    const revision = getRow().leaseRevision;
+    await assert.rejects(() => authority.reserveProgrammaticWrite(base), error => error.code === "PROGRAMMATIC_WRITE_NOT_DUE");
+    assert.equal(getRow().leaseRevision, revision, "an early retry must not invalidate the current lease");
+    getRow().notBefore = new Date(Date.now() - 1);
+    await authority.startProgrammaticWrite(input);
+    getRow().notBefore = new Date(Date.now() + 3600000);
+    await assert.rejects(() => authority.prepareProgrammaticWrite(input), error => error.code === "PROGRAMMATIC_WRITE_NOT_DUE");
+    assert.equal(getRow().writeCommitRevision, 0);
+    assert.equal(getRow().writeCommitAt, null);
+    getRow().notBefore = new Date(Date.now() - 1);
+    const prepared = await authority.prepareProgrammaticWrite(input);
+    assert.equal(prepared.writeCommitRevision, 1, "the same operation becomes executable when its deadline is due");
   });
 });
 

@@ -11,6 +11,7 @@ const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fe
 const { classifyAutomationFailure, FAILURE_CATEGORIES } = require("./automation-failure-taxonomy");
 const { isProviderStatusProvenNoEffect } = require("./provider-http-outcome-proof");
 const { isMass, lockMassDeliveryScope, assertMassCreateAdmission } = require("./mass-delivery-scope-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const ACTIVE_LEASE_STATUSES = new Set(["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"]);
 const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "SKIPPED", "CANCELED"]);
@@ -245,6 +246,30 @@ function assertCompletionEvidence(delivery, result) {
   if (!value) {
     throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_COMPLETION_EVIDENCE_REQUIRED", `${kind} requires ${field} before durable success may be recorded`, 409);
   }
+}
+function assertProgrammaticWriteDue(delivery, now) {
+  const notBefore = delivery.notBefore instanceof Date ? delivery.notBefore : new Date(delivery.notBefore);
+  if (!Number.isFinite(notBefore.getTime())) {
+    throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_SCHEDULE_INVALID", "Programmatic write has no valid retry deadline", 409);
+  }
+  if (notBefore > now) {
+    const error = new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_DUE", `Programmatic write may resume after ${notBefore.toISOString()}`, 409);
+    error.retryAt = notBefore.toISOString();
+    error.retryAfterMs = notBefore.getTime() - now.getTime();
+    throw error;
+  }
+}
+function massSettlementAcknowledgement(delivery, outcome, queueId = null) {
+  const kind = storedProgrammaticKind(delivery);
+  const native = kind === "MASS_NATIVE_QUEUE_CREATE" || kind === "MASS_NATIVE_QUEUE_CANCEL";
+  return {
+    authorityVersion: native ? "MASS_NATIVE_V3" : "MASS_RECEIPT_V1",
+    writeId: delivery.id, writeCommitRevision: delivery.writeCommitRevision,
+    requestKey: native ? object(delivery.payload).nativeRequestKey : delivery.idempotencyKey,
+    kind, deviceId: native ? delivery.sourceDeviceId : object(delivery.result).massSettlementDeviceId,
+    outcome,
+    ...(outcome === "PROVEN_SUCCESS" ? { queueId: queueId || delivery.remoteTargetId } : { providerStatus: object(delivery.result).providerStatus }),
+  };
 }
 function assertPayloadBinding(existing, input, config) {
   if (existing.agencyId !== input.agencyId || existing.creatorId !== input.creatorId || existing.actionType !== config.actionType
@@ -721,7 +746,7 @@ async function settleNativeMassWriteProvenNoEffect(input) {
         || Number(delivery.writeCommitRevision) !== revision) {
       throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_WRITE_BINDING_MISMATCH", "Native MASS rejection belongs to another physical request", 403);
     }
-    if (delivery.status === "FAILED" && delivery.failureCode === "provider_rejected_no_effect") return { ok: true, duplicate: true, provenNoEffect: true, delivery: publicDelivery(delivery) };
+    if (delivery.status === "FAILED" && delivery.failureCode === "provider_rejected_no_effect") return { ok: true, duplicate: true, provenNoEffect: true, ...massSettlementAcknowledgement(delivery, "PROVEN_NO_EFFECT"), delivery: publicDelivery(delivery) };
     if (!delivery.writeCommitAt) {
       throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_WRITE_BINDING_MISMATCH", "Native MASS rejection belongs to a request that is no longer physically committed", 403);
     }
@@ -740,7 +765,8 @@ async function settleNativeMassWriteProvenNoEffect(input) {
       },
     });
     if (!changed.count) throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_SETTLEMENT_RACE", "Native MASS write changed before rejection settlement", 409);
-    return { ok: true, provenNoEffect: true, delivery: publicDelivery(await tx.automationDelivery.findUnique({ where: { id: delivery.id } })) };
+    const settled = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    return { ok: true, provenNoEffect: true, ...massSettlementAcknowledgement(settled, "PROVEN_NO_EFFECT"), delivery: publicDelivery(settled) };
   }, { timeout: 30_000 });
 }
 
@@ -830,7 +856,7 @@ async function settleNativeMassWriteExact(input, db) {
     throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_COMMIT_REVISION_MISMATCH", "Native MASS response does not match the granted physical commit permit", 409);
   }
   if (delivery.status === "COMPLETED") {
-    if (clean(delivery.remoteTargetId, 180) === queueId) return { ok: true, duplicate: true, delivery: publicDelivery(delivery) };
+    if (clean(delivery.remoteTargetId, 180) === queueId) return { ok: true, duplicate: true, ...massSettlementAcknowledgement(delivery, "PROVEN_SUCCESS", queueId), delivery: publicDelivery(delivery) };
     throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_TERMINAL_MISMATCH", "Native MASS write already completed with another queue id", 409);
   }
   const lateUnresolved = delivery.status === "FAILED" && delivery.failureCode === "outcome_unresolved_do_not_retry";
@@ -860,7 +886,8 @@ async function settleNativeMassWriteExact(input, db) {
       data: { remoteLifecycleState: "SETTLED", remoteLifecycleObservedAt: now, remoteSettledAt: now },
     });
   }
-  return { ok: true, delivery: publicDelivery(await db.automationDelivery.findUnique({ where: { id: delivery.id } })) };
+  const settled = await db.automationDelivery.findUnique({ where: { id: delivery.id } });
+  return { ok: true, ...massSettlementAcknowledgement(settled, "PROVEN_SUCCESS", queueId), delivery: publicDelivery(settled) };
 }
 
 async function completeNativeMassWrite(input) {
@@ -895,7 +922,7 @@ async function completeMassWriteWithSettlementToken(input) {
     }
     if (delivery.status === "COMPLETED") {
       if (delivery.remoteTargetId !== queueId) throw new ProgrammaticOfWriteAuthorityError("MASS_SETTLEMENT_CONFLICT", "MASS write already settled with another queue", 409);
-      return { ok: true, duplicate: true, writeId, queueId };
+      return { ok: true, duplicate: true, ...massSettlementAcknowledgement(delivery, "PROVEN_SUCCESS", queueId) };
     }
     const lateUnknown = delivery.status === "FAILED" && delivery.failureCode === "outcome_unresolved_do_not_retry";
     if (!["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status) && !lateUnknown) {
@@ -914,7 +941,7 @@ async function completeMassWriteWithSettlementToken(input) {
         OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: { not: "SETTLED" } }] },
       data: { remoteLifecycleState: "SETTLED", remoteLifecycleObservedAt: now, remoteSettledAt: now },
     });
-    return { ok: true, writeId, queueId };
+    return { ok: true, ...massSettlementAcknowledgement(delivery, "PROVEN_SUCCESS", queueId) };
   }, { timeout: 30_000 });
 }
 
@@ -978,10 +1005,9 @@ async function reserveProgrammaticWrite(input, { db = prisma } = {}) {
   }
   assertProgrammaticIdempotencyNamespace(kind, config, creatorId, idempotencyKey);
   const leaseMs = leaseDuration(input.leaseMs);
-  const now = new Date();
-
   return runDbTransaction(db, async (tx) => {
     await lockBillingWriteAdmission({ db: tx, agencyId });
+    let now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     // CUSTOM_MANUAL_SEND is part of the durable Custom pipeline lifecycle.
     // Serialize NEW manual-write creation against agency/creator retirement so a
     // retire transaction cannot pass its blocker query and have a durable external
@@ -1007,7 +1033,7 @@ async function reserveProgrammaticWrite(input, { db = prisma } = {}) {
       await assertMassCreateAdmission({ db: tx, agencyId, creatorId });
     }
     if (!delivery || ["QUEUED", "RETRY_SCHEDULED", "CLAIMED", "RUNNING"].includes(delivery.status)) {
-      await assertBillingWriteAdmission({ db: tx, agencyId, creatorId });
+      now = (await assertBillingWriteAdmission({ db: tx, agencyId, creatorId })).now;
     }
     if (delivery) {
       const sameIdentity = delivery.agencyId === agencyId && delivery.creatorId === creatorId
@@ -1017,6 +1043,7 @@ async function reserveProgrammaticWrite(input, { db = prisma } = {}) {
       if (!sameIdentity) {
         throw new ProgrammaticOfWriteAuthorityError("IDEMPOTENCY_CONFLICT", "Idempotency key is already bound to another programmatic write authority identity", 409);
       }
+      if (["QUEUED", "RETRY_SCHEDULED", "CLAIMED", "RUNNING"].includes(delivery.status)) assertProgrammaticWriteDue(delivery, now);
       const sameFingerprint = clean(delivery.payloadFingerprint, 200) === payloadFingerprint;
       if (!sameFingerprint) {
         const safeRebind = config.allowPrecommitPayloadRebind === true
@@ -1226,7 +1253,10 @@ async function startProgrammaticWrite(input) {
     await lockBillingWriteAdmission({ db: tx, agencyId: input.agencyId });
     const delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     if (delivery.status === "RECONCILE_REQUIRED") return { ok: true, reconciliationRequired: true, delivery: publicDelivery(delivery) };
-    if (["CLAIMED", "RUNNING"].includes(delivery.status)) await assertBillingWriteAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
+    if (["CLAIMED", "RUNNING"].includes(delivery.status)) {
+      const { now } = await assertBillingWriteAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
+      assertProgrammaticWriteDue(delivery, now);
+    }
     if (delivery.status === "RUNNING") return { ok: true, duplicate: true, delivery: publicDelivery(delivery) };
     if (delivery.status === "COMMITTING") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_ALREADY_COMMITTING", "Write already crossed the commit boundary", 409);
     if (delivery.status !== "CLAIMED") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_CLAIMED", `Programmatic write status is ${delivery.status}`, 409);
@@ -1277,6 +1307,7 @@ async function prepareProgrammaticWrite(input) {
     }
     if (isMassQueueCreateKind(storedProgrammaticKind(delivery))) await assertMassCreateAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
     const { now } = await assertBillingWriteAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
+    assertProgrammaticWriteDue(delivery, now);
     const wantsCustomSettlement = storedProgrammaticKind(delivery) === "CUSTOM_MANUAL_SEND" && input.mintCustomManualSettlementCapability === true;
     const customSettlement = wantsCustomSettlement ? mintWriteSettlementToken() : null;
     const massSettlement = ["MASS_QUEUE_CREATE", "MASS_QUEUE_CANCEL"].includes(storedProgrammaticKind(delivery)) ? mintWriteSettlementToken() : null;
@@ -1408,7 +1439,7 @@ async function failProgrammaticWrite(input) {
         transportCode: facts.transportCode || facts.originalCode || null,
       });
     const reconcile = reachedWire && !idempotent;
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const reconciliationLease = reconcile ? mintLease(now, DEFAULT_LEASE_MS) : null;
     const nextStatus = reconcile ? "RECONCILE_REQUIRED" : (category === FAILURE_CATEGORIES.TERMINAL ? "FAILED" : "RETRY_SCHEDULED");
     const changed = await tx.automationDelivery.updateMany({

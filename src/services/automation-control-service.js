@@ -407,33 +407,81 @@ function effectiveModuleEnabled(snapshot, moduleKey) {
   return snapshot.effective.workspaceEnabled && snapshot.effective.creatorEnabled;
 }
 
-async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKey = null, db = prisma }) {
-  const enabled = new Map();
-  const rows = await db.automationDelivery.findMany({
-    where: { agencyId, originKind: "AUTOMATION", status: "PAUSED", ...(creatorId ? { creatorId } : {}), ...(moduleKey ? { moduleKey } : {}) },
-    orderBy: { id: "asc" }, take: 10000,
-  });
-  let resumed = 0;
-  for (const row of rows) {
-    // Legacy paused unknown outcomes belong to the reconciliation repair, not
-    // to the new-write queue. Re-enabling a module cannot prove their effect.
-    if (deliveryRequiresReconciliation(row)) continue;
-    const key = `${row.creatorId}:${row.moduleKey}`;
-    if (!enabled.has(key)) {
-      try { const snapshot = await getAutomationControlSnapshot({ agencyId, creatorId: row.creatorId, db }); enabled.set(key, effectiveModuleEnabled(snapshot, row.moduleKey)); }
-      catch { enabled.set(key, false); }
-    }
-    if (!enabled.get(key)) continue;
-    const applied = await runDbTransaction(db, async (tx) => {
-      const updated = await tx.automationDelivery.updateMany({ where: { id: row.id, originKind: "AUTOMATION", status: "PAUSED", leaseRevision: row.leaseRevision, ...deliveryOutcomeSnapshotWhere(row) }, data: { status: "QUEUED", failureCode: null, lastError: null, lastCheckedAt: new Date() } });
-      if (!updated.count) return false;
-      const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
-      await projectControlDeliveryState(tx, current, "QUEUED", null);
-      return true;
-    });
-    if (applied) resumed += 1;
+// Control changes hold the creator/workspace commit fence for this transaction.
+// Filter current eligibility BEFORE the bounded page: an arbitrarily large
+// disabled module or an unresolved historical outcome must not hide live work.
+const RESUME_ELIGIBLE_DELIVERIES_SQL = `/* automation216_resume_eligible */
+  SELECT d.* FROM "AutomationDelivery" d
+  JOIN "CreatorAccount" c ON c."id"=d."creatorId" AND c."agencyId"=d."agencyId" AND c."deletedAt" IS NULL
+  LEFT JOIN "AutomationControlState" w ON w."agencyId"=d."agencyId" AND w."scopeKey"='workspace'
+  LEFT JOIN "AutomationControlState" cc ON cc."agencyId"=d."agencyId" AND cc."scopeKey"='creator:'||d."creatorId"
+  JOIN "AutomationControlState" m ON m."agencyId"=d."agencyId"
+    AND m."scopeKey"='creator:'||d."creatorId"||':module:'||d."moduleKey"
+    AND m."enabled"=true AND m."settings"->'enabled'='true'::jsonb
+  WHERE d."agencyId"=$1 AND d."originKind"='AUTOMATION' AND d."status"='PAUSED'
+    AND ($2::text IS NULL OR d."creatorId"=$2)
+    AND ($3::text IS NULL OR d."moduleKey"=$3)
+    AND ($4::text IS NULL OR d."id">$4)
+    AND d."moduleKey"=ANY($5::text[])
+    AND COALESCE(w."enabled",true) AND COALESCE(cc."enabled",true)
+    AND COALESCE(d."failureCategory",'')<>'OUTCOME_UNKNOWN_RECONCILE'
+    AND UPPER(COALESCE(d."result"->>'outcomeState',''))<>'RECONCILE_REQUIRED'
+  ORDER BY d."id" LIMIT 500`;
+
+async function projectResumedDeliveryBatch(db, rows) {
+  // Match the former per-row projection, including its stale generation/owner
+  // fences. One bounded update per domain avoids thousands of network trips
+  // while the workspace control transaction holds its exclusive write fence.
+  const domains = [
+    { module: FOLLOW_BACK_MODULE_KEY, table: "FollowBackCandidate", state: true,
+      match: 'c."agencyId"=d."agencyId" AND c."creatorId"=d."creatorId" AND c."fanId"=d."targetId"' },
+    { module: LIKES_MODULE_KEY, table: "AutomationContentCandidate", state: true,
+      match: 'c."agencyId"=d."agencyId" AND c."creatorId"=d."creatorId" AND c."contentType"=\'post\' AND c."contentId"=d."targetId"' },
+    { module: FOLLOW_AUTOMATION_MODULE_KEY, table: "FollowAutomationCandidate", state: false,
+      match: 'c."agencyId"=d."agencyId" AND c."creatorId"=d."creatorId" AND c."fanId"=d."targetId"' },
+    { module: SFS_MODULE_KEY, table: "SfsTargetCandidate", state: false,
+      match: 'c."agencyId"=d."agencyId" AND c."creatorId"=d."creatorId" AND c."id"=d."candidateId" AND c."generation"=d."generation" AND c."completedAt" IS NULL AND c."state"<>\'COMPLETED\'' },
+  ];
+  for (const domain of domains) {
+    const records = rows.filter(row => row.moduleKey === domain.module).map(row => ({
+      id: row.id, agencyId: row.agencyId, creatorId: row.creatorId, actionType: row.actionType,
+      targetId: row.targetId || (domain.module === LIKES_MODULE_KEY ? object(row.payload).postId : row.fanId) || null,
+      candidateId: typeof row.payload?.candidateId === "string" ? row.payload.candidateId.trim().slice(0, 160) : "",
+      generation: Number.isSafeInteger(row.generation) ? row.generation : -1,
+    }));
+    if (!records.length) continue;
+    await db.$executeRawUnsafe(`WITH input AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS d(id text,"agencyId" text,"creatorId" text,"actionType" text,"targetId" text,"candidateId" text,generation integer)
+      ), chosen AS (
+        SELECT DISTINCT ON (c."id") c."id",d.id AS "deliveryId",d."actionType"
+        FROM "${domain.table}" c JOIN input d ON ${domain.match}
+        WHERE c."latestDeliveryId" IS NULL OR c."latestDeliveryId"=d.id
+        ORDER BY c."id",d.id ASC
+      ) UPDATE "${domain.table}" c SET ${domain.state ? '"state"=\'QUEUED\',' : ''}
+        "latestDeliveryId"=chosen."deliveryId","latestActionType"=chosen."actionType","latestStatus"='QUEUED',"latestError"=NULL,
+        "updatedAt"=clock_timestamp() AT TIME ZONE 'UTC'
+      FROM chosen WHERE c."id"=chosen."id"`, JSON.stringify(records));
   }
-  return resumed;
+}
+
+async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKey = null, db = prisma }) {
+  let cursor = null, resumed = 0;
+  for (;;) {
+    const rows = await db.$queryRawUnsafe(RESUME_ELIGIBLE_DELIVERIES_SQL, agencyId, creatorId, moduleKey, cursor, [...SUPPORTED_MODULE_KEYS]);
+    if (!rows.length) return resumed;
+    cursor = rows[rows.length - 1].id;
+    const changed = await db.$queryRawUnsafe(`WITH observed AS (
+        SELECT * FROM jsonb_to_recordset($2::jsonb) AS s(id text,"leaseRevision" integer,"failureCategory" text,result jsonb)
+      ) UPDATE "AutomationDelivery" d SET "status"='QUEUED',"failureCode"=NULL,"lastError"=NULL,
+          "lastCheckedAt"=clock_timestamp() AT TIME ZONE 'UTC',"updatedAt"=clock_timestamp() AT TIME ZONE 'UTC'
+        FROM observed s WHERE d."agencyId"=$1 AND d."originKind"='AUTOMATION' AND d."status"='PAUSED'
+          AND d."id"=s.id AND d."leaseRevision"=s."leaseRevision"
+          AND d."failureCategory" IS NOT DISTINCT FROM s."failureCategory" AND d."result" IS NOT DISTINCT FROM s.result
+        RETURNING d.*`, agencyId, JSON.stringify(rows.map(row => ({ id: row.id, leaseRevision: row.leaseRevision, failureCategory: row.failureCategory, result: row.result }))));
+    await projectResumedDeliveryBatch(db, changed);
+    resumed += changed.length;
+    if (rows.length < 500) return resumed;
+  }
 }
 
 async function cancelAutomationJobsForControl({ agencyId, creatorId = null, moduleKey = null, reason, failureCode, db = prisma }) {
@@ -578,6 +626,7 @@ async function assertAutomationEnabled({ agencyId, creatorId, moduleKey, db = pr
 }
 
 module.exports = {
+  RESUME_ELIGIBLE_DELIVERIES_SQL,
   FOLLOW_BACK_MODULE_KEY,
   BUMPS_MODULE_KEY,
   LIKES_MODULE_KEY,

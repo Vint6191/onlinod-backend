@@ -16,7 +16,8 @@ test("Audit17 automation product control is origin-isolated while shared write l
   assert.match(action, /retrySafeFailures[\s\S]*originKind:\s*"AUTOMATION"/);
   assert.match(action, /requireLease[\s\S]*originKind !== "AUTOMATION"[\s\S]*DELIVERY_WRONG_AUTHORITY/);
   assert.match(control, /pauseDeliveriesForControl[\s\S]*originKind:\s*"AUTOMATION"/);
-  assert.match(control, /resumeDeliveriesForControl[\s\S]*originKind:\s*"AUTOMATION"/);
+  assert.match(control, /RESUME_ELIGIBLE_DELIVERIES_SQL[\s\S]*d\."originKind"='AUTOMATION'/);
+  assert.match(control, /resumeDeliveriesForControl[\s\S]*UPDATE "AutomationDelivery"[\s\S]*d\."originKind"='AUTOMATION'/);
   assert.match(history, /compactAutomationDeliveries[\s\S]*originKind:\s*"AUTOMATION"/);
   assert.match(history, /getAutomationMetrics[\s\S]*originKind:\s*"AUTOMATION"/);
   assert.match(pacing, /latestWriteState[\s\S]*originKind:\s*"AUTOMATION"/);

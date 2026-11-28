@@ -36,6 +36,7 @@ export {AutomationService} from ${JSON.stringify(path.join(mainServices, "automa
 export {createAutomationHandlers} from ${JSON.stringify(path.join(mainServices, "automation/automation-ipc.ts"))};
 export {BackendActionWorker} from ${JSON.stringify(path.join(mainServices, "backend-actions/backend-action-worker.ts"))};
 export {AutomationMessageSettlementOutbox} from ${JSON.stringify(path.join(mainServices, "backend-actions/automation-message-settlement-outbox.ts"))};
+export {AutomationCommentSettlementOutbox} from ${JSON.stringify(path.join(mainServices, "backend-actions/automation-comment-settlement-outbox.ts"))};
 export {likesContentDiscoveryHandler} from ${JSON.stringify(path.join(mainServices, "backend-jobs/handlers/likes-content-discovery-handler.ts"))};
 export {sfsTargetDiscoveryHandler} from ${JSON.stringify(path.join(mainServices, "backend-jobs/handlers/sfs-target-discovery-handler.ts"))};
 export {sfsTargetScanHandler} from ${JSON.stringify(path.join(mainServices, "backend-jobs/handlers/sfs-target-scan-handler.ts"))};

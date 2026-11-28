@@ -427,6 +427,20 @@ async function settleCustomManualDeliveryWriteFromTeamEvent({ client, row, proje
 }
 
 
+function customManualSettlementAcknowledgement(delivery) {
+  const result = object(delivery.result);
+  return {
+    authorityVersion: "CUSTOM_MANUAL_V2",
+    writeId: delivery.id,
+    writeCommitRevision: Number(delivery.writeCommitRevision),
+    kind: "CUSTOM_MANUAL_SEND",
+    deviceId: delivery.sourceDeviceId,
+    networkRequestId: clean(object(delivery.payload).networkRequestId, 220),
+    outcome: result.outcomeState,
+    providerStatus: result.providerStatus,
+  };
+}
+
 async function settleCustomManualDeliveryWithCapability(input, { db = null } = {}) {
   const client = db || require("../prisma");
   const writeId = clean(input?.writeId, 180);
@@ -465,7 +479,7 @@ async function settleCustomManualDeliveryWithCapability(input, { db = null } = {
 
     if (outcome === "PROVEN_NO_EFFECT") {
       if (String(delivery.status || "") === "RETRY_SCHEDULED" && String(delivery.failureCode || "") === "provider_rejected_no_effect") {
-        return { ok: true, duplicate: true, provenNoEffect: true, writeId };
+        return { ok: true, duplicate: true, provenNoEffect: true, ...customManualSettlementAcknowledgement(delivery) };
       }
       if (!delivery.writeCommitAt) throw fail("CUSTOM_DELIVERY_WRITE_BINDING_MISMATCH", "Custom rejection belongs to a request that is no longer physically committed", 403);
       if (!["COMMITTING", "RECONCILE_REQUIRED"].includes(String(delivery.status || ""))
@@ -483,13 +497,14 @@ async function settleCustomManualDeliveryWithCapability(input, { db = null } = {
         },
       });
       if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_DELIVERY_WRITE_SETTLE_RACE", "Physical Custom delivery authority changed while rejection proof was settling", 409);
-      return { ok: true, provenNoEffect: true, writeId };
+      const settled = await tx.automationDelivery.findUnique({ where: { id: writeId } });
+      return { ok: true, provenNoEffect: true, ...customManualSettlementAcknowledgement(settled) };
     }
 
     if (String(delivery.status || "") === "COMPLETED") {
       const completedMessageId = clean(delivery.messageId || result.messageId, 220);
       if (completedMessageId !== messageId) throw fail("CUSTOM_DELIVERY_WRITE_RESULT_CONFLICT", "Physical Custom delivery authority already completed with another provider message", 409);
-      return { ok: true, duplicate: true, provenSuccess: true, writeId, messageId };
+      return { ok: true, duplicate: true, provenSuccess: true, ...customManualSettlementAcknowledgement(delivery), messageId: completedMessageId };
     }
     if (!delivery.writeCommitAt) throw fail("CUSTOM_DELIVERY_WRITE_BINDING_MISMATCH", "Custom success belongs to a request that is no longer physically committed", 403);
     if (!["COMMITTING", "RECONCILE_REQUIRED"].includes(String(delivery.status || ""))
@@ -521,7 +536,8 @@ async function settleCustomManualDeliveryWithCapability(input, { db = null } = {
       },
     });
     if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_DELIVERY_WRITE_SETTLE_RACE", "Physical Custom delivery authority changed while exact proof was settling", 409);
-    return { ok: true, provenSuccess: true, writeId, messageId, projection };
+    const settled = await tx.automationDelivery.findUnique({ where: { id: writeId } });
+    return { ok: true, provenSuccess: true, ...customManualSettlementAcknowledgement(settled), messageId: settled.messageId, projection };
   };
   if (typeof client.$transaction === "function") {
     const result = await runDbTransaction(client, settle, { timeout: 30_000 });

@@ -27,9 +27,20 @@ exports.runAutomation = async function runAutomation(f) {
   const coordinator = new m.WorkCoordinatorService({ log, databasePath: path.join(scratch, "automation-work.sqlite") });
   const capabilities = { canRun: () => ({ allowed: true }) };
   coordinator.setCapabilityResolver((...args) => capabilities.canRun(...args));
-  let runtimeListener;
+  let runtimeListener, observationSequence = 0;
   const creatorRuntime = { getVerifiedIdentity: creatorId => ({ platformUserId: creatorId === c ? "100001" : "100002" }),
-    on: (_event, listener) => { runtimeListener = listener; return () => { runtimeListener = null; }; } };
+    registerChangeAdapter: (owner, listener) => {
+      assert.equal(owner, "automation");
+      // The physical observation is a fixture; the current owner's admission,
+      // permit and Backend commit path are the real worker implementation.
+      runtimeListener = change => {
+        const permit = authority.capturePermit("LOCAL_PROCESS", { creatorId: change.creatorId });
+        return listener({ id: "acceptance-observation-" + (++observationSequence), ...change }, {
+          historical: false, permit, assertCurrent: () => authority.assertPermitCurrent(permit),
+        });
+      };
+      return () => { runtimeListener = null; };
+    } };
   const provider = { calls: [], messages: [], follows: new Map([["16004", true]]), comments: [], likes: new Set(), gate: null, loseSend: false };
   const success = data => ({ ok: true, status: 200, data });
   const ofApi = {
@@ -78,8 +89,9 @@ exports.runAutomation = async function runAutomation(f) {
     },
   };
   const messageSettlements = new m.AutomationMessageSettlementOutbox(log, path.join(scratch, "automation-message-receipts.sqlite"));
+  const commentSettlements = new m.AutomationCommentSettlementOutbox(log, path.join(scratch, "automation-comment-receipts.sqlite"));
   const worker = new m.BackendActionWorker({ log, authStore, authService, capabilities, authorization: authority,
-    creatorRuntime, coordinator, ofApi, messageSettlements, customOrders: { assertProgrammaticMediaAllowed: async () => {} } });
+    creatorRuntime, coordinator, ofApi, messageSettlements, commentSettlements, customOrders: { assertProgrammaticMediaAllowed: async () => {} } });
   const handlers = { ...m.createAutomationHandlers(service, () => worker),
     "managementCommands.listPending": () => commands.listPending(),
     "managementCommands.acknowledge": input => commands.acknowledge(input.commandId),
@@ -88,7 +100,7 @@ exports.runAutomation = async function runAutomation(f) {
     "subscribers.listHiddenOnline": input => subscribers.listHiddenOnline(input),
     "subscribers.scheduleScan": input => subscribers.scheduleScan(input),
   };
-  let loseCompletionAck = false;
+  let loseCompletionAck = false, loseCommentCompletionAck = false;
   const blockedReleases = [];
   const calls = [], errors = [], requests = [], nativeFetch = globalThis.fetch;
   globalThis.fetch = async (input, options) => {
@@ -100,6 +112,11 @@ exports.runAutomation = async function runAutomation(f) {
       loseCompletionAck = false; await response.clone().text();
       results.lostCompletionAck = true;
       throw Error("Controlled lost completion acknowledgement after SQL commit");
+    }
+    if (loseCommentCompletionAck && /\/api\/automation-action-settlement\/[^/]+\/comment-complete$/.test(url.pathname) && response.ok) {
+      loseCommentCompletionAck = false; await response.clone().text();
+      results.lostCommentCompletionAck = true;
+      throw Error("Controlled lost comment acknowledgement after SQL commit");
     }
     return response;
   };
@@ -128,7 +145,8 @@ acceptRendererAuthorizationProjection(input.projection);root=createRoot(document
 export async function refresh(){await client.invalidateQueries({queryKey:['automation']});}
 export function unmount(){root.unmount();client.clear();}`);
     await load("esbuild").build({ entryPoints: [fixture], outfile: script, bundle: true, platform: "browser", format: "iife", globalName: "ActualAutomation",
-      jsx: "automatic", nodePaths: [path.join(desktop, "node_modules")], loader: { ".css": "css", ".png": "dataurl", ".svg": "dataurl" }, define: { "process.env.NODE_ENV": '"development"' } });
+      jsx: "automatic", alias: { "@nod/shared": path.join(desktop, "packages/shared/src/index.ts") },
+      nodePaths: [path.join(desktop, "node_modules")], loader: { ".css": "css", ".png": "dataurl", ".svg": "dataurl", ".ttf": "dataurl" }, define: { "process.env.NODE_ENV": '"development"' } });
     server = http.createServer((req, res) => {
       const file = req.url === "/app.js" ? script : req.url === "/app.css" ? script.replace(/js$/, "css") : null;
       res.setHeader("Content-Type", file ? file.endsWith(".js") ? "application/javascript" : "text/css" : "text/html");
@@ -136,7 +154,7 @@ export function unmount(){root.unmount();client.clear();}`);
     });
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     const { default: chromium } = await import(pathToFileURL(runtime.resolve("@sparticuz/chromium")).href);
-    browser = await runtime("playwright").chromium.launch({ executablePath: process.env.ONLINOD_CHROMIUM_PATH || await chromium.executablePath(), args: chromium.args, headless: true });
+    browser = await runtime("playwright-core").chromium.launch({ executablePath: process.env.ONLINOD_CHROMIUM_PATH || await chromium.executablePath(), args: chromium.args, headless: true });
     page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
     page.on("pageerror", error => errors.push(error.message));
     const origin = `http://127.0.0.1:${server.address().port}`;
@@ -150,27 +168,46 @@ export function unmount(){root.unmount();client.clear();}`);
     await page.evaluate(input => window.ActualAutomation.mount(input), { creators, session: { ...authStore.readSession(), permissions: { "automation.manage": true } },
       projection: { ok: true, authenticated: true, current: true, quarantineState: "CURRENT", localAuthorizationRevision: 1,
         session: { ...authStore.readSession(), accessToken: undefined, refreshToken: undefined }, creators, activeCreatorId: c } });
-    const go = async name => { await page.getByRole("navigation", { name: "Automation sections" }).getByRole("button", { name, exact: true }).click(); await until(async () => !(await page.getByText("Loading…", { exact: true }).count()), "Renderer did not settle"); };
-    const click = async name => { await page.getByRole("button", { name, exact: true }).first().click(); await until(async () => !(await page.getByRole("button", { name: "Refresh", exact: true }).isDisabled()), "Command did not settle");
+    // Current UI: Russian accessible labels, a shared CreatorPicker, switches,
+    // and per-candidate actions. These select the shipped controls only.
+    const refreshLabel = "Обновить автоматизацию";
+    const settled = label => until(async () => !(await page.getByText("Загружаем данные…", { exact: true }).count())
+      && !(await page.getByRole("button", { name: refreshLabel, exact: true }).isDisabled()), label);
+    const go = async name => { await page.getByRole("navigation", { name: "Разделы автоматизации" }).getByRole("button", { name, exact: true }).click(); await settled("Renderer did not settle"); };
+    const click = async (name, target = page.getByRole("button", { name, exact: true })) => { await target.click(); await settled("Command did not settle");
       const alerts = await page.getByRole("alert").allTextContents(); assert.deepEqual(alerts, [], name + ": " + alerts.join("; ")); };
+    const toggle = async (feature, checked) => {
+      const target = page.getByRole("switch", { name: feature + " · " + creators[0].displayName, exact: true });
+      assert.equal(await target.isChecked(), checked, "Control starts in the expected state: " + feature);
+      await click(feature, target);
+      assert.equal(await target.isChecked(), !checked, "Control reaches the expected state: " + feature);
+    };
+    const pickCreator = async id => {
+      const creator = creators.find(row => row.id === id), name = creator.displayName || creator.username || creator.id;
+      await page.getByRole("button", { name: "Выбрать модель", exact: true }).click();
+      await page.getByRole("option").filter({ has: page.getByText(name, { exact: true }) }).click();
+      await settled("Model change did not settle");
+    };
+    const queueCandidate = (identity, name) => click(name, page.getByRole("row").filter({ hasText: identity }).getByRole("button", { name, exact: true }));
     for (const name of ["Overview", "Bumps", "Hidden Online", "Follow Back", "Refollow", "Likes", "SFS Hunter", "Queue", "History", "Settings"]) {
       await go(name); await wait(100); assert.deepEqual(await page.getByRole("alert").allTextContents(), [], name);
     }
     pass("Ten actual React Automation sections load through Desktop services and live isolated Backend");
     await go("Bumps");
-    await click("New bump");
-    await page.getByLabel("Internal title", { exact: true }).fill("Acceptance welcome");
-    await page.getByLabel("Message", { exact: true }).fill("Linked acceptance message");
-    await page.getByLabel("Minimum delay, seconds", { exact: true }).fill("0");
-    await page.getByLabel("Maximum delay, seconds", { exact: true }).fill("0");
-    await click("Save template");
-    await page.getByRole("heading", { name: "Acceptance welcome", exact: true }).waitFor();
+    await click("Новый бамп");
+    await page.getByLabel("Название для команды", { exact: true }).fill("Acceptance welcome");
+    await page.getByLabel("Текст сообщения", { exact: true }).fill("Linked acceptance message");
+    await page.locator("summary").filter({ hasText: "Время и повторы" }).click();
+    await page.getByLabel("Задержка от, секунды", { exact: true }).fill("0");
+    await page.getByLabel("Задержка до, секунды", { exact: true }).fill("0");
+    await click("Сохранить бамп");
+    await page.getByRole("button", { name: "Acceptance welcome", exact: true }).waitFor();
     await page.screenshot({ path: path.join(output, "bumps-created.png"), fullPage: true });
-    await page.getByLabel("Automation model").selectOption(creatorIds[1]);
-    await page.getByText("No matching templates.", { exact: true }).waitFor();
+    await pickCreator(creatorIds[1]);
+    await page.getByText("Создайте первый бамп", { exact: true }).waitFor();
     assert.equal((await service.uiListBumps({ creatorId: creatorIds[1], includeTrash: true })).items.length, 0);
-    await page.getByLabel("Automation model").selectOption(c);
-    await page.getByRole("heading", { name: "Acceptance welcome", exact: true }).waitFor();
+    await pickCreator(c);
+    await page.getByRole("button", { name: "Acceptance welcome", exact: true }).waitFor();
     pass("UI-created bump is canonical, survives model switching and stays within its model");
     const setControl = async (scope, moduleKey, settings, enabled = true) => {
       const snapshot = (await service.getControls({ creatorId: c })).snapshot;
@@ -222,26 +259,33 @@ export function unmount(){root.unmount();client.clear();}`);
     });
     await heartbeat(); publish();
     await page.evaluate(() => window.ActualAutomation.refresh());
-    await click("Plan automatic bumps");
+    // Automatic planning no longer has a UI button. Keep the same canonical
+    // no-invented-presence assertion through its current Desktop service.
+    const snapshotPlan = await service.planAutomaticBumps({ creatorId: c });
+    commands.acknowledge(snapshotPlan.commandId);
     const deliveries = async () => (await service.listDeliveries({ creatorId: c, limit: 100 })).items;
+    const expectedCompleted = new Map();
     assert.equal((await deliveries()).length, 0, "Plan snapshots must not invent live presence observations");
     coordinator.start(); worker.start();
-    runtimeListener({ creatorId: c, event: { type: "presence_online", fanIds: ["16001"], createdAt: new Date().toISOString() } });
+    const applied = await runtimeListener({ creatorId: c, event: { type: "presence_online", fanIds: ["16001"], createdAt: new Date().toISOString() } });
+    assert.equal(applied.status, "APPLIED", "Live event must receive the real worker's committed observation receipt");
     let initial;
     await until(async () => { initial = (await deliveries()).find(row => row.actionType === "SEND_MESSAGE"); return initial; }, "Live observation did not plan a bump");
     await until(async () => (await deliveries()).find(row => row.id === initial.id)?.status === "COMPLETED", "Bump did not complete", 45000);
+    expectedCompleted.set(initial.id, { actionType: "SEND_MESSAGE", fanId: "16001" });
     assert.equal(provider.messages.length, 1);
     const deleteAfterSend = (await deliveries()).find(row => row.actionType === "DELETE_MESSAGE");
     results.firstBumpTiming = { now: new Date().toISOString(), deleteAfterSend };
     assert.ok(Date.parse(deleteAfterSend.notBefore) > Date.now() + 3000000, "Bump deletion must retain its one-hour delay: " + JSON.stringify(results.firstBumpTiming));
-    await go("History"); await click("Refresh");
-    await page.getByRole("cell", { name: /^COMPLETED/ }).first().waitFor();
+    await go("History"); await click(refreshLabel);
+    await page.getByRole("cell", { name: "Выполнено", exact: true }).first().waitFor();
     await page.screenshot({ path: path.join(output, "bump-history.png"), fullPage: true });
     pass("UI template + actual live-event handling → SQL claim → actual SQLite coordinator/worker → one OF message → UI history");
     const terminal = async (actionType, fanId, timeout = 45000) => {
       let row;
       await until(async () => { row = (await deliveries()).find(x => x.actionType === actionType && x.fanId === fanId); return row && ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"].includes(row.status); }, actionType + " did not settle for " + fanId, timeout);
-      assert.equal(row.status, "COMPLETED", JSON.stringify(row)); return row;
+      assert.equal(row.status, "COMPLETED", JSON.stringify(row));
+      expectedCompleted.set(row.id, { actionType, fanId }); return row;
     };
     const holdRead = match => {
       let enter, release;
@@ -256,12 +300,12 @@ export function unmount(){root.unmount();client.clear();}`);
     const planned = await service.planBumps({ creatorId: c, source: "manual", fanIds: ["16002"], manual: true });
     commands.acknowledge(planned.commandId);
     await Promise.race([held.entered, wait(30000).then(() => { throw Error("Bump preflight was not entered"); })]);
-    await click("Bumps: On");
+    await toggle("Бампы", true);
     assert.equal((await deliveries()).find(row => row.fanId === "16002").status, "PAUSED");
     held.release();
     await until(() => coordinator.list({ statuses: ["running"], limit: 100 }).items.length === 0, "Paused local attempt did not settle");
     assert.equal(provider.messages.length, 1, "Pause before prepare-write forbids external effect");
-    await click("Bumps: Off");
+    await toggle("Бампы", false);
     await terminal("SEND_MESSAGE", "16002");
     assert.equal(provider.messages.length, 2, "Resume produces exactly one message");
     pass("UI pause during preflight invalidates the lease; resume finishes the same delivery once");
@@ -292,7 +336,7 @@ export function unmount(){root.unmount();client.clear();}`);
     for (const [name, actionType, fanId] of [["Follow Back", "FOLLOW_BACK", "16003"], ["Likes", "LIKE_POST", "16005"], ["Refollow", "UNFOLLOW_FAN", "16004"]]) {
       await go(name);
       if (name === "Likes") {
-        await click("Discover candidates");
+        await click("Обновить публикации");
         await runReadJob("likes_content_discovery", m.likesContentDiscoveryHandler);
         const observed = (await service.getLikes({ creatorId: c, limit: 100 })).items;
         results.likesDiscovery = observed;
@@ -300,10 +344,11 @@ export function unmount(){root.unmount();client.clear();}`);
         assert.equal(observed.find(row => row.contentId === "50002")?.canToggleFavorite, false, "Discovery must preserve the provider's cannot-like flag");
         assert.ok(!observed.some(row => row.contentId === "50003"), "Old content must not enter the discovery cohort");
       }
-      await click("Build queue");
+      await click(refreshLabel);
+      await queueCandidate(name === "Likes" ? "50001" : fanId, { "Follow Back": "Подписаться", Likes: "Поставить лайк", Refollow: "Начать" }[name]);
       await terminal(actionType, fanId);
       if (name === "Refollow") await terminal("FOLLOW_FAN", fanId, 60000);
-      await click("Refresh");
+      await click(refreshLabel);
       await page.screenshot({ path: path.join(output, name.toLowerCase().replaceAll(" ", "-") + ".png"), fullPage: true });
     }
     assert.equal(provider.follows.get("16003"), true);
@@ -312,24 +357,30 @@ export function unmount(){root.unmount();client.clear();}`);
     pass("Follow Back, Likes and complete Refollow cycle: UI queue → actual provider executor → canonical state");
 
     await go("SFS Hunter");
-    await click("Discover candidates");
+    await click("Найти партнёров");
     const discoveryResult = await runReadJob("sfs_target_discovery", m.sfsTargetDiscoveryHandler);
     assert.equal(discoveryResult.resolved, 1);
-    await click("Refresh");
+    await click(refreshLabel);
     assert.equal((await service.getSfs({ creatorId: c, limit: 100 })).items[0].targetUserId, "16006");
-    await click("New comment");
-    await page.getByLabel("Internal title", { exact: true }).fill("Acceptance SFS");
-    await page.getByLabel("Message", { exact: true }).fill("Linked SFS comment");
-    await click("Save template");
+    await page.getByRole("tab", { name: "Комментарии", exact: true }).click();
+    await click("Новый комментарий");
+    await page.getByLabel("Название для команды", { exact: true }).fill("Acceptance SFS");
+    await page.getByLabel("Комментарий", { exact: true }).fill("Linked SFS comment");
+    await click("Сохранить комментарий");
     provider.comments.push({ id: "71001", text: "Fan comment", fromUser: { id: 17001, username: "commenter", isPerformer: false }, isLiked: false, canLike: true });
-    await click("Build queue");
+    await page.getByRole("tab", { name: "Партнёры", exact: true }).click();
+    loseCommentCompletionAck = true;
+    await queueCandidate("fixture_16006", "В очередь");
     await terminal("SFS_FOLLOW_TARGET", "16006");
     const scanResult = await runReadJob("sfs_target_scan", m.sfsTargetScanHandler);
     assert.equal(scanResult.posts[0].eligibleComments[0].commentId, "71001");
     await terminal("SFS_COMMENT_POST", "16006", 60000);
+    await until(() => commentSettlements.db.prepare("SELECT count(*) n FROM automation_comment_receipts").get().n === 0,
+      "Exact comment receipt did not survive the lost Backend reply", 30000);
+    assert.equal(results.lostCommentCompletionAck, true);
     await terminal("SFS_LIKE_COMMENT", "16006", 60000);
-    await click("Refresh");
-    await click("SFS Hunter: On");
+    await click(refreshLabel);
+    await toggle("SFS Hunter", true);
     const cleanup = (await deliveries()).find(row => row.actionType === "SFS_UNFOLLOW_TARGET");
     assert.ok(cleanup && cleanup.status !== "PAUSED", "Owned follow cleanup must survive module pause");
     await terminal("SFS_UNFOLLOW_TARGET", "16006", 100000);
@@ -339,10 +390,10 @@ export function unmount(){root.unmount();client.clear();}`);
     assert.equal(settledSfs.state, "COMPLETED");
     assert.equal(settledSfs.usedForever, true);
     results.settledSfs = settledSfs;
-    await click("Refresh");
-    await page.getByRole("cell", { name: /^COMPLETED/ }).first().waitFor();
+    await click(refreshLabel);
+    await page.getByRole("cell", { name: "Выполнено", exact: true }).first().waitFor();
     await page.screenshot({ path: path.join(output, "sfs-complete-paused.png"), fullPage: true });
-    pass("Complete SFS saga: follow → actual scan handler → comment + comment like → owned cleanup while paused");
+    pass("Complete SFS saga: follow → actual scan handler → exact comment receipt survives lost Backend reply → comment like → owned cleanup while paused");
 
     loseCompletionAck = true;
     const withLostAck = await service.planBumps({ creatorId: c, source: "manual", fanIds: ["16007"], manual: true });
@@ -356,35 +407,67 @@ export function unmount(){root.unmount();client.clear();}`);
     assert.equal((await deliveries()).find(row => row.id === ackRow.id).status, "COMPLETED");
     pass("Lost completion acknowledgement retries the durable receipt without another provider send");
 
-    provider.loseSend = true;
-    const ambiguous = await service.planBumps({ creatorId: c, source: "manual", fanIds: ["16008"], manual: true });
-    commands.acknowledge(ambiguous.commandId);
-    await until(async () => (await deliveries()).some(row => row.fanId === "16008" && row.status === "RECONCILE_REQUIRED"), "Unknown send was not fenced for reconciliation");
-    await go("Bumps"); await click("Refresh"); await click("Bumps: On");
-    await terminal("SEND_MESSAGE", "16008", 100000);
-    assert.equal(provider.messages.filter(row => row.toUser.id === "16008").length, 1);
-    pass("Ambiguous send remains eligible for readback while paused and settles without resending");
-    const reconciled = (await deliveries()).find(row => row.fanId === "16008" && row.actionType === "SEND_MESSAGE");
-    results.reconciledDelivery = reconciled;
-    assert.equal(reconciled.failureCategory, null, "Resolved provider outcome must release the creator write barrier");
-    await click("Bumps: Off");
+    assert.equal((await deliveries()).find(row => row.id === ackRow.id).failureCategory, null,
+      "An exact, canonically settled provider receipt must release the creator write barrier");
     const afterRecovery = await service.planBumps({ creatorId: c, source: "manual", fanIds: ["16009"], manual: true });
     commands.acknowledge(afterRecovery.commandId);
     await terminal("SEND_MESSAGE", "16009");
     assert.equal(provider.messages.filter(row => row.toUser.id === "16009").length, 1);
-    pass("A settled unknown result releases the creator lane for new independent work");
+    pass("A canonically settled exact receipt releases the creator lane for new independent work");
+
+    // A missing provider response is different from a missing Backend reply.
+    // The application received no exact ACK here; do not manufacture a receipt
+    // from matching history. Keep this unresolved lane at the end of the run.
+    provider.loseSend = true;
+    const ambiguous = await service.planBumps({ creatorId: c, source: "manual", fanIds: ["16008"], manual: true });
+    commands.acknowledge(ambiguous.commandId);
+    let unresolved;
+    await until(async () => { unresolved = (await deliveries()).find(row => row.fanId === "16008" && row.actionType === "SEND_MESSAGE");
+      return unresolved?.status === "RECONCILE_REQUIRED"; }, "Unknown send was not fenced for reconciliation");
+    await go("Bumps"); await click(refreshLabel); await toggle("Бампы", true);
+    await until(async () => { unresolved = (await deliveries()).find(row => row.id === unresolved.id);
+      return unresolved.status === "RECONCILE_REQUIRED" && unresolved.failureCode === "send_reconcile_pending";
+    }, "Paused reconciliation did not retain the unproven outcome after content readback", 100000);
+    assert.ok(provider.calls.filter(row => row.source === "automation.bump.send-preflight:" + unresolved.id).length >= 2,
+      "The real worker must inspect the matching provider history before the unknown-outcome assertion");
+    assert.equal(provider.messages.filter(row => row.toUser.id === "16008").length, 1);
+    assert.equal(unresolved.failureCategory, "OUTCOME_UNKNOWN_RECONCILE");
+    assert.equal(unresolved.result?.messageOwnership, undefined, "Readback cannot create exact operation ownership");
+    assert.equal(messageSettlements.db.prepare("SELECT count(*) n FROM automation_message_receipts").get().n, 0,
+      "No exact receipt may be manufactured for the lost provider response");
+    results.unresolvedDelivery = unresolved;
+    pass("Lost provider response remains RECONCILE_REQUIRED after actual matching readback while paused, with no second send");
 
     const countBeforeRestart = provider.calls.filter(row => !/preflight|comments:|backend.readonly/.test(row.source)).length;
     await worker.stop();
     const stopped = await f.stop("SIGKILL"); assert.equal(stopped.signal, "SIGKILL");
     await f.boot(); await heartbeat(); publish();
     worker.start();
-    await go("History"); await click("Refresh");
-    assert.equal((await deliveries()).filter(row => row.status === "COMPLETED").length, 13);
-    await until(async () => (await page.getByRole("cell", { name: /^COMPLETED/ }).count()) === 13, "UI history did not show all completed deliveries after restart");
+    await go("History"); await click(refreshLabel);
+    const restarted = await deliveries();
+    // Exact named outcomes replace the obsolete total that incorrectly counted
+    // the lost provider response as completed. Every successful branch remains.
+    assert.deepEqual([...expectedCompleted.values()].map(row => row.actionType + ":" + row.fanId).sort(), [
+      "SEND_MESSAGE:16001", "SEND_MESSAGE:16002", "SEND_MESSAGE:16007", "SEND_MESSAGE:16009",
+      "FOLLOW_BACK:16003", "LIKE_POST:16005", "UNFOLLOW_FAN:16004", "FOLLOW_FAN:16004",
+      "SFS_FOLLOW_TARGET:16006", "SFS_COMMENT_POST:16006", "SFS_LIKE_COMMENT:16006", "SFS_UNFOLLOW_TARGET:16006",
+    ].sort());
+    assert.deepEqual(restarted.filter(row => row.status === "COMPLETED").map(row => row.id).sort(), [...expectedCompleted.keys()].sort());
+    for (const [id, expected] of expectedCompleted) {
+      const row = restarted.find(item => item.id === id);
+      assert.equal(row.actionType, expected.actionType); assert.equal(row.fanId, expected.fanId);
+      const rendered = page.getByRole("row").filter({ has: page.getByRole("button", { name: "Открыть действие " + id, exact: true }) });
+      await rendered.getByRole("cell", { name: "Выполнено", exact: true }).waitFor();
+    }
+    await until(async () => (await deliveries()).find(row => row.id === unresolved.id)?.status === "RECONCILE_REQUIRED",
+      "Unproven provider outcome did not survive restart", 100000);
+    assert.equal((await deliveries()).find(row => row.id === unresolved.id).failureCategory, "OUTCOME_UNKNOWN_RECONCILE");
+    assert.equal(provider.messages.filter(row => row.toUser.id === "16008").length, 1);
     assert.equal(provider.calls.filter(row => !/preflight|comments:|backend.readonly/.test(row.source)).length, countBeforeRestart);
+    results.namedOutcomesAfterRestart = [...expectedCompleted].map(([id, expected]) => ({ id, ...expected, status: "COMPLETED" }));
+    results.namedOutcomesAfterRestart.push({ id: unresolved.id, actionType: "SEND_MESSAGE", fanId: "16008", status: "RECONCILE_REQUIRED" });
     await page.screenshot({ path: path.join(output, "history-after-restart.png"), fullPage: true });
-    pass("Backend SIGKILL/restart preserves all completed Automation receipts and UI history");
+    pass("Backend SIGKILL/restart preserves each named completed receipt and UI row, and retains the distinct unresolved send without provider replay");
     results.provider = { calls: provider.calls, messages: provider.messages, follows: [...provider.follows], likes: [...provider.likes] };
     results.renderer = { engine: await browser.version(), calls, errors, desktopRequests: requests };
     assert.deepEqual(errors, []);
@@ -392,7 +475,7 @@ export function unmount(){root.unmount();client.clear();}`);
     clearInterval(renewal);
     for (const release of blockedReleases) release();
     if (page) { await page.screenshot({ path: path.join(output, "last-screen.png"), fullPage: true }).catch(() => {}); }
-    await worker.stop(); await messageSettlements.destroy(); await coordinator.destroy();
+    await worker.stop(); await messageSettlements.destroy(); await commentSettlements.destroy(); await coordinator.destroy();
     results.finalDeliveries = await service.listDeliveries({ creatorId: c, limit: 100 }).catch(error => ({ error: error.message }));
     globalThis.fetch = nativeFetch;
     await browser?.close();

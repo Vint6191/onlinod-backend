@@ -189,10 +189,29 @@ test("MASS queue cancel wire failure stays idempotent-retryable and another auth
     assert.equal(failed.reconciliationRequired, false);
     assert.equal(failed.delivery.writeCommitAt, null);
 
+    const scheduled = clone(rows[0]);
+    await assert.rejects(
+      () => authority.reserveProgrammaticWrite({ ...common, deviceId: "device-b" }),
+      { code: "PROGRAMMATIC_WRITE_NOT_DUE" },
+    );
+    assert.equal(rows[0].status, "RETRY_SCHEDULED");
+    assert.equal(rows[0].claimedByDeviceId, scheduled.claimedByDeviceId);
+    assert.equal(rows[0].leaseRevision, scheduled.leaseRevision);
+    assert.equal(rows[0].writeCommitRevision, scheduled.writeCommitRevision);
+    assert.equal(rows[0].writeCommitAt, null);
+    // Advance only the fixture deadline; a transferable idempotent cancellation
+    // remains available after the durable retry wait, with the same identity.
+    rows[0].notBefore = new Date(Date.now() - 1000);
     reserved = await authority.reserveProgrammaticWrite({ ...common, deviceId: "device-b" });
     assert.equal(reserved.delivery.status, "CLAIMED");
+    assert.equal(reserved.delivery.id, failed.delivery.id);
     assert.equal(rows[0].claimedByDeviceId, "device-b");
     assert.ok(reserved.lease?.token);
+    const takeover = { ...common, deviceId: "device-b", writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision };
+    await authority.startProgrammaticWrite(takeover);
+    const nextPermit = await authority.prepareProgrammaticWrite(takeover);
+    assert.equal(nextPermit.duplicate, false);
+    assert.equal(nextPermit.writeCommitRevision, prepared.writeCommitRevision + 1);
   });
 });
 

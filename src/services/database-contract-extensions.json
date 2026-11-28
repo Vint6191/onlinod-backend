@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v42_usd_only_money_contract",
+  "version": "nod_current_v43_automation_execution_receipts",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -188,6 +188,10 @@
     {
       "migration": "20261128100000_usd_only_money_contract",
       "checksum": "d59eb2d959c569c1050df45ab9b5caa4eb8a608c91fbd85144f0f08536a8be8a"
+    },
+    {
+      "migration": "20261128110000_automation_execution_receipts",
+      "checksum": "f675b93295d16529c0d871c18b8cab2a26badde75fa734ebcffe4b500e9a3415"
     }
   ],
   "extension": {
@@ -7010,6 +7014,33 @@
         "options": "0 0 0 0",
         "expressions": null,
         "predicate": "(currency IS DISTINCT FROM 'USD'::text)"
+      },
+      {
+        "table": "AutomationDelivery",
+        "name": "AutomationDelivery_control_paused_idx",
+        "unique": false,
+        "keys": "2 1 3 4",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "((\"originKind\" = 'AUTOMATION'::text) AND (status = 'PAUSED'::text))"
+      },
+      {
+        "table": "AutomationDelivery",
+        "name": "AutomationDelivery_pacing_action_commit_idx",
+        "unique": false,
+        "keys": "2 3 5 40",
+        "options": "0 0 0 3",
+        "expressions": null,
+        "predicate": "((\"originKind\" = 'AUTOMATION'::text) AND (\"writeCommitAt\" IS NOT NULL))"
+      },
+      {
+        "table": "AutomationDelivery",
+        "name": "AutomationDelivery_pacing_commit_idx",
+        "unique": false,
+        "keys": "2 3 40",
+        "options": "0 0 3",
+        "expressions": null,
+        "predicate": "((\"originKind\" = 'AUTOMATION'::text) AND (\"writeCommitAt\" IS NOT NULL))"
       }
     ]
   }
