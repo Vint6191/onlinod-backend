@@ -13,6 +13,39 @@ const fail = (code, message, status=409) => Object.assign(new Error(message), {c
 const isTrash = row => Boolean(row?.deletedAt) || ["trash","deleted","deleting"].includes(row?.status);
 const trashPurgeAfter = now => new Date(now.getTime()+RETENTION_DAYS*86400000);
 
+// Public identities prefer a client ID; a stored server ID is a public fallback
+// only for historical rows that never received a client ID. Resolve at most the
+// two possible namespaces and reject an ambiguous legacy alias.
+async function findMessageLibraryScript({db,agencyId,creatorId,scriptId,includeBlocks=false}) {
+  const rows=await db.contentCollection.findMany({where:{agencyId,OR:[{clientId:scriptId},{id:scriptId,clientId:null}]},take:2,
+    ...(includeBlocks?{include:{blocks:{orderBy:[{order:"asc"},{id:"asc"}]}}}:{})});
+  if(rows.length>1) throw fail("MESSAGE_LIBRARY_IDENTITY_AMBIGUOUS","Script identity is ambiguous; reload the library");
+  const row=rows[0]||null;
+  if(row && (row.kind!==KIND || row.creatorId!==creatorId)) throw fail("MESSAGE_LIBRARY_SCRIPT_CREATOR_MISMATCH","Script belongs to another content scope");
+  return row;
+}
+async function findMessageLibraryBlock({db,collectionId,messageId}) {
+  const rows=await db.contentBlock.findMany({where:{collectionId,OR:[{clientId:messageId},{id:messageId,clientId:null}]},take:2});
+  if(rows.length>1) throw fail("MESSAGE_LIBRARY_IDENTITY_AMBIGUOUS","Message identity is ambiguous; reload the script");
+  return rows[0]||null;
+}
+async function inspectMessageLibraryBlockIdentities({db,collectionId,messageIds}) {
+  const ids=[...new Set(messageIds)];
+  if(!ids.length)return [];
+  const matches=await db.contentBlock.findMany({where:{collectionId,OR:[{clientId:{in:ids}},{id:{in:ids},clientId:null}]},select:{id:true,clientId:true},take:ids.length*2});
+  const seen=new Set();
+  for(const row of matches){const publicId=row.clientId??row.id;if(seen.has(publicId))throw fail("MESSAGE_LIBRARY_IDENTITY_AMBIGUOUS","Message identity is ambiguous; reload the script");seen.add(publicId);}
+  return matches;
+}
+async function adoptLegacyMessageLibraryBlockIds({tx,collectionId,blocks}) {
+  const matches=await inspectMessageLibraryBlockIdentities({db:tx,collectionId,messageIds:blocks.map(block=>block.clientId)});
+  const existingIds=new Set(matches.map(row=>row.clientId??row.id));
+  if(blocks.some(block=>existingIds.has(block.clientId)&&block.priceProvided!==true))
+    throw fail("MESSAGE_LIBRARY_PRICE_REQUIRED","Retain or explicitly replace the USD price of every existing message",400);
+  const legacy=matches.filter(row=>row.clientId===null).map(row=>row.id);
+  if(legacy.length) await tx.$executeRawUnsafe('UPDATE "ContentBlock" SET "clientId"="id" WHERE "collectionId"=$1 AND "clientId" IS NULL AND "id"=ANY($2::text[])',collectionId,legacy);
+}
+
 async function lockContentScope({tx,agencyId,creatorId,actorMember=null,userId=null,manager=true}) {
   if(!agencyId || !creatorId) throw fail("MESSAGE_LIBRARY_SCOPE_REQUIRED","Agency and creator are required",400);
   if(actorMember) return assertManagementCommitAuthority({tx,agencyId,actorMember:{...actorMember,userId},creatorIds:[creatorId],permissionKey:manager?"message_library.manage":null});
@@ -25,9 +58,8 @@ async function lockMessageLibraryScript({tx,agencyId,creatorId,scriptId,expected
   if(!scriptId) throw fail("MESSAGE_LIBRARY_SCRIPT_ID_MISSING","Script identity is required",400);
   // Also serializes concurrent creation: the unique namespace is agency/clientId.
   await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",`message-library:${agencyId}:${scriptId}`);
-  await tx.$queryRawUnsafe('SELECT "id" FROM "ContentCollection" WHERE "agencyId"=$1 AND "clientId"=$2 FOR UPDATE',agencyId,scriptId);
-  const row=await tx.contentCollection.findFirst({where:{agencyId,clientId:scriptId},...(includeBlocks?{include:{blocks:{orderBy:[{order:"asc"},{createdAt:"asc"}]}}}:{})});
-  if(row && (row.kind!==KIND || row.creatorId!==creatorId)) throw fail("MESSAGE_LIBRARY_SCRIPT_CREATOR_MISMATCH","Script belongs to another content scope");
+  await tx.$queryRawUnsafe('SELECT "id" FROM "ContentCollection" WHERE "agencyId"=$1 AND ("clientId"=$2 OR ("id"=$2 AND "clientId" IS NULL)) ORDER BY "id" FOR UPDATE',agencyId,scriptId);
+  const row=await findMessageLibraryScript({db:tx,agencyId,creatorId,scriptId,includeBlocks});
   if(expectedUpdatedAt && (!row || new Date(row.updatedAt).getTime()!==new Date(expectedUpdatedAt).getTime())) throw fail("MESSAGE_LIBRARY_REVISION_CONFLICT","Script changed; reload before editing");
   return row;
 }
@@ -50,7 +82,7 @@ async function upsertMessageLibraryBlocks({tx,collectionId,blocks,now}) {
   const rows=blocks.map(b=>({...b,id:randomUUID(),collectionId,status:"active",deletedAt:null,purgeAfter:null,trashedByUserId:null,createdAt:now,updatedAt:now}));
   const types={id:"text",collectionId:"text",clientId:"text",order:"integer",role:"text",title:"text",text:"text",priceCents:"integer",currency:"text",lockedText:"boolean",media:"jsonb",note:"text",metadata:"jsonb",status:"text",deletedAt:"timestamp",purgeAfter:"timestamp",trashedByUserId:"text",createdAt:"timestamp",updatedAt:"timestamp"};
   const columns=Object.keys(types),quoted=columns.map(k=>'"'+k+'"').join(',');
-  const updates=columns.filter(k=>!["id","collectionId","clientId","createdAt"].includes(k)).map(k=>'"'+k+'"=EXCLUDED."'+k+'"').join(',');
+  const updates=columns.filter(k=>!["id","collectionId","clientId","createdAt"].includes(k)).map(k=>k==="metadata"?'"metadata"=COALESCE("ContentBlock"."metadata",\'{}\'::jsonb)||EXCLUDED."metadata"':'"'+k+'"=EXCLUDED."'+k+'"').join(',');
   await tx.$executeRawUnsafe(`INSERT INTO "ContentBlock" (${quoted}) SELECT ${quoted} FROM jsonb_to_recordset($1::jsonb) AS r(${columns.map(k=>'"'+k+'" '+types[k]).join(',')}) ORDER BY "clientId" ON CONFLICT ("collectionId","clientId") DO UPDATE SET ${updates}`,JSON.stringify(rows));
 }
 
@@ -63,7 +95,7 @@ async function changeMessageLibraryLifecycle({tx,existing,now,action,userId=null
   if(messageId) {
     // Shrinking an old over-limit script remains possible while it is in trash.
     if(isTrash(existing) && action!=="trash") throw fail("MESSAGE_LIBRARY_SCRIPT_TRASHED","Restore the script before editing its messages");
-    const block=await tx.contentBlock.findFirst({where:{collectionId:existing.id,OR:[{clientId:messageId},{id:messageId}]}});
+    const block=await findMessageLibraryBlock({db:tx,collectionId:existing.id,messageId});
     if(!block) throw fail("MESSAGE_LIBRARY_BLOCK_NOT_FOUND","Message block not found",404);
     if(action==="restore") await assertMessageLibraryRestore(tx,{...existing,updatedByUserId:userId},block);
     const data=action==="restore"?{status:"active",deletedAt:null,purgeAfter:null,trashedByUserId:null}:{status:"trash",deletedAt:block.deletedAt||now,purgeAfter:block.purgeAfter||trashPurgeAfter(now),trashedByUserId:userId};
@@ -101,17 +133,17 @@ async function cleanupMessageLibraryScript({db,agencyId,creatorId,scriptId,batch
 async function runMessageLibraryTrashMaintenance({db,agencyId=null,creatorId=null,actorMember=null,userId=null,limit=10}={}) {
   const now=await dbAuthorityNow({db});
   const take=Math.max(1,Math.min(10,Math.floor(Number(limit)||10)));
-  const scope={kind:KIND,clientId:{not:null},...(agencyId?{agencyId}:{}),...(creatorId?{creatorId}:{}),creator:{is:{deletedAt:null}},agency:{deletedAt:null}};
+  const scope={kind:KIND,...(agencyId?{agencyId}:{}),...(creatorId?{creatorId}:{}),creator:{is:{deletedAt:null}},agency:{deletedAt:null}};
   const parents=await db.contentCollection.findMany({where:{...scope,purgeAfter:{lte:now},OR:[{status:{in:["trash","deleted","deleting"]}},{deletedAt:{not:null}}]},select:{id:true,agencyId:true,creatorId:true,clientId:true},orderBy:[{purgeAfter:"asc"},{id:"asc"}],take});
   const blocks=await db.contentBlock.findMany({where:{purgeAfter:{lte:now},OR:[{status:"trash"},{deletedAt:{not:null}}],collection:scope},select:{collection:{select:{id:true,agencyId:true,creatorId:true,clientId:true}}},orderBy:[{purgeAfter:"asc"},{id:"asc"}],take});
-  const targets=[...new Map([...parents,...blocks.map(b=>b.collection)].filter(r=>r.clientId).map(r=>[r.id,r])).values()];
+  const targets=[...new Map([...parents,...blocks.map(b=>b.collection)].map(r=>[r.id,r])).values()];
   const out={ok:true,scriptsDeleted:0,blocksDeleted:0,processed:0,hasMore:parents.length===take||blocks.length===take,errors:[]};
   const started=Date.now();
   for(const row of targets){
     if(Date.now()-started>=8000){out.hasMore=true;break;}
-    try{const result=await cleanupMessageLibraryScript({db,agencyId:row.agencyId,creatorId:row.creatorId,scriptId:row.clientId,actorMember,userId});out.scriptsDeleted+=result.scriptsDeleted;out.blocksDeleted+=result.blocksDeleted;out.processed++;out.hasMore ||= result.hasMore;}
+    try{const result=await cleanupMessageLibraryScript({db,agencyId:row.agencyId,creatorId:row.creatorId,scriptId:row.clientId??row.id,actorMember,userId});out.scriptsDeleted+=result.scriptsDeleted;out.blocksDeleted+=result.blocksDeleted;out.processed++;out.hasMore ||= result.hasMore;}
     catch(error){out.ok=false;out.errors.push({id:row.id,code:error.code||"MESSAGE_LIBRARY_CLEANUP_FAILED"});}
   }
   return out;
 }
-module.exports={upsertMessageLibraryBlocks,KIND,RETENTION_DAYS,trashPurgeAfter,isTrash,lockContentScope,lockMessageLibraryScript,withMessageLibraryMutation,changeMessageLibraryLifecycle,cleanupMessageLibraryScript,runMessageLibraryTrashMaintenance};
+module.exports={findMessageLibraryScript,findMessageLibraryBlock,inspectMessageLibraryBlockIdentities,adoptLegacyMessageLibraryBlockIds,upsertMessageLibraryBlocks,KIND,RETENTION_DAYS,trashPurgeAfter,isTrash,lockContentScope,lockMessageLibraryScript,withMessageLibraryMutation,changeMessageLibraryLifecycle,cleanupMessageLibraryScript,runMessageLibraryTrashMaintenance};

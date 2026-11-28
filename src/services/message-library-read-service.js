@@ -1,5 +1,6 @@
 "use strict";
 const fail=(code,message,status=409)=>Object.assign(new Error(message),{code,status});
+const {inspectMessageLibraryBlockIdentities}=require('./message-library-lifecycle-service');
 const ACTIVE=`"deletedAt" IS NULL AND status NOT IN ('trash','deleted')`;
 async function blockSummary(db,collectionIds) {
   if (!collectionIds.length) return new Map();
@@ -34,6 +35,7 @@ async function readBlockPage(db,collection,{state='active',offset=0,limit=100,sn
       ORDER BY b."order",b.id`,collection.id,take,offset);
   const total=Number((await db.$queryRawUnsafe(`SELECT count(*) n FROM "ContentBlock" WHERE "collectionId"=$1 AND ${predicate}`,collection.id))[0].n);
   if (!rows.length && offset<total) throw fail('MESSAGE_LIBRARY_BLOCK_TOO_LARGE','This block exceeds the readable content limit',413);
+  await inspectMessageLibraryBlockIdentities({db,collectionId:collection.id,messageIds:rows.map(row=>row.clientId??row.id)});
   return {rows,count:total,offset,nextOffset:offset+rows.length,hasMore:offset+rows.length<total,snapshotRevision:revision};
 }
 async function assertCompleteSnapshot(db,collection,payload) {
@@ -42,4 +44,19 @@ async function assertCompleteSnapshot(db,collection,payload) {
     || got.activeCount!==expected.activeCount || got.digest!==expected.digest)
     throw fail('MESSAGE_LIBRARY_COMPLETE_CONTENT_REQUIRED','Load the complete current script before replacing its messages',428);
 }
-module.exports={blockSummary,contentSnapshot,readBlockPage,assertCompleteSnapshot};
+async function readMessageLibrarySearchPage(db,{agencyId,creatorId,includeTrash,search,limit,offset}) {
+  // Filter tags in the same bounded server query as titles and message content.
+  // A client-side filter cannot recover a tag-only script omitted by a page.
+  const where=`c."agencyId"=$1 AND c."creatorId"=$2 AND c.kind='message_library_script'
+    AND c.status<>'deleting' AND ($3::boolean OR (c."deletedAt" IS NULL AND c.status NOT IN ('trash','deleted')))
+    AND (strpos(lower(c.title),lower($4))>0 OR strpos(lower(coalesce(c.description,'')),lower($4))>0
+      OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c.tags)='array' THEN c.tags ELSE '[]'::jsonb END) tag(value)
+        WHERE jsonb_typeof(tag.value)='string' AND strpos(lower(tag.value #>> '{}'),lower($4))>0)
+      OR EXISTS (SELECT 1 FROM "ContentBlock" b WHERE b."collectionId"=c.id AND b."deletedAt" IS NULL AND b.status NOT IN ('trash','deleted')
+        AND (strpos(lower(b.text),lower($4))>0 OR strpos(lower(coalesce(b.title,'')),lower($4))>0 OR strpos(lower(coalesce(b.note,'')),lower($4))>0)))`;
+  const params=[agencyId,creatorId,includeTrash,search];
+  const items=await db.$queryRawUnsafe(`SELECT c.* FROM "ContentCollection" c WHERE ${where} ORDER BY c."updatedAt" DESC,c.id DESC LIMIT $5 OFFSET $6`,...params,limit,offset);
+  const count=Number((await db.$queryRawUnsafe(`SELECT count(*) n FROM "ContentCollection" c WHERE ${where}`,...params))[0].n);
+  return {items,count};
+}
+module.exports={blockSummary,contentSnapshot,readBlockPage,assertCompleteSnapshot,readMessageLibrarySearchPage};

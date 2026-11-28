@@ -3,7 +3,7 @@
 const { createHash } = require("node:crypto");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
-const { lockContentScope, lockMessageLibraryScript, isTrash } = require("./message-library-lifecycle-service");
+const { lockContentScope, lockMessageLibraryScript, findMessageLibraryBlock, isTrash } = require("./message-library-lifecycle-service");
 const { cleanString, optionalString, jsonObject } = require("./server-store-utils");
 
 const fail = (code, message, status = 409) => Object.assign(new Error(message), { code, status });
@@ -85,9 +85,7 @@ async function recordMessageLibraryUsage({ db, agencyId, userId, actorMember, in
     const collection = await lockMessageLibraryScript({ tx, agencyId, creatorId, scriptId });
     if (!collection) throw fail("MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", "Message Library script not found for this creator", 404);
     if (isTrash(collection)) throw fail("MESSAGE_LIBRARY_SCRIPT_TRASHED", "Script is not available");
-    const block = messageId ? await tx.contentBlock.findFirst({ where: {
-      collectionId: collection.id, OR: [{ clientId: messageId }, { id: messageId, clientId: null }],
-    } }) : null;
+    const block = messageId ? await findMessageLibraryBlock({ db: tx, collectionId: collection.id, messageId }) : null;
     if (messageId && !block) throw fail("MESSAGE_LIBRARY_BLOCK_NOT_FOUND", "Message Library block not found", 404);
     if (block && isTrash(block)) throw fail("MESSAGE_LIBRARY_BLOCK_TRASHED", "Message is not available");
     if (block) require("./usd-money-contract").requireUsdCurrency(block.currency);

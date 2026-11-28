@@ -294,7 +294,9 @@ test("usage attribution is creator-bound and stores only the safe metadata allow
     id: "server-script-1", creatorId: "creator-1",
     blocks: [{ id: "server-block-1", clientId: "block-1" }],
   });
+  db.contentCollection.findMany = async () => [{ id: "server-script-1", agencyId: "agency-1", creatorId: "creator-1", kind: "message_library_script", status: "active" }];
   db.contentBlock.findFirst = async () => ({ id: "server-block-1", clientId: "block-1", currency: "USD" });
+  db.contentBlock.findMany = async () => [{ id: "server-block-1", clientId: "block-1", currency: "USD" }];
   let created = null;
   db.contentUsageEvent.create = async ({ data }) => { created = data; return { id: "event-1", ...data }; };
   const api = loadRoute(db);
@@ -327,6 +329,7 @@ test("old usage writes are retired; v2 refuses missing intent IDs without mutati
 test("v2 route returns 201 first, 200 replay, and 409 changed intent data", async () => {
   const db = baseDb(); let row = null, auditCount = 0;
   db.contentCollection.findFirst = async () => ({ id: "server-script-1", clientId: "script-1", creatorId: "creator-1" });
+  db.contentCollection.findMany = async () => [{ id: "server-script-1", clientId: "script-1", agencyId: "agency-1", creatorId: "creator-1", kind: "message_library_script", status: "active" }];
   db.contentUsageEvent.findUnique = async ({ where }) => row?.id === where.id ? structuredClone(row) : null;
   db.contentUsageEvent.create = async ({ data }) => (row = structuredClone(data));
   db.auditLog.create = async () => { auditCount++; };
@@ -350,6 +353,7 @@ test("script id collisions cannot move a script to another creator", async () =>
   db.contentCollection.findFirst = async () => ({
     id: "server-script-1", clientId: "script-1", creatorId: "creator-a", blocks: [],
   });
+  db.contentCollection.findMany = async () => [{ id: "server-script-1", clientId: "script-1", agencyId: "agency-1", creatorId: "creator-a", kind: "message_library_script", status: "active" }];
   let transactionCalled = false;
   db.$transaction = async fn => { transactionCalled = true; return fn({ ...({}), $transaction: undefined }); };
   const api = loadRoute(db);
@@ -467,6 +471,19 @@ test("a new Desktop draft with a local updatedAt is created without a false revi
  db.contentCollection.create=async({data})=>{saved={id:"new-server-id",...data,updatedAt:new Date("2026-09-24"),blocks:[]};return saved;};
  const api=loadRoute(db),res=response();await api.save({auth:auth(),query:{},params:{id:"new-script"},body:{creatorId:"creator-1",serverId:null,updatedAt:"2026-09-23T18:30:00Z",messages:[]}},res);
  assert.equal(res.statusCode,200);assert.equal(res.body.item.serverId,"new-server-id");
+});
+
+for (const money of [
+  { price: null }, { price: "" }, { price: false }, { price: "12.50" }, { price: -1 }, { price: 1.234 },
+  { priceCents: null }, { priceCents: false }, { priceCents: "1250" }, { priceCents: -1 }, { priceCents: 1.5 },
+  { price: 12.5, priceCents: 1251 }, { price: 21474836.48 },
+]) test(`invalid USD message amount ${JSON.stringify(money)} fails before mutation`, async () => {
+  const db = baseDb(); let transactions = 0;
+  db.$transaction = async () => { transactions++; throw new Error("unexpected write transaction"); };
+  const api = loadRoute(db), res = response();
+  await api.save({ auth: auth(), query: {}, params: { id: "invalid-price" },
+    body: { creatorId: "creator-1", messages: [{ id: "message-1", text: "Paid message", currency: "USD", ...money }] } }, res);
+  assert.equal(res.statusCode, 400); assert.equal(res.body.code, "MESSAGE_LIBRARY_PRICE_INVALID"); assert.equal(transactions, 0);
 });
 for(const state of ["trash","deleting"])test(`ordinary save cannot resurrect ${state} script`,async()=>{
  const db=baseDb();let writes=0;db.contentCollection.findFirst=async()=>({id:"server-script-1",clientId:"script-1",creatorId:"creator-1",status:state,deletedAt:new Date("2026-01-01"),updatedAt:new Date("2026-01-01")});db.contentCollection.update=async()=>{writes++;};

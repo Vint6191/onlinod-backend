@@ -2,7 +2,8 @@
 const { normalizeUsageInput, recordMessageLibraryUsage } = require("../services/message-library-usage-service");
 
 const express = require("express");
-const {blockSummary,contentSnapshot,readBlockPage,assertCompleteSnapshot}=require("../services/message-library-read-service");
+const {blockSummary,contentSnapshot,readBlockPage,assertCompleteSnapshot,readMessageLibrarySearchPage}=require("../services/message-library-read-service");
+const { unavailableMessageLibraryStats } = require("../services/message-library-stats");
 const { executeMessageLibraryCommand } = require("../services/message-library-command-service");
 const prisma = require("../prisma");
 const { assertMessageLibraryAggregate, aggregateState, activeBlock, MAX_BLOCKS, MAX_BYTES, MAX_MEDIA } = require("../services/message-library-limits-service");
@@ -14,13 +15,12 @@ const {
   optionalString,
   jsonArray,
   jsonObject,
-  centsFromAny,
   parseLimit,
   parseOffset,
   sendError,
 } = require("../services/server-store-utils");
 
-const { upsertMessageLibraryBlocks, withMessageLibraryMutation, changeMessageLibraryLifecycle, runMessageLibraryTrashMaintenance, isTrash } = require("../services/message-library-lifecycle-service");
+const { findMessageLibraryScript, adoptLegacyMessageLibraryBlockIds, upsertMessageLibraryBlocks, withMessageLibraryMutation, changeMessageLibraryLifecycle, runMessageLibraryTrashMaintenance, isTrash } = require("../services/message-library-lifecycle-service");
 const router = express.Router();
 
 function genericContentGone(req, res) {
@@ -91,15 +91,27 @@ function asDateOrNull(value) {
 }
 
 function dollarsFromCents(value) {
-  const cents = Number(value || 0);
-  if (!Number.isFinite(cents) || cents <= 0) return 0;
-  return Math.round(cents) / 100;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value / 100 : null;
 }
 
-function centsFromDollars(value) {
-  const n = Number(value || 0);
-  if (!Number.isFinite(n) || n <= 0) return 0;
-  return Math.round(n * 100);
+function messagePriceCents(message) {
+  const invalid = () => Object.assign(new Error("Enter a valid USD price with whole cents"), { code: "MESSAGE_LIBRARY_PRICE_INVALID", status: 400 });
+  const dollars = message.price;
+  let fromDollars;
+  if (dollars !== undefined) {
+    if (typeof dollars !== "number" || !Number.isFinite(dollars) || dollars < 0) throw invalid();
+    fromDollars = Math.round(dollars * 100);
+    if (!Number.isSafeInteger(fromDollars) || fromDollars > 2147483647 || dollars !== fromDollars / 100) throw invalid();
+  }
+  if (message.priceCents !== undefined) {
+    const cents = message.priceCents;
+    if (typeof cents !== "number" || !Number.isSafeInteger(cents) || cents < 0 || cents > 2147483647
+      || (fromDollars !== undefined && fromDollars !== cents)) throw invalid();
+    return cents;
+  }
+  // An omitted price on a newly constructed message is the established free
+  // message contract. Explicit null/blank/malformed history is never zero.
+  return fromDollars === undefined ? 0 : fromDollars;
 }
 
 function normalizeMlTags(value = []) {
@@ -208,7 +220,7 @@ function messageFromBlock(block = {}, index = 0) {
     lockedText: block.lockedText === true,
     media: normalizeMlMedia(block.media),
     note: block.note || "",
-    stats: jsonObject(metadata.stats),
+    stats: unavailableMessageLibraryStats(),
     status: block.status || (block.deletedAt ? "trash" : "active"),
     trashedAt: block.deletedAt || metadata.trashedAt || null,
     purgeAfter: block.purgeAfter || metadata.purgeAfter || null,
@@ -260,7 +272,7 @@ function scriptFromCollection(collection = {}, { includeTrashedBlocks = false } 
     description: collection.description || "",
     tags: normalizeMlTags(collection.tags),
     messages,
-    stats: jsonObject(metadata.stats),
+    stats: unavailableMessageLibraryStats(),
     status: collection.status || (collection.deletedAt ? "trash" : "active"),
     trashedAt: collection.deletedAt || metadata.trashedAt || null,
     purgeAfter: collection.purgeAfter || metadata.purgeAfter || null,
@@ -273,13 +285,13 @@ function scriptFromCollection(collection = {}, { includeTrashedBlocks = false } 
 
 function normalizeMlMessage(message = {}, index = 0) {
   const clientId = cleanString(message.id || message.clientId || `msg_${index}`, 120) || `msg_${index}`;
-  const stats = jsonObject(message.stats);
   return {
     order: Number.isFinite(Number(message.order)) ? Number(message.order) : index,
     role: cleanString(message.role || "message", 40) || "message",
     title: optionalString(message.title || message.role || `Message ${index + 1}`, 180),
     text: mlText(message.text ?? message.messageText ?? message.body ?? "", 12000),
-    priceCents: message.priceCents !== undefined ? centsFromAny(message, "priceCents", "price") : centsFromDollars(message.price),
+    priceCents: messagePriceCents(message),
+    priceProvided: message.price !== undefined || message.priceCents !== undefined,
     currency: require("../services/usd-money-contract").requireUsdCurrency(message.currency, { allowMissing: true }),
     lockedText: message.lockedText === true,
     media: normalizeMlMedia(message.media),
@@ -287,7 +299,6 @@ function normalizeMlMessage(message = {}, index = 0) {
     clientId,
     metadata: {
       source: "message-library",
-      stats,
       rawId: String(message.id || ""),
       updatedAt: new Date().toISOString(),
     },
@@ -325,7 +336,6 @@ async function normalizeMlScriptPayload(req, { patch = false, db = prisma } = {}
       accountId: cleanString(body.accountId || creatorId, 120) || null,
       folderId: cleanString(body.folderId || body.folder || "scripts", 80) || "scripts",
       enabled,
-      stats: jsonObject(body.stats),
       schemaVersion: 1,
       updatedAt: new Date().toISOString(),
     },
@@ -409,6 +419,9 @@ async function upsertMessageLibraryScript(req, db = prisma) {
       const updateData = { ...normalized.data };
       delete updateData.agencyId;
       delete updateData.createdByUserId;
+      // Retain old metadata as history; caller-provided counters never replace
+      // it and public projections never treat it as measured performance.
+      updateData.metadata = { ...jsonObject(existing.metadata), ...updateData.metadata };
       collection = await tx.contentCollection.update({
         where: { id: existing.id },
         data: updateData,
@@ -421,6 +434,8 @@ async function upsertMessageLibraryScript(req, db = prisma) {
     const trashAt = now;
     const purgeAfter = trashPurgeAfter(trashAt);
 
+    await adoptLegacyMessageLibraryBlockIds({ tx, collectionId: collection.id, blocks: normalized.blocks });
+
     // Missing blocks are moved to trash for 14 days instead of hard-deleted.
     // This allows restoring deleted message blocks and prevents accidental loss.
     if (existing) {
@@ -428,7 +443,7 @@ async function upsertMessageLibraryScript(req, db = prisma) {
         where: {
           collectionId: collection.id,
           deletedAt: null,
-          ...(incomingClientIds.length ? { clientId: { notIn: incomingClientIds } } : {}),
+          ...(incomingClientIds.length ? { OR: [{ clientId: null }, { clientId: { notIn: incomingClientIds } }] } : {}),
         },
         data: {
           status: "trash",
@@ -477,14 +492,15 @@ router.get("/message-library/scripts", async (req, res) => {
       const revision = heads[0]?.revision || "0";
       if (expectedRevision !== undefined && expectedRevision !== revision)
         throw Object.assign(new Error("Message Library changed while reading its pages"), {code:"MESSAGE_LIBRARY_LIST_CHANGED",status:409});
-      const items = await tx.contentCollection.findMany({
+      const searched = search ? await readMessageLibrarySearchPage(tx, { agencyId:req.auth.agencyId,creatorId,includeTrash,search,limit:take,offset:skip }) : null;
+      const items = searched ? searched.items : await tx.contentCollection.findMany({
         where,
 
         orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
         take,
         skip,
       });
-      const count = await tx.contentCollection.count({ where });
+      const count = searched ? searched.count : await tx.contentCollection.count({ where });
       const counts=await blockSummary(tx,items.map(item=>item.id));
       return {items:items.map(item=>({...item,...counts.get(item.id),contentState:'summary',searchMatch:search.toLocaleLowerCase()})),count,snapshotRevision:revision};
     }, {isolationLevel:"RepeatableRead",maxWait:5000,timeout:15000});
@@ -513,9 +529,8 @@ router.get("/message-library/scripts/:id", async (req, res) => {
       return res.status(400).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_ID_INVALID", error: "A valid script identity is required" });
     }
     const result=await prisma.$transaction(async tx=>{
-      const item=await tx.contentCollection.findFirst({where:{agencyId:req.auth.agencyId,creatorId,kind:MESSAGE_LIBRARY_KIND,status:{not:'deleting'},
-        OR:[{clientId:scriptId},{id:scriptId,clientId:null}]}});
-      if(!item) throw Object.assign(new Error('Script not found'),{status:404,code:'MESSAGE_LIBRARY_SCRIPT_NOT_FOUND'});
+      const item=await findMessageLibraryScript({db:tx,agencyId:req.auth.agencyId,creatorId,scriptId});
+      if(!item || item.status==='deleting') throw Object.assign(new Error('Script not found'),{status:404,code:'MESSAGE_LIBRARY_SCRIPT_NOT_FOUND'});
       const state=req.query.blockState==='trash'?'trash':'active';
       const page=await readBlockPage(tx,item,{state,offset:parseOffset(req.query.offset),limit:parseLimit(req.query.limit,100,100),snapshotRevision:req.query.snapshotRevision});
       const summary=(await blockSummary(tx,[item.id])).get(item.id);

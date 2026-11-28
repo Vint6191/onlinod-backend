@@ -115,7 +115,8 @@ async function executeMessageLibraryCommand({
           if (ref) {
             await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", `message-library:${agencyId}:${ref.scriptId}`);
             await tx.$queryRawUnsafe('SELECT "id" FROM "ContentCollection" WHERE "id"=$1 AND "agencyId"=$2 AND "creatorId"=$3 FOR UPDATE', ref.scriptServerId, agencyId, c.creatorId);
-            row = await tx.contentCollection.findFirst({ where: { id: ref.scriptServerId, agencyId, creatorId: c.creatorId, clientId: ref.scriptId, kind: "message_library_script" } });
+            row = await tx.contentCollection.findFirst({ where: { id: ref.scriptServerId, agencyId, creatorId: c.creatorId,
+              OR: [{clientId:ref.scriptId},{id:ref.scriptId,clientId:null}], kind: "message_library_script" } });
           }
           let value = null;
           if (row && row.id === ref.scriptServerId) {
