@@ -1592,7 +1592,7 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
     },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignSourceValidationV1: true, campaignFairPagesV1: true } });
   assert.equal(result.reason, "claimed");
   assert.equal(updateData.claimedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.startedAt.toISOString(), authorityNow.toISOString());
@@ -1609,6 +1609,7 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
     campaignBoundedTraversalVersion: 1,
     campaignTraversalAuthorityVersion: 1,
     campaignFairPagesVersion: 1,
+    sourceValidationVersion: 1,
   }, "legacy queued campaign jobs must drop provider-order catch-up hints/page caps and upgrade to current causal/resumable/order-independent protocol at claim time");
 });
 
@@ -1649,7 +1650,7 @@ test("Campaign claim sets active physical claim generation before SCHEDULED to C
   const { claimJob } = loadService({ db });
   const result = await claimJob({
     userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"],
-    capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true },
+    capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignSourceValidationV1: true, campaignFairPagesV1: true },
   });
   assert.equal(result.reason, "claimed");
   const markerAt = events.findIndex((event) => event[0] === "marker");
@@ -1705,19 +1706,19 @@ test("job claim creator capability freshness uses the same PostgreSQL authority 
     jobInstance: { findMany: async () => [], findFirst: async () => null },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignSourceValidationV1: true, campaignFairPagesV1: true } });
   assert.equal(result.reason, "no-work");
   assert.equal(bindingWhere.lastSeenAt.gte.toISOString(), new Date(authorityNow.getTime() - 2 * 60_000).toISOString());
   assert.equal(bindingWhere.lastSeenAt.lte.toISOString(), new Date(authorityNow.getTime() + 5 * 60_000).toISOString());
 });
 
-for (const missing of ["creatorEventDrivenSyncV2", "campaignBoundedTraversalV1", "campaignTraversalAuthorityV1", "campaignFairPagesV1"]) {
+for (const missing of ["creatorEventDrivenSyncV2", "campaignBoundedTraversalV1", "campaignTraversalAuthorityV1", "campaignFairPagesV1", "campaignSourceValidationV1"]) {
   test(`Campaign claim without ${missing} never reaches a lease mutation`, async () => {
     const authorityNow = new Date("2039-03-04T05:06:07.800Z");
     const capabilities = {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true,
       campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true,
       campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true,
-      campaignTraversalAuthorityV1: true, campaignFairPagesV1: true };
+      campaignTraversalAuthorityV1: true, campaignSourceValidationV1: true, campaignFairPagesV1: true };
     delete capabilities[missing];
     const db = {
       $queryRawUnsafe: async () => [{ authorityNow }],
@@ -1923,15 +1924,16 @@ function collectorRetryFixture(source, variant = 'advance') {
     item.input.continuation = effect.financialContinuation;
   } else if (source === 'campaigns') {
     item.job.jobKey = 'fetch_campaigns';
-    item.job.params = { campaignTraversalAuthorityVersion: 1, collectionMode: 'full', collectionGeneration: 'retry-source', collectionRequestedAt: '2026-10-01T00:00:00Z' };
-    const current = { collectorVersion: 'campaigns-v13', scanRunId: 'retry-source', scanStartedAt: '2026-10-01T00:00:00.000Z', phase: 'campaigns',
+    item.job.params = { sourceValidationVersion: 1, campaignTraversalAuthorityVersion: 1, collectionMode: 'full', collectionGeneration: 'retry-source', collectionRequestedAt: '2026-10-01T00:00:00Z' };
+    const current = { sourceValidationVersion: 1, collectorVersion: 'campaigns-v13', scanRunId: 'retry-source', scanStartedAt: '2026-10-01T00:00:00.000Z', phase: 'campaigns',
       campaignMode: 'full', offset: 0, page: 0, campaigns: [], segmentCursor: null, segmentRequestCursor: null, segmentHasMore: false,
       campaignIndex: 0, claimerOffset: 0, claimerPage: 0, claimerRejected: 0, directorySourceExhausted: false, campaignPagesComplete: false,
       truncated: false, totalCampaignCount: 0, campaignBatchCount: 0, claimerBatchCount: 0, campaignScannerRejected: 0, claimerScannerRejected: 0 };
-    item.input.chunkResult = variant === 'segment' ? { kind: 'campaign_directory_segment' }
-      : { kind: 'campaigns_page', sourceRowCount: 1, sourceHasMore: true, pageNumber: 1, sourceOffset: 0, scannerRejected: 0, campaigns: [{ externalCampaignId: '1' }] };
+    item.input.chunkResult = variant === 'segment' ? { sourceValidationVersion: 1, kind: 'campaign_directory_segment' }
+      : { sourceValidationVersion: 1, kind: 'campaigns_page', sourceRowCount: 1, sourceHasMore: true, pageNumber: 1, sourceOffset: 0, scannerRejected: 0, campaigns: [{ externalCampaignId: '1' }] };
     item.input.continuation = { driverPhase: 'execute', jobContinuation: variant === 'segment' ? current : { ...current, offset: 1, page: 1, campaignBatchCount: 1 } };
-    effect = { batchId: 'campaign-receipt', replay: variant === 'replay', superseded: variant === 'superseded', serverNoProgressDetected: variant === 'stalled' };
+    effect = { batchId: 'campaign-receipt', replay: variant === 'replay', superseded: variant === 'superseded',
+      directorySourceProgress: variant === 'directory-overlap' ? 0 : 1, serverNoProgressDetected: variant === 'stalled' };
   } else if (source === 'notifications') {
     item.job.params = { ...item.job.params, notificationMode: 'full', collectionMode: 'full' };
     item.input.chunkResult = { kind: 'notification_facts_page_all', schemaVersion: 6, scanRunId: item.job.params.collectionGeneration,
@@ -1963,7 +1965,7 @@ for (const source of ['financial', 'campaigns', 'notifications', 'subscribers'])
   });
 }
 for (const [source, variant] of [['financial','chart'], ['financial','superseded'], ['financial','unchanged'], ['campaigns','segment'],
-  ['campaigns','superseded'], ['campaigns','stalled'], ['notifications','stalled'], ['subscribers','stalled']]) {
+  ['campaigns','superseded'], ['campaigns','stalled'], ['campaigns','directory-overlap'], ['notifications','stalled'], ['subscribers','stalled']]) {
   test(`${source} ${variant} cannot replenish provider-page retry budget`, async () => {
     const item = collectorRetryFixture(source, variant), { progressJob } = loadService(item);
     await progressJob(item.input);

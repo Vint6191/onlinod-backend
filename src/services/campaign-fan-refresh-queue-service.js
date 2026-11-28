@@ -262,6 +262,14 @@ async function ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, covera
     });
   }
   const currentCutoff = asDate(state.fanValueFreshnessCutoffAt);
+  // Generation acceptance creates a MISSING zero-count row before any page is
+  // observed. The first claimer page establishes its exact empty starting set,
+  // even when every Campaign has zero claimers. Later pages add their receipts;
+  // existing outstanding, failed or unavailable work must remain authoritative.
+  const initializeEmptyCoverage = state.fanValueFreshnessStatus === "MISSING" && [
+    "fanValueExpected", "fanValueAlreadyFresh", "fanValueQueued", "fanValueSucceeded",
+    "fanValueUnavailable", "fanValueFailed", "fanValueOutstanding",
+  ].every(key => Number(state[key] || 0) === 0);
   const authorityUpdate = coverageAuthority ? {
     fanValueCoverageDelegated: coverageAuthority.delegated === true,
     fanValueCoverageOwnerKind: clean(coverageAuthority.ownerKind, 32),
@@ -275,10 +283,12 @@ async function ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, covera
     String(state.fanValueCoverageCollectorVersion || "") !== String(coverageAuthority.collectorVersion || "") ||
     String(state.fanValueCoverageSourceJobId || "") !== String(coverageAuthority.sourceJobId || "")
   );
-  if (cutoffAdvanced || authorityChanged) {
+  if (cutoffAdvanced || authorityChanged || initializeEmptyCoverage) {
     return db.creatorCampaignCollectionState.update({
       where: { creatorId },
-      data: { ...(cutoffAdvanced ? { fanValueFreshnessCutoffAt: cutoff } : {}), ...authorityUpdate, fanValueCoverageUpdatedAt: now },
+      data: { ...(cutoffAdvanced ? { fanValueFreshnessCutoffAt: cutoff } : {}),
+        ...(initializeEmptyCoverage ? { fanValueFreshnessStatus: "COMPLETE" } : {}),
+        ...authorityUpdate, fanValueCoverageUpdatedAt: now },
     });
   }
   return state;

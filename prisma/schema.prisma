@@ -2235,9 +2235,11 @@ model CreatorCampaignCollectionState {
   membershipBaselineVerifiedAt                DateTime?
   membershipBaselineObservedAt                DateTime?
   membershipBaselineGeneration                String?
+  membershipBaselineSourceValidationVersion   Int                     @default(0)
   membershipCatchupVerifiedAt                 DateTime?
   membershipCatchupObservedAt                 DateTime?
   membershipCatchupGeneration                 String?
+  membershipCatchupSourceValidationVersion    Int                     @default(0)
   membershipCoverageStatus                    AnalyticsCoverageStatus @default(MISSING)
   membershipCoverageCompletedAt               DateTime?
   membershipObservedAt                        DateTime?
@@ -2272,6 +2274,7 @@ model CreatorCampaignCollectionState {
   campaignFrontierNextDueAt                   DateTime?
   campaignFrontierUpdatedAt                   DateTime?
   campaignDirectoryGeneration                 String?                 @db.VarChar(120)
+  campaignDirectorySourceValidationVersion    Int                     @default(0)
   campaignDirectoryRequestedAt                DateTime?
   campaignDirectoryVerifiedAt                 DateTime?
   campaignDirectoryRevision                   Int                     @default(0)

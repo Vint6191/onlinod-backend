@@ -139,7 +139,9 @@ function campaignDirectoryDiscoveryCapacityState(state, now = new Date(), target
   if (pendingDemand) status = "REQUESTED";
   else if (!verifiedAt || !dueAt) status = "DUE";
   else if (overdueByMs > 0) status = "OVERDUE";
-  else if (dueAt.getTime() <= authorityNow.getTime()) status = "DUE";
+  // A retained timestamp describes the older observation, not successful
+  // verification by the current source parser. Keep its dates for diagnostics.
+  else if (dueAt.getTime() <= authorityNow.getTime() || state?.campaignDirectorySourceValidationVersion !== 1) status = "DUE";
   return {
     status,
     dueAt,

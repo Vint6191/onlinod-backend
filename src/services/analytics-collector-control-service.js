@@ -83,6 +83,7 @@ function buildCollectionPlanningDedupeParams({ collectorType, collectionMode = "
     planningEpoch: `${generation}:${proofAt ? proofAt.toISOString() : "none"}`,
     collectionOrderingAfter: orderingAfter ? orderingAfter.toISOString() : "none",
     ...(collectorType === COLLECTOR_TYPES.NOTIFICATIONS ? { notificationNormalizerVersion: "notification-source-v3" } : {}),
+    ...(collectorType === COLLECTOR_TYPES.CAMPAIGNS ? { sourceValidationVersion: 1 } : {}),
     collectionContractVersion: COLLECTION_CONTRACT_VERSION,
     collectionType: collectorType,
     collectionMode: requestedMode,
@@ -95,6 +96,7 @@ function buildCollectionCommand({ collectorType, collectionMode = "full", reason
   if (!requestedAt) throw new Error("ANALYTICS_COLLECTION_CLOCK_INVALID");
   return {
     ...(collectorType === COLLECTOR_TYPES.NOTIFICATIONS ? { notificationNormalizerVersion: "notification-source-v3" } : {}),
+    ...(collectorType === COLLECTOR_TYPES.CAMPAIGNS ? { sourceValidationVersion: 1 } : {}),
     collectionContractVersion: COLLECTION_CONTRACT_VERSION,
     collectionType: collectorType,
     collectionMode: mode(collectionMode),
@@ -420,7 +422,8 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
       sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220), ...(success ? { lastCompleteScanRunId: clean(scanRunId, 120) } : {}),
     };
     const membershipData = membershipComplete
-      ? require("./campaign-membership-proof-service").membershipProofData(command.mode, command.generation, now, observedAt) : {};
+      ? require("./campaign-membership-proof-service").membershipProofData(command.mode, command.generation, now, observedAt,
+        job.params?.sourceValidationVersion) : {};
     const successData = success && job.params?.moneyResolutionVersion === 1 ? {
       lastResolutionGeneration: command.generation,
     } : success && command.mode === "full" ? { baselineVerifiedAt: now, baselineObservedAt: observedAt, baselineGeneration: command.generation }

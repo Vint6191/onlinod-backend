@@ -195,7 +195,7 @@ test("INT5.7A-5 a full 50-claimer page uses one canonical FanData lock for ident
     leaseRevision: 1,
     params: {
       collectionContractVersion: 1,
-      collectionType: "CAMPAIGNS",
+      sourceValidationVersion: 1, collectionType: "CAMPAIGNS",
       collectionMode: "full",
       collectionGeneration: "scan-1",
       collectionRequestedAt: "2026-09-17T18:00:00.000Z",
@@ -224,7 +224,7 @@ test("INT5.7A-5 a full 50-claimer page uses one canonical FanData lock for ident
     chunk: {
       kind: "campaign_claimers_page",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v8",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v8",
       scanRunId: "scan-1",
       batchKey: "run:scan-1:campaigns-v8:claimers:test",
       externalCampaignId: "campaign-1",

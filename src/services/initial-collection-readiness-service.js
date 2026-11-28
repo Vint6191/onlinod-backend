@@ -58,11 +58,8 @@ function initialCollectionClaimWhere(now = new Date()) {
   ] };
   const campaignsReleased = { campaignCollectionState: { is: { OR: [
     finiteOrDeferred,
-    { membershipBaselineGeneration: generation, membershipBaselineVerifiedAt: { lte: trustedThrough } },
-    { AND: [
-      { OR: [{ membershipBaselineGeneration: null }, { membershipBaselineGeneration: "" }, { membershipBaselineVerifiedAt: null }] },
-      { baselineGeneration: generation, baselineVerifiedAt: { lte: trustedThrough } },
-    ] },
+    { membershipBaselineSourceValidationVersion: 1,
+      membershipBaselineGeneration: generation, membershipBaselineVerifiedAt: { lte: trustedThrough } },
   ] } } };
   return { OR: [
     { jobKey: { notIn: ["fetch_campaigns", "catchup_notifications_scan", "subscriber_directory_scan"] } },

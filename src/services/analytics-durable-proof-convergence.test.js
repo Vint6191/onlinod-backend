@@ -33,6 +33,11 @@ for (const c of cases) test(c.name + ": readers and planning use the same proof"
     const state = type === "NOTIFICATIONS"
       ? { normalizerVersion: "notification-source-v3", fullBackfillVerifiedAt: c.baseline, lastCatchupVerifiedAt: c.head, fullBackfillObservedAt: c.baseline, lastCatchupObservedAt: c.head }
       : { receiptCoverageVersion: 1, baselineVerifiedAt: c.baseline, lastCatchupCompletedAt: c.head, baselineObservedAt: c.baseline, lastCatchupObservedAt: c.head };
+    if (type === "CAMPAIGNS") Object.assign(state, {
+      membershipBaselineSourceValidationVersion: 1, membershipCatchupSourceValidationVersion: 1,
+      membershipBaselineGeneration: "full", membershipBaselineVerifiedAt: c.baseline, membershipBaselineObservedAt: c.baseline,
+      membershipCatchupGeneration: "head", membershipCatchupVerifiedAt: c.head, membershipCatchupObservedAt: c.head,
+    });
     state.activeGeneration = "server-generation";
     const before = JSON.stringify(state);
     assert.equal(iso(collectorPlanningProofAt(type, "catchup", state, now)), iso(c.latest));

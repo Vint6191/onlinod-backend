@@ -6,15 +6,15 @@ const now = new Date("2026-10-03T12:00:00Z");
 const wrap = jobContinuation => ({ driverPhase: "execute", jobContinuation });
 function fixture() {
   const job = { id: "job", agencyId: "a", creatorId: "c", jobKey: "fetch_campaigns", leaseRevision: 1, status: "CLAIMED",
-    params: { campaignTraversalAuthorityVersion: 1, collectionGeneration: "g", collectionMode: "catchup",
+    params: { sourceValidationVersion: 1, campaignTraversalAuthorityVersion: 1, collectionGeneration: "g", collectionMode: "catchup",
       collectionRequestedAt: now.toISOString(), analyticsObservationStartedAt: new Date(+now-7*3600000).toISOString() } };
-  job.continuation = wrap({ collectorVersion: "campaigns-v13", scanRunId: "g", scanStartedAt: now.toISOString(), phase: "claimers",
+  job.continuation = wrap({ sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "g", scanStartedAt: now.toISOString(), phase: "claimers",
     campaignMode: "catchup", offset: 0, page: 0, campaigns: [{ id: "first", scanClaimers: true }, { id: "second", scanClaimers: true }],
     segmentCursor: "second", segmentRequestCursor: null, segmentHasMore: false, campaignIndex: 0, claimerOffset: 0, claimerPage: 0,
     claimerRejected: 0,
     directorySourceExhausted: true, campaignPagesComplete: true, truncated: false, totalCampaignCount: 4000, segmentTargetCount: 2,
     campaignBatchCount: 0, claimerBatchCount: 0, campaignScannerRejected: 0, claimerScannerRejected: 0 });
-  const page = { kind: "campaign_claimers_page", externalCampaignId: "first", pageNumber: 1, sourceOffset: 0,
+  const page = { sourceValidationVersion: 1, kind: "campaign_claimers_page", externalCampaignId: "first", pageNumber: 1, sourceOffset: 0,
     sourceRowCount: 0, claimers: [], scannerRejected: 0, sourceHasMore: false, campaignComplete: true };
   const next = wrap({ ...structuredClone(job.continuation.jobContinuation), campaignIndex: 1, claimerBatchCount: 1 });
   return { job, page, next };
@@ -103,7 +103,7 @@ function progressFixture(job, apply) {
     update:async({data})=>{writes++;Object.assign(job,structuredClone(data));return structuredClone(job);}}};
   const deps={require,liveSync:require("./creator-live-sync-service"),campaignTraversal:authority,leaseCommit:async(_,work)=>work(tx,{job:structuredClone(job),now}),
     enterCampaignBoundedExecution:async()=>{},hashToken:()=>"hash",leaseDuration:()=>60000,safeProgress:x=>x,
-    normalizeLeaseContinuation:x=>x,clean:x=>x,applyJobChunk:apply,publishNotificationConsequences:async()=>{},
+    normalizeLeaseContinuation:x=>x,leaseDriverContinuation:authority.envelope,clean:x=>x,applyJobChunk:apply,publishNotificationConsequences:async()=>{},
     campaignServerBoundaryContinuation:()=>null,campaignDirectorySegmentContinuation:()=>null,JobLeaseError:Error};
   return {run:new Function(...Object.keys(deps),"return ("+code+")")(...Object.values(deps)),get writes(){return writes;}};
 }
@@ -125,4 +125,32 @@ test("legacy receipt replay cannot rewind an advanced cursor",async()=>{
   const p=progressFixture(f.job,async()=>({replay:true}));
   const r=await p.run({continuation:wrap({...f.next.jobContinuation,campaignIndex:0}),chunkResult:f.page});
   assert.equal(r.continuation.jobContinuation.campaignIndex,1);
+});
+
+test("directory overlap budget comes only from durable state and exact source progress", () => {
+  const f = fixture();
+  f.job.continuation.jobContinuation.phase = "campaigns";
+  f.job.continuation.jobContinuation.directoryNoProgressPages = 2;
+  const requested = structuredClone(f.job.continuation);
+  requested.jobContinuation.directoryNoProgressPages = 0;
+  assert.equal(authority.directoryProgress(f.job, null, requested, {}).jobContinuation.directoryNoProgressPages, 2);
+  requested.jobContinuation.directoryNoProgressPages = 999;
+  assert.equal(authority.directoryProgress(f.job, null, requested, {}).jobContinuation.directoryNoProgressPages, 2);
+  assert.equal(authority.directoryProgress(f.job, { kind: "campaigns_page", sourceHasMore: true }, requested,
+    { directorySourceProgress: 1 }).jobContinuation.directoryNoProgressPages, 0);
+  assert.throws(() => authority.directoryProgress(f.job, { kind: "campaigns_page", sourceHasMore: true }, requested,
+    { directorySourceProgress: 0 }), error => error.code === "CAMPAIGN_DIRECTORY_STALLED" && error.retryable === false && error.status === 409);
+  assert.equal(f.job.continuation.jobContinuation.directoryNoProgressPages, 2);
+});
+test("terminal directory exhaustion and immutable receipt replay do not count as stalled source pages", () => {
+  const f = fixture();
+  f.job.continuation.jobContinuation.phase = "campaigns";
+  f.job.continuation.jobContinuation.directoryNoProgressPages = 2;
+  const requested = structuredClone(f.job.continuation);
+  requested.jobContinuation.phase = "segment";
+  assert.equal(authority.directoryProgress(f.job, { kind: "campaigns_page", sourceHasMore: false }, requested,
+    { directorySourceProgress: 0 }), null);
+  requested.jobContinuation.phase = "campaigns";
+  assert.equal(authority.directoryProgress(f.job, { kind: "campaigns_page", sourceHasMore: true }, requested,
+    { directorySourceProgress: 0, replay: true }), null);
 });

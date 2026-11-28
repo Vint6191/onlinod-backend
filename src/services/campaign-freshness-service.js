@@ -9,10 +9,13 @@ const { membershipProofState } = require("./campaign-membership-proof-service");
 const FRONTIER_OBSERVATION_VERSION = 1;
 const CAMPAIGN_COVERAGE_SELECT = Object.freeze(Object.fromEntries([
   "membershipBaselineVerifiedAt", "membershipBaselineObservedAt", "membershipBaselineGeneration",
+  "membershipBaselineSourceValidationVersion",
   "membershipCatchupVerifiedAt", "membershipCatchupObservedAt", "membershipCatchupGeneration",
+  "membershipCatchupSourceValidationVersion",
   "status", "baselineVerifiedAt", "lastCatchupCompletedAt", "baselineObservedAt", "lastCatchupObservedAt", "retryAfterAt",
   "activeGeneration", "membershipCoverageStatus", "membershipObservedAt",
   "campaignDirectoryGeneration", "campaignDirectoryRequestedAt", "campaignDirectoryVerifiedAt", "campaignDirectoryRevision",
+  "campaignDirectorySourceValidationVersion",
   "campaignDirectoryCampaignCount", "campaignDirectoryDiscoveryDueAt", "campaignDirectoryDiscoveryRequestedRevision", "campaignDirectoryDiscoveryCompletedRevision",
   "campaignDirectoryFactsRevision", "campaignDirectoryCountRevision",
   "campaignFrontierNextEligibleAt", "campaignFrontierScheduleVersion", "campaignFrontierPlanRunId", "campaignFrontierObservationVersion", "campaignFrontierFreshnessStatus", "campaignFrontierNextDueAt",
@@ -33,7 +36,8 @@ function directoryPending(state) {
 }
 function directoryDue(state, now = new Date()) {
   const deadline = directoryDiscoveryDeadline(state, CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS, now);
-  return !state?.campaignDirectoryGeneration || !(Number(state.campaignDirectoryRevision) > 0)
+  return state?.campaignDirectorySourceValidationVersion !== 1
+    || !state?.campaignDirectoryGeneration || !(Number(state.campaignDirectoryRevision) > 0)
     || directoryPending(state) || directoryCountInvalidated(state) || !deadline || +deadline <= +now;
 }
 function frontierDue(state, now = new Date()) {

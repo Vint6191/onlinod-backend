@@ -132,7 +132,7 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
       const directoryDue = campaignDirectoryDiscoveryDue(currentCollectorState, now);
       if (!frontierDue && !directoryDue) return { created: false, reason: "fresh" };
       const reuse = campaignDirectoryReuseBinding(currentCollectorState, now);
-      for (const key of ["campaignDirectoryReuseGeneration", "campaignDirectoryReuseRequestedAt", "campaignDirectoryReuseRevision", "campaignDirectoryReuseCampaignCount", "campaignDirectoryDiscoveryVersion"]) delete params[key];
+      for (const key of ["campaignDirectoryReuseGeneration", "campaignDirectoryReuseRequestedAt", "campaignDirectoryReuseRevision", "campaignDirectoryReuseCampaignCount", "campaignDirectoryReuseSourceValidationVersion", "campaignDirectoryDiscoveryVersion"]) delete params[key];
       if (reuse) {
         Object.assign(params, reuse);
         bucketMs = CAMPAIGN_COLLECTION_FRESHNESS_MS;
@@ -249,6 +249,7 @@ function campaignDirectoryReuseBinding(state, now = new Date()) {
   if (!generation || !requestedAt || !Number.isFinite(requestedAt.getTime()) || !verifiedProofTimestampReady(verifiedAt, now)) return null;
   if (!Number.isInteger(revision) || revision < 1 || !Number.isInteger(campaignCount) || campaignCount < 0) return null;
   return {
+    campaignDirectoryReuseSourceValidationVersion: 1,
     campaignDirectoryReuseGeneration: generation,
     campaignDirectoryReuseRequestedAt: requestedAt.toISOString(),
     campaignDirectoryReuseRevision: revision,

@@ -4,6 +4,18 @@ const { normalizePredicate } = require("./index-predicate");
 const q = s => '"' + s.replaceAll('"', '""') + '"';
 const normalizeKeys = s => String(s || "").replace(/[\s"]/g, "");
 const fail = (code, name) => Object.assign(new Error(`${code}:${name}`), { code, index: name });
+async function acquireBuildLock(db, { timeoutMs = 10 * 60 * 1000, pollMs = 250 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    // A blocking advisory-lock SELECT retains its statement snapshot. The
+    // winning CREATE INDEX CONCURRENTLY can then wait for that same snapshot,
+    // deadlocking two installers. End each losing statement before waiting.
+    const rows = await db.$queryRawUnsafe("SELECT pg_try_advisory_lock(hashtextextended('analytics-traffic-indexes-v2',0)) AS acquired");
+    if (rows[0]?.acquired === true) return;
+    if (Date.now() >= deadline) throw fail("ANALYTICS_TRAFFIC_INDEX_LOCK_BUSY", "analytics-traffic-indexes-v2");
+    await new Promise(resolve => setTimeout(resolve, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
+  }
+}
 async function state(db, spec) {
   const rows = await db.$queryRawUnsafe(`SELECT t.relname AS table,i.indisvalid AS valid,i.indisready AS ready,i.indisunique AS unique,
     am.amname AS method,pg_get_expr(i.indpred,i.indrelid) AS predicate,
@@ -34,7 +46,7 @@ async function ensureIndexes(db, { create = false } = {}) {
   }
   return { ready: true, contracts: definitions.length };
 }
-module.exports = { definitions, state, ensureIndexes };
+module.exports = { definitions, state, ensureIndexes, acquireBuildLock };
 if (require.main === module) {
   require("dotenv").config();
   const { PrismaClient } = require("@prisma/client");
@@ -43,7 +55,7 @@ if (require.main === module) {
   (async () => {
     await db.$executeRawUnsafe("SET lock_timeout='5s'");
     await db.$executeRawUnsafe("SET statement_timeout='10min'");
-    await db.$executeRawUnsafe("SELECT pg_advisory_lock(hashtextextended('analytics-traffic-indexes-v2',0))");
+    await acquireBuildLock(db);
     return ensureIndexes(db, { create: process.argv.includes("--create") });
   })().then(r => console.log(JSON.stringify(r))).catch(e => { console.error(e.message); process.exitCode = 1; }).finally(() => db.$disconnect());
 }

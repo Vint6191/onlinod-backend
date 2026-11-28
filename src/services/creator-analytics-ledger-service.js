@@ -3,6 +3,7 @@ const directoryCounts = require("./campaign-directory-count-authority");
 const boundedFrontiers = require("./campaign-bounded-frontier-service");
 const fairPages = require("./campaign-fair-pages-service");
 const traversalAuthority = require("./campaign-traversal-authority-service");
+const campaignSourceValidation = require("./campaign-source-validation-authority-service");
 
 const { observationStartForJob } = require("./analytics-observation-time");
 const { FRONTIER_OBSERVATION_VERSION, frontierDueWhere } = require("./campaign-freshness-service");
@@ -875,9 +876,18 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
   });
 }
 
+function campaignSourceId(value, max = 220) {
+  // Provider identifiers are opaque. Coercing objects/arrays/booleans creates
+  // invented identities, and an unsafe number has already lost its exact ID.
+  if (typeof value !== "string" && !(typeof value === "number" && Number.isSafeInteger(value) && value > 0)) return null;
+  const id = String(value).trim();
+  return id && id.length <= max && !/[\x00-\x1f\x7f]/.test(id) && !/[\uD800-\uDFFF]/u.test(id) ? id : null;
+}
+
 function normalizeCampaign(raw) {
   const row = object(raw);
-  const externalCampaignId = text(row.id ?? row.externalCampaignId, 220);
+  const externalCampaignId = campaignSourceId(row.id ?? row.externalCampaignId, 220);
+  if (row.id != null && row.externalCampaignId != null && campaignSourceId(row.externalCampaignId, 220) !== externalCampaignId) return null;
   const name = text(row.name ?? row.title ?? (externalCampaignId ? `Campaign ${externalCampaignId}` : null), 500);
   if (!externalCampaignId || !name) return null;
   const startedAtRaw = row.startedAt ?? row.createdAt ?? row.created_at;
@@ -908,15 +918,27 @@ function normalizeCampaign(raw) {
 }
 function normalizeClaimer(raw) {
   const row = object(raw);
-  const nestedUser = object(row.user || row.fan || row.subscriber);
-  const hasNestedUser = Object.keys(nestedUser).length > 0;
+  const nestedKeys = ["user", "fan", "subscriber"].filter(key => Object.hasOwn(row, key));
+  if (nestedKeys.some(key => row[key] != null && (typeof row[key] !== "object" || Array.isArray(row[key])))) return null;
+  const nestedUser = object(row.user ?? row.fan ?? row.subscriber);
+  const hasNestedUser = nestedKeys.length > 0;
   const user = hasNestedUser ? nestedUser : row;
   // Desktop's canonical flattened claimer contract is { id: claimerId, userId: fanId }.
   // Never let the attribution row id masquerade as the OnlyFans user id.
-  const onlyFansUserId = text(hasNestedUser
-    ? (user.id ?? user.userId ?? row.userId ?? row.fanId)
-    : (row.userId ?? row.fanId ?? row.id), 180);
+  const identities = [row.userId, row.fanId, ...nestedKeys.flatMap(key => {
+    const nested = object(row[key]);
+    return [nested.id, nested.userId, nested.fanId];
+  })].filter(value => value != null);
+  const hasExplicitFanId = Object.hasOwn(row, "userId") || Object.hasOwn(row, "fanId");
+  if (!identities.length && !hasNestedUser && !hasExplicitFanId) identities.push(row.id);
+  const ids = identities.map(value => campaignSourceId(value, 180));
+  if (ids.some(value => !value) || new Set(ids).size !== 1) return null;
+  const onlyFansUserId = ids[0];
   if (!onlyFansUserId) return null;
+  const claimerIdRaw = row.id ?? row.claimerId;
+  const externalClaimerId = claimerIdRaw == null ? null : campaignSourceId(claimerIdRaw, 220);
+  if (claimerIdRaw != null && !externalClaimerId) return null;
+  if (row.id != null && row.claimerId != null && campaignSourceId(row.claimerId, 220) !== externalClaimerId) return null;
   const attributedAtRaw = row.attributedAt ?? row.createdAt ?? row.created_at ?? row.claimedAt;
   const attributedAt = attributedAtRaw == null ? null : strictDate(attributedAtRaw);
   if (attributedAtRaw != null && !attributedAt) return null;
@@ -945,7 +967,7 @@ function normalizeClaimer(raw) {
     username,
     displayName,
     avatarUrl,
-    externalClaimerId: text(row.id ?? row.claimerId, 220),
+    externalClaimerId,
     attributedAt,
     embeddedValue,
   };
@@ -974,7 +996,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
   if (scannerRejected === null) throw new Error("Campaign scannerRejected is invalid");
   const rawRows = kind === "campaigns_page" ? array(payload.campaigns) : array(payload.claimers);
   if (rawRows.length > 50) throw new Error(kind === "campaigns_page" ? "Campaign page exceeds 50 rows" : "Campaign claimer page exceeds 50 rows");
-  const externalCampaignId = kind === "campaign_claimers_page" ? text(payload.externalCampaignId, 220) : null;
+  const externalCampaignId = kind === "campaign_claimers_page" ? campaignSourceId(payload.externalCampaignId, 220) : null;
   if (kind === "campaign_claimers_page" && !externalCampaignId) throw new Error("Campaign claimer page is missing externalCampaignId");
 
   return inTransaction(db, async (tx) => {
@@ -996,6 +1018,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       }
     }
 
+    campaignSourceValidation.assertCurrent(job, payload);
     if (kind === "campaign_claimers_page" && traversalAuthority.enabled(job)) traversalAuthority.assertPage(job, payload);
 
     // Current selective Campaign claimer writes are only legal after the server
@@ -1056,6 +1079,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     let rejected = scannerRejected;
 
     if (kind === "campaigns_page") {
+      let directorySourceProgress = 0;
       for (const rawCampaign of rawRows) {
         const campaign = normalizeCampaign(rawCampaign);
         if (!campaign) {
@@ -1065,12 +1089,13 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         const where = { creatorId_externalCampaignId: { creatorId: job.creatorId, externalCampaignId: campaign.externalCampaignId } };
         const existing = await tx.creatorCampaign.findUnique({
           where,
-          select: { id: true, claimersCursorRunId: true, sourceScanStartedAt: true, isActive: true, claimersCount: true, claimerRevision: true },
+          select: { id: true, claimersCursorRunId: true, sourceScanRunId: true, sourceScanStartedAt: true, isActive: true, claimersCount: true, claimerRevision: true },
         });
         if (isNewerGeneration(existing, scanStartedAt)) {
           unchanged += 1;
           continue;
         }
+        if (existing?.sourceScanRunId !== scanRunId || !sameTime(existing?.sourceScanStartedAt, scanStartedAt)) directorySourceProgress++;
         const common = {
           name: campaign.name,
           isActive: campaign.isActive,
@@ -1132,7 +1157,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       await require("./campaign-fan-change-publication").publishCanonicalCampaignChanges({ db: tx,
         agencyId: job.agencyId, creatorId: job.creatorId,
         externalCampaignIds: rawRows.map(raw => normalizeCampaign(raw)?.externalCampaignId).filter(Boolean) });
-      return { replay: false, batchId: batch.id, inserted, updated, unchanged, rejected, superseded: false };
+      return { replay: false, batchId: batch.id, inserted, updated, unchanged, rejected, directorySourceProgress, superseded: false };
     }
 
     const saved = await tx.creatorCampaign.findUnique({
@@ -1807,6 +1832,11 @@ function campaignDirectoryReuseBinding(job) {
   if (Number(params.campaignDirectoryReuseVersion || 0) < CAMPAIGN_DIRECTORY_REUSE_VERSION) return null;
   const generation = text(params.campaignDirectoryReuseGeneration, 120);
   if (!generation) return null;
+  if (params.campaignDirectoryReuseSourceValidationVersion !== campaignSourceValidation.VERSION) {
+    const error = new Error("Campaign directory reuse requires current source validation");
+    error.code = "CAMPAIGN_DIRECTORY_SOURCE_VALIDATION_REQUIRED";
+    throw error;
+  }
   const requestedAt = strictDate(params.campaignDirectoryReuseRequestedAt);
   const revision = integer(params.campaignDirectoryReuseRevision, 2_147_483_647);
   const campaignCount = integer(params.campaignDirectoryReuseCampaignCount, 100_000_000);
@@ -1827,6 +1857,7 @@ function sameTime(left, right) {
 function campaignDirectoryReuseStateMatches(state, reuse, command) {
   return Boolean(
     reuse &&
+    state?.campaignDirectorySourceValidationVersion === campaignSourceValidation.VERSION &&
     command?.mode === "catchup" &&
     state?.campaignDirectoryGeneration === reuse.generation &&
     !directoryCounts.directoryCountInvalidated(state) &&
@@ -1866,12 +1897,18 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
 
   const expectedBatches = integer(durable?.campaignBatchCount, 1_000_000);
   const proof = campaignCompletionProofFromState(state, scanRunId, CAMPAIGN_COLLECTOR_VERSION);
-  if (expectedBatches === null || proof.matches !== true || proof.rejectedBatches !== 0 || proof.rejectedRows !== 0 || proof.campaignBatches !== expectedBatches) {
+  const sealed = directoryCounts.sealedDirectoryCount(state, { generation: scanRunId, requestedAt: command.requestedAt });
+  // The first segment seals the complete directory before any claimer page.
+  // Later fair segments reuse that exact seal: a rejected claimer must leave
+  // membership partial without invalidating the already-proven directory or
+  // preventing other Campaigns from advancing. A missing/invalidated seal still
+  // requires a clean proof before it can be established.
+  if (expectedBatches === null || proof.matches !== true || proof.campaignBatches !== expectedBatches
+    || (sealed === null && (proof.rejectedBatches !== 0 || proof.rejectedRows !== 0))) {
     const error = new Error("Campaign directory generation is not fully durable");
     error.code = "CAMPAIGN_DIRECTORY_PROOF_INCOMPLETE";
     throw error;
   }
-  const sealed = directoryCounts.sealedDirectoryCount(state, { generation: scanRunId, requestedAt: command.requestedAt });
   const campaignCount = sealed ?? await tx.creatorCampaign.count({
     where: { creatorId: job.creatorId, sourceScanRunId: scanRunId, sourceScanStartedAt: command.requestedAt },
   });
@@ -1886,6 +1923,7 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
       await tx.creatorCampaignCollectionState.update({
         where: { creatorId: job.creatorId },
         data: {
+          campaignDirectorySourceValidationVersion: campaignSourceValidation.VERSION,
           campaignDirectoryCountRevision: directoryCounts.revision(state.campaignDirectoryFactsRevision) ?? 0n,
           campaignDirectoryDiscoveryCompletedRevision: requestedDiscoveryRevision,
           campaignDirectoryDiscoveryDueAt: observationStartForJob(job)
@@ -1901,6 +1939,7 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
     where: { creatorId: job.creatorId },
     data: {
       campaignDirectoryGeneration: scanRunId,
+      campaignDirectorySourceValidationVersion: campaignSourceValidation.VERSION,
       campaignDirectoryRequestedAt: command.requestedAt,
       campaignDirectoryVerifiedAt: observationStartForJob(job),
       campaignDirectoryRevision: revision,
@@ -2061,6 +2100,7 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
 async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaignLockHeld = false }) {
   requireJob(job);
   const payload = object(chunk);
+  campaignSourceValidation.assertCurrent(job, payload);
   if (text(payload.kind, 80) !== "campaign_directory_segment") throw new Error("Unsupported campaign directory segment request");
   const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
@@ -2186,7 +2226,8 @@ function validateCampaignCompletion(job, result) {
   ) {
     throw new Error("Invalid campaign completion contract");
   }
-  const protocolCurrent = payload.collectorVersion === CAMPAIGN_COLLECTOR_VERSION;
+  const protocolCurrent = payload.collectorVersion === CAMPAIGN_COLLECTOR_VERSION
+    && campaignSourceValidation.jobCurrent(job) && campaignSourceValidation.current(payload);
   const expectedCampaignBatches = integer(payload.campaignBatchCount, 1_000_000);
   const expectedClaimerBatches = integer(payload.claimerBatchCount);
   const expectedCampaignCount = integer(payload.campaignCount, 100_000_000);
@@ -2230,6 +2271,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result, public
     if (directoryReuse) {
       const directoryState = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
       directoryReuseValid =
+        directoryState?.campaignDirectorySourceValidationVersion === campaignSourceValidation.VERSION &&
         directoryState?.campaignDirectoryGeneration === directoryReuse.generation &&
         sameTime(directoryState?.campaignDirectoryRequestedAt, directoryReuse.requestedAt) &&
         Number(directoryState?.campaignDirectoryRevision || 0) === directoryReuse.revision &&
@@ -2299,7 +2341,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result, public
       frontierSchedulingCurrent !== true || (frontierPlanMatches && frontierCompleted >= frontierTarget && frontierDeferred === 0)
     );
     const fanValuesComplete = fanValueCoverage?.matches
-      ? fanValueCoverage.outstanding === 0 && fanValueCoverage.failed === 0
+      ? fanValueCoverage.outstanding === 0 && fanValueCoverage.failed === 0 && fanValueCoverage.unavailable === 0
       : emptyCurrentFreshnessComplete
         ? true
         : CAMPAIGN_SERVER_REFRESH_COLLECTOR_VERSIONS.has(payload.collectorVersion)
@@ -2744,6 +2786,7 @@ module.exports = {
   readCampaignsWithRevenue,
   normalizeEarningsRow,
   normalizeCampaign,
+  normalizeClaimer,
   normalizeMessageDay,
   rangeBounds,
   EARNINGS_COLLECTOR_VERSION,

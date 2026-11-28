@@ -19,6 +19,7 @@ const {
   ingestCampaignFanValueChunk,
   ingestCampaignFanValuesBatchChunk,
   completeCampaignScan,
+  normalizeCampaign,
   upsertMessagesDaily,
   readCreatorLedgerOverview,
   readCreatorCoverage,
@@ -53,6 +54,7 @@ function campaignJob(scanRunId, requestedAt = "2026-08-06T11:00:00.000Z", collec
     params: {
       collectionContractVersion: 1,
       collectionType: "CAMPAIGNS",
+      sourceValidationVersion: 1,
       collectionMode,
       collectionGeneration: scanRunId,
       collectionRequestedAt: requestedAt,
@@ -505,7 +507,7 @@ test("campaign page receipt uses PostgreSQL time for collectedAt and ingest audi
     job: campaignJob("scan-db-receipt", "2026-08-06T11:00:00.000Z"),
     deviceId: "device-1",
     chunk: {
-      kind: "campaigns_page", schemaVersion: 4, collectorVersion: "campaigns-v6",
+      kind: "campaigns_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
       scanRunId: "scan-db-receipt", batchKey: "run:scan-db-receipt:campaigns:1", scannerRejected: 0,
       campaigns: [{ id: "campaign-1", name: "Campaign 1", isActive: true }],
     },
@@ -532,7 +534,7 @@ test("campaign completion proves every page batch before closing coverage", asyn
   };
   const payload = {
     schemaVersion: 4,
-    collectorVersion: "campaigns-v13",
+    sourceValidationVersion: 1, collectorVersion: "campaigns-v13",
     scanRunId: "scan-1",
     scanStartedAt: "2026-08-06T11:00:00.000Z",
     observedAt: "2026-08-06T12:00:00.000Z",
@@ -566,6 +568,68 @@ test("campaign completion proves every page batch before closing coverage", asyn
   assert.equal(partialHarness.coverage.length, 0);
 });
 
+test("Campaign completion preserves unavailable FanData as partial while publishing membership proof", async () => {
+  const harness = batchHarness({ campaignCollectorVersion: "campaigns-v13", pageBatches: [
+    { idempotencyKey: "campaigns:job-1:run:unavailable-213:campaigns:a", status: "COMMITTED", rejectedRows: 0 },
+    { idempotencyKey: "campaigns:job-1:run:unavailable-213:claimers:b", status: "COMMITTED", rejectedRows: 0 },
+  ] });
+  Object.assign(harness.campaignState(), { fanValueExpected: 1, fanValueUnavailable: 1, fanValueFreshnessStatus: "PARTIAL" });
+  harness.tx.creatorCampaign = { count: async () => 1, updateMany: async () => ({ count: 0 }) };
+  const run = campaignJob("unavailable-213");
+  const completion = await completeCampaignScan({ db: harness.db, job: run, result: {
+    schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "unavailable-213",
+    campaignPagesComplete: true, claimersComplete: true, truncated: false,
+    campaignCount: 1, campaignBatchCount: 1, claimerBatchCount: 1,
+    // Client completion flags do not override the canonical unavailable receipt.
+    fanValuesComplete: true, fanValuesUnavailable: 0,
+  } });
+  assert.equal(completion.providerTraversalComplete, true);
+  assert.equal(completion.membershipComplete, true);
+  assert.equal(completion.complete, false);
+  assert.equal(completion.proof.fanValuesComplete, false);
+  assert.equal(completion.proof.fanValuesUnavailable, 1);
+  assert.equal(harness.campaignState().status, "PARTIAL");
+  assert.equal(harness.campaignState().membershipBaselineGeneration, "unavailable-213");
+  assert.equal(harness.campaignState().baselineGeneration, undefined);
+  assert.equal(harness.updated.at(-1).status, "COMMITTED", "provider completion remains committed without retrying its source");
+});
+
+test("Campaign source identifiers preserve valid opaque IDs and reject coercion or precision loss", () => {
+  for (const id of [true, false, {}, ["123"], 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "\u0001bad", "x".repeat(221), "\uD800", "x\uDC00"]) {
+    assert.equal(normalizeCampaign({ id, name: "Source" }), null, JSON.stringify(id));
+  }
+  for (const [id, expected] of [[123, "123"], [Number.MAX_SAFE_INTEGER, String(Number.MAX_SAFE_INTEGER)], ["  source-1  ", "source-1"], ["0", "0"], ["valid-\uD83D\uDE00", "valid-\uD83D\uDE00"]]) {
+    assert.equal(normalizeCampaign({ id, name: "Source" }).externalCampaignId, expected);
+  }
+});
+
+test("malformed and ambiguous Campaign claimer identities remain rejected receipts with no membership writes", async () => {
+  const malformed = [
+    { id: "claim", userId: true }, { id: "claim", userId: {} }, { id: "claim", userId: ["123"] },
+    { id: "claim", userId: Number.MAX_SAFE_INTEGER + 1 }, { id: "claim", user: {} },
+    { id: "claim", user: null }, { id: "claim", user: false, userId: "123" },
+    { id: "claim", user: { id: "123" }, userId: "456" },
+    { id: "claim", user: { id: "123", userId: "456" } },
+    { id: "claim", userId: "123", fanId: "456" }, { id: {}, userId: "123" },
+    { id: "claim", userId: null }, { id: "claim", fanId: null },
+    { id: "claim", claimerId: "another-claim", userId: "123" },
+    { id: "claim", userId: "123", createdAt: "" }, { id: "claim", userId: "123", createdAt: "  " },
+    { id: "claim", userId: "\uD800" }, { id: "\uDC00", userId: "123" },
+  ];
+  const harness = batchHarness();
+  harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-213" }) };
+  const ingested = await ingestCampaignChunk({ db: harness.db, job: campaignJob("identities-213"), chunk: {
+    kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13",
+    scanRunId: "identities-213", batchKey: "run:identities-213:claimers:1", scannerRejected: 0,
+    externalCampaignId: "campaign-213", pageNumber: 1, sourceHasMore: false, campaignComplete: true, claimers: malformed,
+  } });
+  assert.equal(ingested.rejected, malformed.length);
+  assert.equal(ingested.inserted, 0);
+  assert.equal(ingested.campaignComplete, false);
+  assert.equal(harness.campaignState().campaignProofRejectedRows, malformed.length);
+  assert.equal(harness.updated.at(-1).status, "PARTIAL");
+});
+
 test("campaign completion proof is incremented transactionally and completes without ingest-history materialization", async () => {
   const harness = batchHarness({ throwOnBatchFindMany: true });
   let campaignExists = false;
@@ -581,7 +645,7 @@ test("campaign completion proof is incremented transactionally and completes wit
     job: proofJob,
     deviceId: "device-1",
     chunk: {
-      kind: "campaigns_page", schemaVersion: 4, collectorVersion: "campaigns-v13",
+      kind: "campaigns_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13",
       scanRunId: "scan-proof-incremental", batchKey: "run:scan-proof-incremental:campaigns-v13:campaigns:a", scannerRejected: 0,
       campaigns: [{ id: "campaign-proof", name: "Proof", isActive: true }],
     },
@@ -598,7 +662,7 @@ test("campaign completion proof is incremented transactionally and completes wit
     job: proofJob,
     deviceId: "device-1",
     result: {
-      schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "scan-proof-incremental",
+      schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "scan-proof-incremental",
       campaignPagesComplete: true, claimersComplete: true, fanValuesComplete: true, truncated: false,
       campaignCount: 1, campaignBatchCount: 1, claimerBatchCount: 0,
       fanValuesRequested: 0, fanValuesFetched: 0, fanValuesUnavailable: 0,
@@ -618,7 +682,7 @@ test("campaign completion replay can promote a formerly partial audit batch", as
   };
   const payload = {
     schemaVersion: 4,
-    collectorVersion: "campaigns-v13",
+    sourceValidationVersion: 1, collectorVersion: "campaigns-v13",
     scanRunId: "scan-2",
     scanStartedAt: "2026-08-06T11:00:00.000Z",
     observedAt: "2026-08-06T12:00:00.000Z",
@@ -691,7 +755,7 @@ test("campaign claimer identity freshness uses PostgreSQL receipt time, not hist
     chunk: {
       kind: "campaign_claimers_page",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v6",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
       scanRunId: "scan-identity-receipt",
       batchKey: "run:scan-identity-receipt:claimers:1",
       externalCampaignId: "campaign-1",
@@ -768,7 +832,7 @@ test("campaign claimer causal job consumes exact token and projects token chrono
   await ingestCampaignChunk({
     db: harness.db, job: causalJob, deviceId: "device-1",
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v7",
+      kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v7",
       scanRunId: "scan-identity-token", batchKey: "run:scan-identity-token:claimers:1",
       externalCampaignId: "campaign-1", pageNumber: 1, campaignComplete: true, scannerRejected: 0,
       observationToken: "campaign-token-1",
@@ -819,7 +883,7 @@ test("campaign catch-up frontier stays staged after page 1 and publishes only at
     chunk: {
       kind: "campaign_claimers_page",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v8",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v8",
       scanRunId,
       batchKey: `run:${scanRunId}:campaigns-v8:claimers:page-1`,
       externalCampaignId: "campaign-1",
@@ -845,7 +909,7 @@ test("campaign catch-up frontier stays staged after page 1 and publishes only at
     chunk: {
       kind: "campaign_claimers_page",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v8",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v8",
       scanRunId,
       batchKey: `run:${scanRunId}:campaigns-v8:claimers:page-2`,
       externalCampaignId: "campaign-1",
@@ -892,7 +956,7 @@ test("campaign staged frontier from an older generation cannot be published by a
     chunk: {
       kind: "campaign_claimers_page",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v8",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v8",
       scanRunId: replacementRun,
       batchKey: `run:${replacementRun}:campaigns-v8:claimers:page-2`,
       externalCampaignId: "campaign-1",
@@ -958,7 +1022,7 @@ test("campaign deep frontier finds a shifted prior head identity below page 1 an
     chunk: {
       kind: "campaign_claimers_page",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v9",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v9",
       scanRunId,
       batchKey: `run:${scanRunId}:campaigns-v9:claimers:page-2`,
       externalCampaignId: "campaign-1",
@@ -1037,7 +1101,7 @@ test("campaign deep frontier uses exact prior membership when head anchors and c
     job: campaignJob(scanRunId, scanStartedAt, "catchup"),
     deviceId: "device-1",
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v9",
+      kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v9",
       scanRunId, batchKey: `run:${scanRunId}:campaigns-v9:claimers:history`, externalCampaignId: "campaign-1",
       pageNumber: 7, sourceHasMore: true, campaignComplete: false, knownBoundaryReached: false,
       campaignMode: "catchup", scannerRejected: 0,
@@ -1094,7 +1158,7 @@ test("campaign deep frontier refuses membership proof from a partial generation 
     job: campaignJob(scanRunId, scanStartedAt, "catchup"),
     deviceId: "device-1",
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v9",
+      kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v9",
       scanRunId, batchKey: `run:${scanRunId}:campaigns-v9:claimers:partial-membership`, externalCampaignId: "campaign-1",
       pageNumber: 8, sourceHasMore: true, campaignComplete: false, knownBoundaryReached: false,
       campaignMode: "catchup", scannerRejected: 0,
@@ -1145,7 +1209,7 @@ test("campaigns-v12 ignores historical membership/client boundary hints until pr
     job: campaignJob(scanRunId, scanStartedAt, "catchup"),
     deviceId: "device-1",
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v12",
+      kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v12",
       scanRunId, batchKey: `run:${scanRunId}:campaigns-v12:claimers:page-2`, externalCampaignId: "campaign-1",
       pageNumber: 2, sourceHasMore: true, campaignComplete: true, knownBoundaryReached: true,
       campaignMode: "catchup", scannerRejected: 0,
@@ -1164,7 +1228,7 @@ test("campaigns-v12 ignores historical membership/client boundary hints until pr
     job: campaignJob(scanRunId, scanStartedAt, "catchup"),
     deviceId: "device-1",
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v12",
+      kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v12",
       scanRunId, batchKey: `run:${scanRunId}:campaigns-v12:claimers:page-3`, externalCampaignId: "campaign-1",
       pageNumber: 3, sourceHasMore: false, campaignComplete: true, knownBoundaryReached: false,
       campaignMode: "catchup", scannerRejected: 0, claimers: [],
@@ -1189,7 +1253,7 @@ test("campaign claimer causal job fails closed when exact token is missing", asy
   await assert.rejects(() => ingestCampaignChunk({
     db: harness.db, job: causalJob, deviceId: "device-1",
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v7",
+      kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v7",
       scanRunId: "scan-token-required", batchKey: "run:scan-token-required:claimers:1",
       externalCampaignId: "campaign-1", campaignComplete: true, scannerRejected: 0,
       claimers: [{ id: "claim-1", user: { id: "fan-1", username: "beta" } }],
@@ -1209,7 +1273,7 @@ test("campaign fan attribution keeps the earliest confirmed attribution date", a
   await ingestCampaignChunk({
     db: harness.db, job: campaignJob("scan-earliest"),
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v6",
+      kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
       scanRunId: "scan-earliest", scanStartedAt: "2026-08-06T11:00:00.000Z", observedAt: "2026-08-06T12:00:00.000Z",
       batchKey: "run:scan-earliest:claimers:1", externalCampaignId: "campaign-1", campaignComplete: true, scannerRejected: 0,
       claimers: [{ user: { id: "fan-1" }, id: "claim-new", attributedAt: "2026-08-01T00:00:00.000Z" }],
@@ -1237,7 +1301,7 @@ test("campaign fan attribution is historical and is never pruned by a later empt
       chunk: {
         kind: "campaign_claimers_page",
         schemaVersion: 4,
-        collectorVersion: "campaigns-v6",
+        sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
         scanRunId: "scan-history",
         scanStartedAt: "2026-08-06T11:00:00.000Z",
         observedAt: "2026-08-06T12:00:00.000Z",
@@ -1297,7 +1361,7 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
     chunk: {
       kind: "campaign_fan_value",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v6",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
       scanRunId: "fan-value-run",
       scanStartedAt: "2026-08-08T18:00:00.000Z",
       observedAt: "2026-08-08T18:01:00.000Z",
@@ -1355,7 +1419,7 @@ test("campaign fan value batch applies 20 current snapshots with constant bounde
     db: commitDatabaseFixture(db), job: campaignJob("batch-run", "2026-08-08T18:00:00.000Z"), deviceId: "device-1",
     chunk: {
       kind: "campaign_fan_values_batch",
-      schemaVersion: 4, collectorVersion: "campaigns-v6",
+      schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
       scanRunId: "batch-run", scanStartedAt: "2026-08-08T18:00:00.000Z", observedAt: "2026-08-08T18:01:00.000Z",
       batchKey: "run:batch-run:fan-values:abc",
       values: Array.from({ length: 20 }, (_, index) => ({
@@ -1418,7 +1482,7 @@ test("campaign fan value source is server-assigned and fan scope is proven by cu
   const baseChunk = {
     kind: "campaign_fan_value",
     schemaVersion: 4,
-    collectorVersion: "campaigns-v6",
+    sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
     scanRunId: "scope-run",
     scanStartedAt: "2026-08-08T18:00:00.000Z",
     observedAt: "2026-08-08T18:01:00.000Z",
@@ -1794,7 +1858,7 @@ test("chunk ingesters run inside the fenced Prisma transaction client without ne
     chunk: {
       kind: "campaigns_page",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v6",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
       scanRunId: "run-fenced-campaigns",
     scanStartedAt: "2026-08-06T11:00:00.000Z",
       observedAt: "2026-08-06T12:00:00.000Z",
@@ -1867,7 +1931,7 @@ test("older campaign pages are superseded once a newer generation has reached in
     chunk: {
       kind: "campaigns_page",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v6",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
       scanRunId: "older-run",
       scanStartedAt: "2026-08-06T11:00:00.000Z",
       observedAt: "2026-08-06T13:00:00.000Z",
@@ -1895,7 +1959,7 @@ test("older campaign completion cannot deactivate or overwrite coverage after a 
     deviceId: "device-1",
     result: {
       schemaVersion: 4,
-      collectorVersion: "campaigns-v6",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
       scanRunId: "older-run",
       scanStartedAt: "2026-08-06T11:00:00.000Z",
       observedAt: "2026-08-06T13:00:00.000Z",
@@ -1924,7 +1988,7 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
     chunk: {
       kind: "campaigns_page",
       schemaVersion: 4,
-      collectorVersion: "campaigns-v6",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v6",
       scanRunId: "lock-run",
       scanStartedAt: "2026-08-06T11:00:00.000Z",
       observedAt: "2026-08-06T12:00:00.000Z",
@@ -2237,7 +2301,7 @@ test("INT5.6A-4 causal campaign profile value consumes exact token and projects 
   const result = await ingestCampaignFanValuesBatchChunk({
     db: harness.db, job: causalJob, deviceId: "device-1",
     chunk: {
-      kind: "campaign_fan_values_batch", schemaVersion: 4, collectorVersion: "campaigns-v7",
+      kind: "campaign_fan_values_batch", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v7",
       scanRunId: "fan-value-causal", batchKey: "run:fan-value-causal:fan-values:1",
       values: [{
         fanOnlyFansUserId: "fan-1", available: true, observedAt: "2026-09-17T15:59:00.000Z",
@@ -2260,7 +2324,7 @@ test("INT5.6A-4 causal campaign profile value consumes exact token and projects 
 test("INT5.6A-4 committed campaign fan-value replay returns before one-shot token consumption", async () => {
   const crypto = require("node:crypto");
   const chunk = {
-    kind: "campaign_fan_values_batch", schemaVersion: 4, collectorVersion: "campaigns-v7",
+    kind: "campaign_fan_values_batch", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v7",
     scanRunId: "fan-value-replay", batchKey: "run:fan-value-replay:fan-values:1",
     values: [{
       fanOnlyFansUserId: "fan-1", available: true, observedAt: "2026-09-17T15:59:00.000Z",
@@ -2323,7 +2387,7 @@ test("INT5.6A-4 embedded claimer value reuses claimer-page causal chronology wit
   await ingestCampaignChunk({
     db: harness.db, job: causalJob, deviceId: "device-1",
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v7",
+      kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v7",
       scanRunId: "claimer-embedded", batchKey: "run:claimer-embedded:claimers:1",
       externalCampaignId: "campaign-1", campaignComplete: true, scannerRejected: 0,
       observationToken: "claimer-token-embedded",
@@ -2382,7 +2446,7 @@ test("campaigns-v10 accepts claimer pages beyond 10k and detects exact current-r
     job: campaignJob(scanRunId, scanStartedAt, "full"),
     deviceId: "device-1",
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v10",
+      kind: "campaign_claimers_page", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v10",
       scanRunId, batchKey: `run:${scanRunId}:campaigns-v10:claimers:10001`, externalCampaignId: "campaign-1",
       pageNumber: 10_001, sourceHasMore: true, campaignComplete: false, knownBoundaryReached: false,
       campaignMode: "full", scannerRejected: 0,

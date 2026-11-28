@@ -70,14 +70,14 @@ test("INT5.9A-7 relational segment cursor is bounded, stable and server-counted 
   };
   const job = {
     id: "job-1", creatorId: "creator-1", agencyId: "agency-1",
-    params: { collectionContractVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: "run-1", collectionRequestedAt: requestedAt.toISOString() },
+    params: { collectionContractVersion: 1, sourceValidationVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: "run-1", collectionRequestedAt: requestedAt.toISOString() },
     continuation: { driverPhase: "execute", jobContinuation: {
-      collectorVersion: "campaigns-v13", scanRunId: "run-1", phase: "segment",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-1", phase: "segment",
       directorySourceExhausted: true, campaignPagesComplete: true, truncated: false, segmentCursor: null,
     } },
   };
   const result = await loadCampaignDirectorySegment({ db, job, chunk: {
-    kind: "campaign_directory_segment", schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "run-1", cursor: null,
+    kind: "campaign_directory_segment", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-1", cursor: null,
   } });
   assert.equal(result.campaignDirectorySegment.campaigns.length, 50);
   assert.equal(result.campaignDirectorySegment.hasMore, true);
@@ -96,22 +96,22 @@ test("INT5.9A-7 segment advance rejects cursor skips but permits exact lost-resp
   } };
   const base = {
     id: "job-2", creatorId: "creator-1", agencyId: "agency-1",
-    params: { collectionContractVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: "run-2", collectionRequestedAt: requestedAt },
+    params: { collectionContractVersion: 1, sourceValidationVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: "run-2", collectionRequestedAt: requestedAt },
   };
   await assert.rejects(() => loadCampaignDirectorySegment({ db, job: {
     ...base, continuation: { driverPhase: "execute", jobContinuation: {
-      collectorVersion: "campaigns-v13", scanRunId: "run-2", phase: "segment", directorySourceExhausted: true,
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-2", phase: "segment", directorySourceExhausted: true,
       campaignPagesComplete: true, truncated: false, segmentCursor: "campaign-0050",
     } },
-  }, chunk: { kind: "campaign_directory_segment", schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "run-2", cursor: "campaign-9999" } }), /cursor does not match/);
+  }, chunk: { kind: "campaign_directory_segment", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-2", cursor: "campaign-9999" } }), /cursor does not match/);
   assert.equal(reads, 0);
 
   const replay = await loadCampaignDirectorySegment({ db, job: {
     ...base, continuation: { driverPhase: "execute", jobContinuation: {
-      collectorVersion: "campaigns-v13", scanRunId: "run-2", phase: "claimers", directorySourceExhausted: true,
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-2", phase: "claimers", directorySourceExhausted: true,
       campaignPagesComplete: true, truncated: false, segmentCursor: "campaign-0101", segmentRequestCursor: "campaign-0050",
     } },
-  }, chunk: { kind: "campaign_directory_segment", schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "run-2", cursor: "campaign-0050" } });
+  }, chunk: { kind: "campaign_directory_segment", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-2", cursor: "campaign-0050" } });
   assert.equal(replay.campaignDirectorySegment.requestCursor, "campaign-0050");
   assert.equal(reads, 1);
 });

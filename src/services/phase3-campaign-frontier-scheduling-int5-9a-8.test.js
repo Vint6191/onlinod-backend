@@ -83,16 +83,16 @@ test("INT5.9A-8 catch-up selects one durable due budget and emits scanClaimers=f
   const job = {
     id: "job-a8", creatorId: "creator-1", agencyId: "agency-1",
     params: {
-      collectionContractVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: "run-a8",
+      collectionContractVersion: 1, sourceValidationVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: "run-a8",
       collectionRequestedAt: requestedAt.toISOString(), collectionMode: "catchup",
       campaignFrontierSchedulingVersion: 1, campaignFrontierBudget: 25,
     },
     continuation: { driverPhase: "execute", jobContinuation: {
-      collectorVersion: "campaigns-v13", scanRunId: "run-a8", phase: "segment",
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-a8", phase: "segment",
       directorySourceExhausted: true, campaignPagesComplete: true, truncated: false, segmentCursor: null,
     } },
   };
-  const chunk = { kind: "campaign_directory_segment", schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "run-a8", cursor: null };
+  const chunk = { kind: "campaign_directory_segment", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-a8", cursor: null };
   const result = await loadCampaignDirectorySegment({ db, job, chunk });
   assert.equal(result.campaignDirectorySegment.campaigns.length, 50);
   assert.equal(result.campaignDirectorySegment.campaigns.filter((row) => row.scanClaimers).length, 25);

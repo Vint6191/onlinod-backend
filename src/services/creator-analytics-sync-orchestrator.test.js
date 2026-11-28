@@ -38,11 +38,22 @@ test.beforeEach(()=>{
  planned=[];active=[];sources=[];intents={};locks=[];ledger=true;
  notes={normalizerVersion:'notification-source-v3',status:'COMPLETE',fullBackfillVerifiedAt:old,fullBackfillObservedAt:old,knownNotificationIds:['known'],headNotificationId:'known'};
  financialState={status:'COMPLETE',baselineGeneration:'fin-base',baselineVerifiedAt:old,baselineObservedAt:old,receiptCoverageVersion:1};
- campaignState={status:'COMPLETE',baselineGeneration:'campaign-base',baselineVerifiedAt:old,baselineObservedAt:old,membershipCoverageStatus:'COMPLETE',fanValueFreshnessStatus:'COMPLETE'};
+ campaignState={status:'COMPLETE',baselineGeneration:'campaign-base',baselineVerifiedAt:old,baselineObservedAt:old,membershipCoverageStatus:'COMPLETE',fanValueFreshnessStatus:'COMPLETE',
+   membershipBaselineGeneration:'campaign-base',membershipBaselineVerifiedAt:old,membershipBaselineObservedAt:old,membershipBaselineSourceValidationVersion:1};
 });
 test('months-old collection timestamps alone schedule no source request',async()=>{
  const result=await api.ensureRecurringCreatorAnalyticsCatchups(input(db()));assert(result.ready);assert.equal(planned.length,0);
  for(const stream of ['notifications','financial','campaigns'])assert(result.skipped.includes(stream+':live_no_recovery_debt'));
+});
+test('a legacy Campaign validator schedules one full per-creator verification while preserving the historical proof',async()=>{
+ campaignState.membershipBaselineSourceValidationVersion=0;
+ const before=structuredClone(campaignState),d=db();
+ const result=await api.ensureRecurringCreatorAnalyticsCatchups(input(d));
+ assert.equal(result.initial.stage,'campaigns');assert.equal(planned.length,1);
+ assert.equal(planned[0].jobKey,'fetch_campaigns');assert.equal(planned[0].params.collectionMode,'full');
+ assert.equal(planned[0].params.sourceValidationVersion,1);
+ assert.deepEqual(campaignState,before,'planning must not relabel or erase an already published legacy proof');
+ await api.ensureRecurringCreatorAnalyticsCatchups(input(d));assert.equal(planned.length,1,'the existing episode coalesces repeated planning');
 });
 test('one offline intent schedules one version-bound job per stream and repeats coalesce',async()=>{
  for(const stream of ['notifications','financial','campaigns'])intents[stream]=debt(stream);
@@ -64,7 +75,8 @@ test('initial history prioritizes financial ledger, campaigns, then notification
  const d=db();notes=null;financialState=null;campaignState=null;ledger=false;
  let step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.stage,'financial');assert.equal(planned.at(-1).params.collectionMode,'full');assert.equal(planned.at(-1).params.earningsLedgerVersion,1);
  active=[];financialState={baselineGeneration:'f',baselineVerifiedAt:old};ledger=true;step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.stage,'campaigns');
- active=[];campaignState={baselineGeneration:'c',baselineVerifiedAt:old,membershipCoverageStatus:'COMPLETE'};step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.stage,'notifications');
+ active=[];campaignState={baselineGeneration:'c',baselineVerifiedAt:old,membershipCoverageStatus:'COMPLETE',
+   membershipBaselineGeneration:'c',membershipBaselineVerifiedAt:old,membershipBaselineSourceValidationVersion:1};step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.stage,'notifications');
  active=[];notes={normalizerVersion:'notification-source-v3',fullBackfillVerifiedAt:old};step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.ready,true);
 });
 test('cutover requires one verified ledger baseline, then never repeats it by age',async()=>{

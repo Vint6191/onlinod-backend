@@ -28,8 +28,11 @@ function state(overrides = {}) { return {
   id: 'state', agencyId: 'agency', creatorId: 'creator', status: 'COMPLETE', mode: 'catchup',
   activeGeneration: 'old', activeRequestedAt: observed, baselineGeneration: 'baseline', baselineVerifiedAt: observed,
   baselineObservedAt: observed, lastCatchupCompletedAt: observed, lastCatchupObservedAt: observed,
+  membershipBaselineVerifiedAt: observed, membershipBaselineObservedAt: observed, membershipBaselineGeneration: 'baseline',
+  membershipBaselineSourceValidationVersion: 1, membershipCatchupVerifiedAt: observed, membershipCatchupObservedAt: observed,
+  membershipCatchupGeneration: 'old', membershipCatchupSourceValidationVersion: 1,
   membershipCoverageStatus: 'COMPLETE', membershipObservedAt: observed,
-  campaignDirectoryGeneration: 'directory', campaignDirectoryRequestedAt: observed,
+  campaignDirectorySourceValidationVersion: 1, campaignDirectoryGeneration: 'directory', campaignDirectoryRequestedAt: observed,
   campaignDirectoryVerifiedAt: observed, campaignDirectoryRevision: 1, campaignDirectoryCampaignCount: 1,
   campaignDirectoryDiscoveryDueAt: new Date(+observed + 72 * 3600000),
   campaignFrontierPlanRunId: 'old', campaignFrontierFreshnessStatus: 'COMPLETE',
@@ -48,7 +51,7 @@ const financial = { status: 'COMPLETE', baselineGeneration: 'financial', baselin
 const read = load('campaign-read-repository');
 async function comparison(legacy, recovery=false) {
   scheduled.length = 0;
-  const current = state(legacy ? { baselineObservedAt: null, lastCatchupObservedAt: null, campaignFrontierObservationVersion: 0 } : {});
+  const current = state(legacy ? { baselineObservedAt: null, lastCatchupObservedAt: null, membershipBaselineObservedAt: null, membershipCatchupObservedAt: null, campaignFrontierObservationVersion: 0 } : {});
   const db = { creatorCampaignCollectionState: { findUnique: async () => structuredClone(current) },
     creatorFinancialCollectionState: { findUnique: async () => financial },
     creatorCampaign: { findMany: async () => [] }, jobInstance: { findFirst: async () => null, findMany: async () => [] },
@@ -137,15 +140,15 @@ function fixture({ versions = [1], count = versions.length, budget = 50, bounded
     campaignDirectoryReuseVersion:1, campaignFrontierBudget:budget, analyticsObservationStartedAt:now.toISOString(),
     ...(bounded ? {campaignBoundedTraversalVersion:1} : {})};
   const job = {id:'job',jobKey:'fetch_campaigns',agencyId:'agency',creatorId:'creator',params,
-    continuation:{driverPhase:'execute',jobContinuation:{collectorVersion:'campaigns-v13',scanRunId:params.collectionGeneration,
+    continuation:{driverPhase:'execute',jobContinuation:{sourceValidationVersion: 1, collectorVersion: 'campaigns-v13',scanRunId:params.collectionGeneration,
       phase:'segment',directorySourceExhausted:true,campaignPagesComplete:true,truncated:false,
       campaignBatchCount:0,claimerBatchCount:0,segmentCursor:null}}};
   const segment = () => ledger().loadCampaignDirectorySegment({db,job,chunk:{kind:'campaign_directory_segment',schemaVersion:4,
-    collectorVersion:'campaigns-v13',scanRunId:params.collectionGeneration,cursor:null}});
-  const completion = override => ledger().completeCampaignScan({db,job,result:{schemaVersion:4,collectorVersion:'campaigns-v13',
+    sourceValidationVersion: 1, collectorVersion: 'campaigns-v13',scanRunId:params.collectionGeneration,cursor:null}});
+  const completion = override => ledger().completeCampaignScan({db,job,result:{schemaVersion:4,sourceValidationVersion: 1, collectorVersion: 'campaigns-v13',
     scanRunId:params.collectionGeneration,campaignBatchCount:0,claimerBatchCount:0,campaignCount:count,
     campaignPagesComplete:true,claimersComplete:true,truncated:false,...override}});
-  const page = (externalCampaignId='1') => ({kind:'campaign_claimers_page',schemaVersion:4,collectorVersion:'campaigns-v13',
+  const page = (externalCampaignId='1') => ({kind:'campaign_claimers_page',schemaVersion:4,sourceValidationVersion: 1, collectorVersion: 'campaigns-v13',
     scanRunId:params.collectionGeneration,batchKey:`run:${params.collectionGeneration}:claimers:${externalCampaignId}:1`,
     externalCampaignId,pageNumber:1,campaignMode:'catchup',campaignComplete:true,sourceHasMore:false,scannerRejected:0,claimers:[]});
   return {db,job,rows,batches,operations,ledger,segment,completion,page,get state(){return current;},
@@ -166,7 +169,7 @@ test('fresh Campaign reads do not create recovery work',async()=>{
   const r=await comparison(false);
   assert.equal(r.coverage.fresh,true);assert(r.skipped.includes('campaigns:live_no_recovery_debt'));assert.equal(r.scheduled.length,0);
 });
-test('legacy Campaign proof stays usable without a TTL-triggered scan',async()=>{
+test('source-validated Campaign proof with legacy age metadata stays usable without a TTL-triggered scan',async()=>{
   const r=await comparison(true);
   assert.equal(r.coverage.proven,true);assert.equal(r.coverage.fresh,false);assert.equal(r.coverage.due,true);
   assert.equal(r.scheduled.length,0);
@@ -304,7 +307,7 @@ function trackDirectoryIO(f) {
 function nextSegment(f,cursor) {
   f.job.continuation.jobContinuation.phase='segment';f.job.continuation.jobContinuation.segmentCursor=cursor;
   return f.ledger().loadCampaignDirectorySegment({db:f.db,job:f.job,chunk:{kind:'campaign_directory_segment',schemaVersion:4,
-    collectorVersion:'campaigns-v13',scanRunId:f.job.params.collectionGeneration,cursor}});
+    sourceValidationVersion: 1, collectorVersion: 'campaigns-v13',scanRunId:f.job.params.collectionGeneration,cursor}});
 }
 test('Bounded reuse of 4000 campaigns returns only 10 targets without COUNT or catalog traversal',async()=>{
   const f=fixture({versions:[...Array(3990).fill(1),...Array(10).fill(0)],bounded:true,sealed:true});
@@ -359,7 +362,7 @@ test('Directory fact mutation invalidates cached count, plan, reader freshness a
 });
 test('A stale publication count revision cannot complete even if its numeric count is unchanged',async()=>{
   const f=fixture({bounded:true,sealed:true});await f.segment();
-  const result={schemaVersion:4,collectorVersion:'campaigns-v13',scanRunId:f.job.params.collectionGeneration,
+  const result={schemaVersion:4,sourceValidationVersion: 1, collectorVersion: 'campaigns-v13',scanRunId:f.job.params.collectionGeneration,
     campaignBatchCount:0,claimerBatchCount:0,campaignCount:1,campaignPagesComplete:true,claimersComplete:true,truncated:false};
   const r=await f.ledger().completeCampaignScan({db:f.db,job:f.job,result,publication:{observedCampaignCount:1,directoryCountRevision:'99',prepareOnly:true}});
   assert.equal(r.complete,false);assert.equal(r.providerTraversalComplete,false);

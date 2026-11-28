@@ -246,6 +246,7 @@ async function financialUnit(db, job, row, now) {
 
 function repairParams(job, now) {
   const previous = job.params || {};
+  if (job.jobKey === "fetch_campaigns") return require("./campaign-source-validation-authority-service").repairParams(job, now);
   if (job.jobKey === "fetch_earnings") {
     const old = new Date(previous.authorityRequestedAt || previous.requestedAt);
     const next = new Date(Math.max(now.getTime(), old.getTime() + 1));
@@ -316,6 +317,18 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
     await require("./subscriber-directory-maintenance-signal-service").signalSubscriberDirectoryMaintenance({
       db, agencyId: job.agencyId, creatorId: job.creatorId,
       kind: "DERIVED_PLANNING", reason: "INITIAL_FINANCIAL_PUBLISHED",
+    });
+  }
+  if (job.jobKey === "fetch_campaigns" && job.params?.analyticsSyncKind === "initial"
+    && Number(job.params?.analyticsSyncVersion) === require("./creator-analytics-sync-orchestrator").ANALYTICS_SYNC_VERSION
+    && complete && sideEffect?.completion?.membershipComplete === true
+    && sideEffect?.completion?.protocolCurrent === true && !sideEffect?.completion?.superseded) {
+    // A directory with no fans has no delegated FanData job to wake the next
+    // initial stage. Commit the wake with the membership proof so a planner
+    // that already yielded cannot leave Notifications parked for an hour.
+    await require("./subscriber-directory-maintenance-signal-service").signalSubscriberDirectoryMaintenance({
+      db, agencyId: job.agencyId, creatorId: job.creatorId,
+      kind: "DERIVED_PLANNING", reason: "INITIAL_CAMPAIGN_PUBLISHED",
     });
   }
   if (complete) require("./analytics-change-hint-service").publish(job.agencyId);

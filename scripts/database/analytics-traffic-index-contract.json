@@ -56,6 +56,20 @@
     "where": null
   },
   {
+    "name": "TrafficSource_cost_currency_v213",
+    "table": "TrafficSource",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"currency\"",
+    "where": "\"costCents\" <> 0"
+  },
+  {
+    "name": "TrafficSource_type_cost_currency_v213",
+    "table": "TrafficSource",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"sourceType\",\"currency\"",
+    "where": "\"costCents\" <> 0"
+  },
+  {
     "name": "TrafficSourceMember_fan_page_v2",
     "table": "TrafficSourceMember",
     "unique": false,

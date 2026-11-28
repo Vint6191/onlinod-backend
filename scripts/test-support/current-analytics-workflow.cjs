@@ -212,11 +212,29 @@ export async function refresh(){await client.invalidateQueries();}`);
     const scanner = name => page.getByRole("navigation", { name: "Creator Analytics scanners" }).getByRole("button", { name: new RegExp(name) }).click();
     const showTrafficSource = async name => {
       const table = page.getByRole('table', { name: 'Traffic sources' });
-      await until(async () => await page.getByRole('button', { name: 'Reload saved data', exact: true }).isEnabled(), 'Traffic reload did not settle');
+      await until(async () => await page.getByRole('button', { name: 'Refresh view', exact: true }).isEnabled(), 'Traffic reload did not settle');
       await until(async () => (await table.locator('tbody tr').count()) > 0 && !(await table.innerText()).includes('Loading traffic'), 'Traffic page did not load');
       if (!await table.getByText(name, { exact: true }).count()) await page.getByRole('button', { name: 'Next sources', exact: true }).click();
       await table.getByText(name, { exact: true }).waitFor();
     };
+    if (process.env.ONLINOD_ANALYTICS_PROOF_SCOPE === 'campaigns') {
+      await require('./campaign-chain213-http-scenario.cjs').runCampaignHttpScenario({
+        page, browser, app, until, home, analytics, commands, traffic, overview, results, pass, calls, errors,
+        creatorId: c, providerReads, showTrafficSource, observeTrafficProgress,
+        startWorkers() { lostProgress = true; coordinator.start(); worker.start(); },
+        correctFinancial() { refunded = false; },
+        loseNextCostReply() { loseCostReply = true; },
+        updateProviderCampaign() { campaignGeneration++; campaigns[0].name = 'Source 01 refreshed'; },
+        holdTrafficResponse(value) { heldTraffic = value; },
+        wakeWorker() { worker.wakeAvailableJob(); },
+        async reopenBackendAndWorker() {
+          await worker.stop(); await coordinator.destroy();
+          const killed = await f.stop('SIGKILL'); assert.equal(killed.signal, 'SIGKILL'); await f.boot();
+          creatorService.invalidateBootstrap(); publishAuthority(); makeWorker(); coordinator.start(); worker.start();
+        },
+      });
+      return;
+    }
     if (earningsOnly) {
       const net = () => page.locator('.hq-number-row').filter({ has: page.getByText('Net earnings', { exact: true }) }).locator('.hq-number-value');
       const selectCreator = async name => {

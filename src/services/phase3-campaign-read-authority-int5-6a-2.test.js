@@ -60,6 +60,7 @@ test("INT5.6A-2 manual campaign pause CAS-revokes the owner and exact read lease
   let cleanupWhere = null;
   const db = {
     async $executeRawUnsafe(sql, key) {
+      if (sql === "SET CONSTRAINTS ALL IMMEDIATE") return 1;
       assert.match(String(sql), /pg_advisory_xact_lock/);
       assert.equal(key, "analytics-collector:campaigns:creator-1");
       order.push("collector-lock");

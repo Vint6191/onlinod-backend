@@ -2,6 +2,7 @@
 const { isCreatorLifecycleContention } = require("./creator-lifecycle-contention");
 const { notificationCommittedPageProof } = require("./notification-page-receipt-service");
 const { notificationRepairParams, needsNotificationRepairRotation, notificationProgressIsStale } = require("./notification-repair-service");
+const campaignSourceValidation = require("./campaign-source-validation-authority-service");
 
 const { isDeepStrictEqual } = require("node:util");
 
@@ -147,7 +148,7 @@ async function campaignDirectoryDiscoveryClaimAvailable(db, candidateParams = nu
 }
 
 function campaignClaimParams(value) {
-  const params = { ...object(value) };
+  const params = campaignSourceValidation.claimParams(value);
   // Retire the old O(campaign fan history) catch-up hints at the claim fence so
   // already-SCHEDULED pre-cutover jobs cannot leak oversized params to a new
   // Desktop. Missing compact hints only causes a safe provider rescan.
@@ -164,6 +165,8 @@ function campaignClaimParams(value) {
 }
 function campaignDirectoryReuseInitialContinuation(value) {
   const params = object(value);
+  if (params.sourceValidationVersion !== campaignSourceValidation.VERSION
+      || params.campaignDirectoryReuseSourceValidationVersion !== campaignSourceValidation.VERSION) return null;
   if (Number(params.campaignDirectoryReuseVersion || 0) < 1) return null;
   const directoryGeneration = clean(params.campaignDirectoryReuseGeneration, 120);
   if (!directoryGeneration) return null;
@@ -179,6 +182,7 @@ function campaignDirectoryReuseInitialContinuation(value) {
   return {
     driverPhase: "execute",
     jobContinuation: {
+      sourceValidationVersion: campaignSourceValidation.VERSION,
       ...(Number(params.campaignFairPagesVersion) === 1 ? { fairPagesVersion: 1 } : {}),
       collectorVersion: "campaigns-v13", scanRunId: generation, scanStartedAt: new Date(requestedAt).toISOString(),
       phase: "segment", campaignMode: "catchup", offset: 0, page: 0, campaigns: [],
@@ -460,6 +464,7 @@ function committedCollectorSourceAdvance(job, chunk, effect) {
       && !isDeepStrictEqual(leaseDriverContinuation(job.continuation), leaseDriverContinuation(effect.financialContinuation));
   }
   if (job.jobKey === "fetch_campaigns") {
+    if (chunk.kind === "campaigns_page" && chunk.sourceHasMore === true && effect.directorySourceProgress === 0) return false;
     return campaignTraversal.enabled(job) && ["campaigns_page", "campaign_claimers_page"].includes(chunk.kind)
       && effect.replay === false && Boolean(effect.batchId) && typeof chunk.sourceHasMore === "boolean"
       && (chunk.sourceHasMore === false || Number.isSafeInteger(chunk.sourceRowCount) && chunk.sourceRowCount > 0);
@@ -660,7 +665,8 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     capabilities?.campaignDirectoryReuseV1 !== true ||
     capabilities?.campaignBoundedTraversalV1 !== true ||
     capabilities?.campaignTraversalAuthorityV1 !== true ||
-    capabilities?.campaignFairPagesV1 !== true
+    capabilities?.campaignFairPagesV1 !== true ||
+    capabilities?.campaignSourceValidationV1 !== true
   ) {
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
@@ -739,10 +745,12 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     if (await cancelRedundantNotificationFull(candidate, now)) continue;
     const leaseToken = crypto.randomBytes(32).toString("base64url");
     const until = new Date(now.getTime() + leaseDuration(leaseMs));
+    const campaignRotation = campaignSourceValidation.needsRotation(candidate);
+    const campaignParams = String(candidate.jobKey || "") === "fetch_campaigns" ? campaignClaimParams(candidate.params) : null;
     const fairCampaign = String(candidate.jobKey || "") === "fetch_campaigns"
-      && (fairPages.enabled(candidate) || (candidate.continuation == null && candidate.startedAt == null));
-    const reuseContinuation = String(candidate.jobKey || "") === "fetch_campaigns" && candidate.continuation == null
-      ? campaignDirectoryReuseInitialContinuation({ ...object(candidate.params), ...(fairCampaign ? { campaignFairPagesVersion: 1 } : {}) })
+      && (campaignRotation || fairPages.enabled(candidate) || (candidate.continuation == null && candidate.startedAt == null));
+    const reuseContinuation = String(candidate.jobKey || "") === "fetch_campaigns" && !campaignRotation && candidate.continuation == null
+      ? campaignDirectoryReuseInitialContinuation({ ...campaignParams, ...(fairCampaign ? { campaignFairPagesVersion: 1 } : {}) })
       : null;
     const claimData = {
       status: "CLAIMED", claimedAt: now, claimedByDeviceId: device.id, leaseUntil: until,
@@ -750,7 +758,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       progress: clearWaitProgress(candidate.progress),
       ...(FAN_OBSERVATION_READ_LEASE_JOB_KEYS.has(String(candidate.jobKey || "")) ? {
         params: {
-          ...(String(candidate.jobKey || "") === "fetch_campaigns" ? campaignClaimParams(candidate.params) : object(candidate.params)),
+          ...(campaignParams || object(candidate.params)),
           observationTokenVersion: 1,
           observationReadLeaseVersion: 1,
           ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignBoundedTraversalVersion: 1, campaignTraversalAuthorityVersion: 1, ...(fairCampaign ? { campaignFairPagesVersion: 1 } : {}) } : {}),
@@ -765,7 +773,8 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       await assertJobBillingAccess({ db, job: candidate, recoveryCapable: capabilities?.billingRecoveryLeaseV1 === true, financialRecoveryCapable: capabilities?.billingFinancialRecoveryV1 === true });
       if (String(candidate.jobKey || "") === "fetch_campaigns") {
         await enterCampaignClaimGeneration({ db });
-        if (campaignDirectoryDiscoveryJob(candidate.params) && !(await campaignDirectoryDiscoveryClaimAvailable(db, candidate.params))) {
+        const discoveryParams = campaignRotation ? { ...campaignParams, campaignDirectoryReuseGeneration: null } : campaignParams;
+        if (campaignDirectoryDiscoveryJob(discoveryParams) && !(await campaignDirectoryDiscoveryClaimAvailable(db, discoveryParams))) {
           return { __campaignDirectoryCapacityBlocked: true };
         }
       }
@@ -812,6 +821,11 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
         attemptClaimData.params = notificationRepairParams(candidate, claimNow);
         attemptClaimData.continuation = null;
         attemptClaimData.progress = { percent: 0, message: "Notification repair: new collection generation" };
+      }
+      if (campaignRotation) {
+        attemptClaimData.params = campaignSourceValidation.repairParams({ ...candidate, params: attemptClaimData.params }, claimNow);
+        attemptClaimData.continuation = null;
+        attemptClaimData.progress = { percent: 0, message: "Campaign source validation: new collection generation" };
       }
       if (candidate.jobKey === DIALOG_INTELLIGENCE_JOB_KEY && candidate.params?.dialogId === DIALOG_DISCOVERY_DIALOG_ID) {
         attemptClaimData.params = { ...object(attemptClaimData.params || candidate.params), discoveryTraversalVersion: 1 };
@@ -964,6 +978,21 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   return job;
 }
 
+async function rotateCampaignSourceLease(tx, job, now) {
+  if (!campaignSourceValidation.needsRotation(job)) return false;
+  await enterCampaignBoundedExecution({ db: tx });
+  const rotated = await tx.jobInstance.updateMany({ where: { id: job.id, status: "CLAIMED", leaseRevision: job.leaseRevision,
+    leaseTokenHash: job.leaseTokenHash, claimedByDeviceId: job.claimedByDeviceId }, data: {
+    status: "SCHEDULED", params: campaignSourceValidation.repairParams(job, now), nextRunAt: now,
+    continuation: null, progress: { percent: 0, message: "Campaign source validation: new collection generation" },
+    claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null,
+    leaseRevision: { increment: 1 }, workId: null, completedAt: null, lastError: null,
+  } });
+  if (!rotated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Campaign source-validation lease changed before rotation");
+  await tx.fanObservationReadLease.deleteMany({ where: { jobId: job.id, leaseRevision: job.leaseRevision } });
+  return true;
+}
+
 async function leaseCommit(input, work, { profile = "JOB_CHUNK", allowExpired = false, nowait = false } = {}) {
   try {
     const outcome = await runRootCommit(prisma, async ({ tx }) => {
@@ -971,6 +1000,7 @@ async function leaseCommit(input, work, { profile = "JOB_CHUNK", allowExpired = 
       if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
       if (job.jobKey === "financial_transactions_scan") await require("./financial-receipt-authority").enter(tx);
       const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+      if (await rotateCampaignSourceLease(tx, job, now)) return { campaignSourceValidationRotated: true };
       if (needsNotificationRepairRotation(job)) {
         const rotated = await tx.jobInstance.updateMany({ where: { id: job.id, status: "CLAIMED", leaseRevision: job.leaseRevision,
           leaseTokenHash: job.leaseTokenHash, claimedByDeviceId: job.claimedByDeviceId }, data: {
@@ -986,6 +1016,7 @@ async function leaseCommit(input, work, { profile = "JOB_CHUNK", allowExpired = 
     }, { profile, authority: { kind: "JOB_LEASE", userId: input.userId }, conflictCode: "JOB_LEASE_CONFLICT" });
     // Throw only after the rotation commits; throwing inside would roll it back.
     if (outcome?.notificationRepairRotated) throw new JobLeaseError("JOB_LEASE_STALE", "Notification repair moved to a new collection generation", 409);
+    if (outcome?.campaignSourceValidationRotated) throw new JobLeaseError("JOB_LEASE_STALE", "Campaign source validation moved to a new collection generation", 409);
     return outcome;
   } catch (error) {
     // The root has rolled back. Lock contention is temporary unavailability,
@@ -1276,6 +1307,8 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     if (!updatedFence.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before progress");
 
     const sideEffect = await applyJobChunk({ db: tx, job, deviceId, userId, chunkResult });
+    const campaignDirectoryOverride = job.jobKey === "fetch_campaigns"
+      ? campaignTraversal.directoryProgress(job, chunkResult, requestedContinuation, sideEffect) : null;
     if (chunkResult != null) await publishNotificationConsequences({ db: tx, job });
     if (!liveSync.admitsJob(job)) {
       const cancelled = await tx.jobInstance.update({where:{id:job.id},data:{status:"CANCELLED",completedAt:now,
@@ -1331,6 +1364,8 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       updated = await tx.jobInstance.update({ where: { id: job.id }, data: {
         continuation: job.continuation, progress: job.progress,
       } });
+    } else if (campaignDirectoryOverride) {
+      updated = await tx.jobInstance.update({ where: { id: job.id }, data: { continuation: campaignDirectoryOverride } });
     } else if (job.jobKey === "dialog_intelligence_scan" && sideEffect?.replayedCommit === true) {
       // A saved receipt acknowledges the old commit, not permission to rewind
       // a newer target/discovery cursor when its HTTP response is retried.
@@ -1448,7 +1483,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   const publication = require("./analytics-publication-service");
   const observedJob = await prisma.jobInstance.findUnique({ where: { id: jobId } });
   if (publication.isAnalyticsPublicationJob(observedJob)) {
-    return runRootCommit(prisma, async ({ tx }) => {
+    const outcome = await runRootCommit(prisma, async ({ tx }) => {
       const lifecycle = await require("./agency-lifecycle-barrier-service").lockAgencyLifecycleBarrier({ db: tx, agencyId: observedJob.agencyId });
       if (!lifecycle.row || lifecycle.row.deletedAt) throw new JobLeaseError("EXECUTION_ACCESS_REVOKED", "Agency is retired", 403);
       const users = await tx.$queryRawUnsafe('SELECT "id" FROM "User" WHERE "id"=$1 AND "disabledAt" IS NULL FOR SHARE', userId);
@@ -1465,11 +1500,14 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       const receipt = await tx.analyticsPublication.findUnique({ where: { jobId_leaseRevision: { jobId, leaseRevision } } });
       if (receipt) return publication.assertReplay(receipt, { userId, deviceId, leaseToken, leaseRevision, result });
       const current = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, db: tx });
-      const acceptedResult = acceptedCompletionResult(current, result);
       const acceptedAt = await dbAuthorityNow({ db: tx });
+      if (await rotateCampaignSourceLease(tx, current, acceptedAt)) return { campaignSourceValidationRotated: true };
+      const acceptedResult = acceptedCompletionResult(current, result);
       return publication.acceptAnalyticsPublication({ db: tx, job: current, userId, deviceId,
         leaseToken, leaseRevision, result: acceptedResult, now: acceptedAt });
     }, { profile: "JOB_CHUNK", authority: { kind: "ANALYTICS_PUBLICATION_ACCEPT", userId, agencyId: observedJob.agencyId, creatorId: observedJob.creatorId } });
+    if (outcome?.campaignSourceValidationRotated) throw new JobLeaseError("JOB_LEASE_STALE", "Campaign source validation moved to a new collection generation", 409);
+    return outcome;
   }
   let now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   let job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, now });

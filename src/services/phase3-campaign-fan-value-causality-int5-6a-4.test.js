@@ -26,6 +26,13 @@ test("INT5.6A-4 embedded campaign value is projected under claimer token chronol
 });
 
 test("INT5.6A-4 flattened Desktop claimer contract cannot confuse claimerId with fanId", () => {
-  assert.match(ledger, /const hasNestedUser = Object\.keys\(nestedUser\)\.length > 0/);
-  assert.match(ledger, /: \(row\.userId \?\? row\.fanId \?\? row\.id\)/);
+  const { normalizeClaimer } = require("./creator-analytics-ledger-service");
+  const flat = normalizeClaimer({ id: "claim-213", userId: "fan-213" });
+  assert.equal(flat.externalClaimerId, "claim-213");
+  assert.equal(flat.onlyFansUserId, "fan-213");
+  const nested = normalizeClaimer({ id: "claim-213", user: { id: "fan-213" } });
+  assert.equal(nested.onlyFansUserId, "fan-213");
+  assert.equal(normalizeClaimer({ id: "claim-213", user: {} }), null);
+  assert.equal(normalizeClaimer({ id: "claim-213", userId: null }), null);
+  assert.equal(normalizeClaimer({ id: "claim-213", userId: "fan-213", user: { id: "another-fan" } }), null);
 });

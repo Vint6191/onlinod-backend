@@ -18,16 +18,16 @@ function campaignJob({ generation = "run-a9", requestedAt = "2026-09-18T20:00:00
   return {
     id: "job-a9", creatorId: "creator-1", agencyId: "agency-1",
     params: {
-      collectionContractVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: generation,
+      collectionContractVersion: 1, sourceValidationVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: generation,
       collectionRequestedAt: requestedAt, collectionMode: "catchup", campaignMode: "catchup",
       campaignFrontierSchedulingVersion: 1, campaignDirectoryReuseVersion: 1, campaignFrontierBudget: 50,
-      campaignDirectoryReuseGeneration: "directory-g1",
+      campaignDirectoryReuseSourceValidationVersion: 1, campaignDirectoryReuseGeneration: "directory-g1",
       campaignDirectoryReuseRequestedAt: "2026-09-18T18:00:00.000Z",
       campaignDirectoryReuseRevision: revision,
       campaignDirectoryReuseCampaignCount: 2_500,
     },
     continuation: { driverPhase: "execute", jobContinuation: {
-      collectorVersion: "campaigns-v13", scanRunId: generation, scanStartedAt: requestedAt,
+      sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: generation, scanStartedAt: requestedAt,
       phase: "segment", campaignMode: "catchup", directorySourceExhausted: true,
       campaignPagesComplete: true, truncated: false, totalCampaignCount: 2_500,
       campaignBatchCount: 0, claimerBatchCount: 0, segmentCursor: null,
@@ -40,7 +40,7 @@ function reuseDb() {
   const state = {
     status: "PARTIAL", mode: "catchup", activeGeneration: "prior-tranche", activeRequestedAt: new Date("2026-09-18T19:00:00.000Z"),
     fanValueCoverageScanRunId: "prior-tranche", fanValueExpected: 10, fanValueFreshnessStatus: "COMPLETE",
-    campaignDirectoryGeneration: "directory-g1", campaignDirectoryRequestedAt: directoryRequestedAt,
+    campaignDirectorySourceValidationVersion: 1, campaignDirectoryGeneration: "directory-g1", campaignDirectoryRequestedAt: directoryRequestedAt,
     campaignDirectoryVerifiedAt: new Date("2026-09-18T18:05:00.000Z"), campaignDirectoryRevision: 7, campaignDirectoryCampaignCount: 2_500,
     campaignFrontierPlanRunId: "prior-tranche", campaignFrontierFreshnessStatus: "PARTIAL",
     campaignFrontierDueCount: 120, campaignFrontierTargetCount: 50, campaignFrontierCompletedCount: 50, campaignFrontierDeferredCount: 70,
@@ -51,6 +51,7 @@ function reuseDb() {
   let upserts = 0;
   const db = {
     async $executeRawUnsafe(sql) {
+      if (sql === "SET CONSTRAINTS ALL IMMEDIATE") return 1;
       if (["campaign_observation_version", "campaign_directory_count_version", "campaign_traversal_authority_version"]
         .some(marker => sql.startsWith(`SELECT set_config('onlinod.${marker}', '1', true)`))) return 1;
       assert.match(sql, /pg_advisory_xact_lock/); return 1;
@@ -110,6 +111,7 @@ test("INT5.9A-9 same SCANNING Campaign generation is replay, not destructive rei
   };
   const db = {
     async $executeRawUnsafe(sql) {
+      if (sql === "SET CONSTRAINTS ALL IMMEDIATE") return 1;
       if (["campaign_observation_version", "campaign_directory_count_version", "campaign_traversal_authority_version"]
         .some(marker => sql.startsWith(`SELECT set_config('onlinod.${marker}', '1', true)`))) return 1;
       assert.match(sql, /pg_advisory_xact_lock/); return 1;
@@ -118,7 +120,7 @@ test("INT5.9A-9 same SCANNING Campaign generation is replay, not destructive rei
     upsert: async () => { upserts += 1; throw new Error("must not reinitialize current SCANNING generation"); },
   } };
   const job = { id: "job-same", creatorId: "creator-1", agencyId: "agency-1", params: {
-    collectionContractVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: "run-same",
+    collectionContractVersion: 1, sourceValidationVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: "run-same",
     collectionRequestedAt: "2026-09-18T20:00:00.000Z", collectionMode: "catchup",
   } };
   const result = await acceptCampaignGeneration({ db: commitDatabaseFixture(db), job });
@@ -132,7 +134,7 @@ test("INT5.9A-9 drains next frontier tranche from exact prior directory generati
   const harness = reuseDb();
   const job = campaignJob();
   const result = await loadCampaignDirectorySegment({ db: commitDatabaseFixture(harness.db), job, chunk: {
-    kind: "campaign_directory_segment", schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "run-a9", cursor: null,
+    kind: "campaign_directory_segment", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-a9", cursor: null,
   } });
   assert.equal(result.campaignDirectorySegment.totalCampaignCount, 2_500);
   assert.equal(result.campaignDirectorySegment.campaigns.length, 50);
@@ -153,7 +155,7 @@ test("INT5.9A-9 stale directory revision fails before activating/resetting a new
   const harness = reuseDb();
   const job = campaignJob({ revision: 6 });
   await assert.rejects(() => loadCampaignDirectorySegment({ db: commitDatabaseFixture(harness.db), job, chunk: {
-    kind: "campaign_directory_segment", schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "run-a9", cursor: null,
+    kind: "campaign_directory_segment", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13", scanRunId: "run-a9", cursor: null,
   } }), (error) => error?.code === "CAMPAIGN_DIRECTORY_REUSE_STALE");
   assert.equal(harness.state.activeGeneration, "prior-tranche");
   assert.equal(harness.upserts, 0);
@@ -164,7 +166,7 @@ test("INT5.9A-9 legacy directory reuse stays scoped; offline recovery explicitly
   const source = read("src/services/creator-analytics-sync-orchestrator.js");
   assert.match(source, /function campaignDirectoryReuseBinding\(state, now = new Date\(\)\)/);
   assert.match(source, /campaignDirectoryDiscoveryDue\(state, now\)/);
-  assert.match(source, /campaignDirectoryReuseGeneration: generation/);
+  assert.match(source, /campaignDirectoryReuseSourceValidationVersion: 1,\s+campaignDirectoryReuseGeneration: generation/);
   assert.match(source, /campaignDirectoryReuseBinding\(currentCollectorState, now\)/);
   assert.match(source, /params\.recoveryIntentId[\s\S]*campaigns_offline_recovery/);
 });
@@ -173,7 +175,7 @@ test("INT5.9A-9 legacy directory reuse stays scoped; offline recovery explicitly
 test("INT5.9A-9 stale reuse claimer write fails before collection generation acceptance", async () => {
   let stateUpserts = 0;
   const state = {
-    campaignDirectoryGeneration: "directory-g1",
+    campaignDirectorySourceValidationVersion: 1, campaignDirectoryGeneration: "directory-g1",
     campaignDirectoryRequestedAt: new Date("2026-09-18T18:00:00.000Z"),
     campaignDirectoryVerifiedAt: new Date("2026-09-18T18:05:00.000Z"),
     campaignDirectoryRevision: 7,
@@ -185,6 +187,7 @@ test("INT5.9A-9 stale reuse claimer write fails before collection generation acc
   const db = {
     analyticsIngestBatch: { findUnique: async () => null },
     async $executeRawUnsafe(sql) {
+      if (sql === "SET CONSTRAINTS ALL IMMEDIATE") return 1;
       if (["campaign_observation_version", "campaign_directory_count_version", "campaign_traversal_authority_version"]
         .some(marker => sql.startsWith(`SELECT set_config('onlinod.${marker}', '1', true)`))) return 1;
       assert.match(sql, /pg_advisory_xact_lock/); return 1;
@@ -200,7 +203,7 @@ test("INT5.9A-9 stale reuse claimer write fails before collection generation acc
   const job = campaignJob({ revision: 6 });
   await assert.rejects(() => ingestCampaignChunk({ db: commitDatabaseFixture(db), job, deviceId: "device-1", chunk: {
     kind: "campaign_claimers_page", batchKey: "run:run-a9:claimers:campaign-1:0",
-    scanRunId: "run-a9", schemaVersion: 4, collectorVersion: "campaigns-v13",
+    scanRunId: "run-a9", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13",
     externalCampaignId: "campaign-1", scannerRejected: 0, claimers: [],
   } }), (error) => error?.code === "CAMPAIGN_DIRECTORY_REUSE_STALE");
   assert.equal(stateUpserts, 0);
@@ -210,7 +213,7 @@ test("INT5.9A-9 stale reuse claimer write fails before collection generation acc
 test("INT5.9A-9 non-target claimer write fails before collection generation acceptance", async () => {
   let stateUpserts = 0;
   const state = {
-    campaignDirectoryGeneration: "directory-g1",
+    campaignDirectorySourceValidationVersion: 1, campaignDirectoryGeneration: "directory-g1",
     campaignDirectoryRequestedAt: new Date("2026-09-18T18:00:00.000Z"),
     campaignDirectoryVerifiedAt: new Date("2026-09-18T18:05:00.000Z"),
     campaignDirectoryRevision: 7,
@@ -222,6 +225,7 @@ test("INT5.9A-9 non-target claimer write fails before collection generation acce
   const db = {
     analyticsIngestBatch: { findUnique: async () => null },
     async $executeRawUnsafe(sql) {
+      if (sql === "SET CONSTRAINTS ALL IMMEDIATE") return 1;
       if (["campaign_observation_version", "campaign_directory_count_version", "campaign_traversal_authority_version"]
         .some(marker => sql.startsWith(`SELECT set_config('onlinod.${marker}', '1', true)`))) return 1;
       assert.match(sql, /pg_advisory_xact_lock/); return 1;
@@ -237,7 +241,7 @@ test("INT5.9A-9 non-target claimer write fails before collection generation acce
   const job = campaignJob();
   await assert.rejects(() => ingestCampaignChunk({ db: commitDatabaseFixture(db), job, deviceId: "device-1", chunk: {
     kind: "campaign_claimers_page", batchKey: "run:run-a9:claimers:campaign-1:0",
-    scanRunId: "run-a9", schemaVersion: 4, collectorVersion: "campaigns-v13",
+    scanRunId: "run-a9", schemaVersion: 4, sourceValidationVersion: 1, collectorVersion: "campaigns-v13",
     externalCampaignId: "campaign-1", scannerRejected: 0, claimers: [],
   } }), (error) => error?.code === "CAMPAIGN_FRONTIER_NOT_TARGETED");
   assert.equal(stateUpserts, 0);

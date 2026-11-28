@@ -22,7 +22,7 @@ test("INT5.9A-8 decouples provider traversal success from delegated FanData fres
 test("current traversal debt and global FanData debt retain separate freshness decisions", () => {
   const { evaluateCampaignCollectionState } = require("./campaign-freshness-service");
   const now = new Date("2026-10-04T12:00:00Z");
-  const state = {status:"PARTIAL", membershipBaselineVerifiedAt:now, membershipBaselineObservedAt:now, membershipBaselineGeneration:"g",
+  const state = {membershipBaselineSourceValidationVersion:1,campaignDirectorySourceValidationVersion:1,status:"PARTIAL", membershipBaselineVerifiedAt:now, membershipBaselineObservedAt:now, membershipBaselineGeneration:"g",
     activeGeneration:"g",campaignFrontierPlanRunId:"g",campaignFrontierObservationVersion:1,
     campaignFrontierFreshnessStatus:"COMPLETE",membershipCoverageStatus:"COMPLETE",campaignDirectoryGeneration:"d",
     campaignDirectoryRevision:1,campaignDirectoryRequestedAt:now,campaignDirectoryVerifiedAt:now,

@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v39_notification_upgrade_receipt_retention",
+  "version": "nod_current_v40_campaign_source_validation_and_traffic_currency",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -176,6 +176,10 @@
     {
       "migration": "20261128070000_notification_upgrade_receipt_retention",
       "checksum": "0e5a1acb349ad0b00c192823aab399da9fff5d4efae32fb1f8ece1e7b8a0b650"
+    },
+    {
+      "migration": "20261128080000_campaign_source_validation",
+      "checksum": "7cd2cae921d9afaef97eaa5b71c9cbbfaca984d1915080a8388c216777bbbb84"
     }
   ],
   "extension": {
@@ -3685,6 +3689,30 @@
         "udt_name": "int4",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CreatorCampaignCollectionState",
+        "name": "campaignDirectorySourceValidationVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorCampaignCollectionState",
+        "name": "membershipBaselineSourceValidationVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorCampaignCollectionState",
+        "name": "membershipCatchupSourceValidationVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
       }
     ],
     "enums": [],
@@ -6444,6 +6472,24 @@
         "options": "0 0",
         "expressions": null,
         "predicate": null
+      },
+      {
+        "table": "TrafficSource",
+        "name": "TrafficSource_cost_currency_v213",
+        "unique": false,
+        "keys": "4 5 17",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(\"costCents\" <> 0)"
+      },
+      {
+        "table": "TrafficSource",
+        "name": "TrafficSource_type_cost_currency_v213",
+        "unique": false,
+        "keys": "4 5 7 17",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": "(\"costCents\" <> 0)"
       }
     ]
   }

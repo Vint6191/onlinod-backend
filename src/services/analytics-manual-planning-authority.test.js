@@ -138,6 +138,7 @@ test("manual Campaign planning uses the same durable planning identity as automa
   assert.deepEqual(scheduled[0].dedupeParams, {
     planningEpoch: "none:none",
     collectionOrderingAfter: "none",
+    sourceValidationVersion: 1,
     collectionContractVersion: 1,
     collectionType: "CAMPAIGNS",
     collectionMode: "full",

@@ -87,7 +87,7 @@ async function finishEmptyCampaign(h, scope, expectedId) {
     const capabilities = Object.fromEntries(['creatorEventDrivenSyncV2', 'campaignCausalObservationV1',
       'campaignServerFanRefreshV1', 'campaignResumablePaginationV1', 'campaignFreshnessCoverageV1',
       'campaignOrderIndependentTraversalV1', 'campaignSegmentedFairTraversalV1', 'campaignFrontierSchedulingV1',
-      'campaignDirectoryReuseV1', 'campaignBoundedTraversalV1', 'campaignTraversalAuthorityV1', 'campaignFairPagesV1'].map(k => [k, true]));
+      'campaignDirectoryReuseV1', 'campaignBoundedTraversalV1', 'campaignTraversalAuthorityV1', 'campaignFairPagesV1', 'campaignSourceValidationV1'].map(k => [k, true]));
     const claimed = await h.lease.claimJob({ userId: scope.userId, deviceId: scope.deviceId, jobKeys: ['fetch_campaigns'], capabilities });
     assert.equal(claimed.job?.id, expectedId, JSON.stringify(claimed));
     const job = claimed.job, credentials = { jobId: job.id, userId: scope.userId, deviceId: scope.deviceId,

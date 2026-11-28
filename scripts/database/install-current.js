@@ -145,6 +145,33 @@ function validateConfiguration(args = process.argv.slice(2), env = process.env) 
   }
   return { installationUrl: env.DATABASE_URL, connectionSetting: "DATABASE_URL" };
 }
+
+async function installAnalyticsTrafficIndexes(installationUrl) {
+  // Concurrent index builds must use autocommit on the direct installation
+  // connection. A single physical session also owns the deployment lock for
+  // the whole check/build/verify sequence, including simultaneous installers.
+  const url = new URL(installationUrl);
+  url.searchParams.set("connection_limit", "1");
+  const db = new PrismaClient({ datasources: { db: { url: url.toString() } } });
+  let primary, result;
+  try {
+    await db.$connect();
+    await db.$executeRawUnsafe("SET lock_timeout='5s'");
+    await db.$executeRawUnsafe("SET statement_timeout='10min'");
+    const trafficIndexes = require("./analytics-traffic-indexes");
+    await trafficIndexes.acquireBuildLock(db);
+    result = await trafficIndexes.ensureIndexes(db, { create: true });
+  } catch (error) { primary = error; }
+  finally {
+    // Disconnect releases the session lock even after a failed build. An
+    // invalid existing index remains explicit operator-visible repair work.
+    try { await db.$disconnect(); }
+    catch (error) { primary = preservePrimaryFailure(primary, error, { phase: "DATABASE_DISCONNECT", domain: "core" }); }
+  }
+  if (primary) throw primary;
+  return result;
+}
+
 async function main(args = process.argv.slice(2)) {
   let phase = "CONFIGURATION", deployment, db, primary, result, connection;
   try {
@@ -166,10 +193,12 @@ async function main(args = process.argv.slice(2)) {
     phase = "CORE_DEPLOY";
     console.log(JSON.stringify({ phase, domain: "core", status: "STARTED", connectionSetting: connection.connectionSetting }));
     await deploy(deployment.schemaPath, connection.installationUrl);
+    phase = "CORE_ONLINE_INDEXES";
+    const indexes = await installAnalyticsTrafficIndexes(connection.installationUrl);
     phase = "CORE_VERIFY";
     await db.$connect();
     await assertDatabaseContract(db);
-    result = { ok: true, domain: "core", ...installation, version: currentContract().version };
+    result = { ok: true, domain: "core", ...installation, version: currentContract().version, indexes };
   } catch (error) {
     primary = annotateFailure(error, { phase, domain: "core", connectionSetting: connection?.connectionSetting });
   } finally {
@@ -186,5 +215,5 @@ async function main(args = process.argv.slice(2)) {
   console.log(JSON.stringify(result));
   return result;
 }
-module.exports = { prepareDeployment, inspectInstallation, resetLegacyTestDatabase, validateConfiguration, main, reportFailure };
+module.exports = { prepareDeployment, inspectInstallation, resetLegacyTestDatabase, validateConfiguration, installAnalyticsTrafficIndexes, main, reportFailure };
 if (require.main === module) main().catch(error => { reportFailure(error); process.exitCode = 1; });

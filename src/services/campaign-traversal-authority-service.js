@@ -4,6 +4,7 @@ const { isDeepStrictEqual } = require("node:util");
 const { observationStartForJob } = require("./analytics-observation-time");
 
 const fairPages = require("./campaign-fair-pages-service");
+const sourceValidation = require("./campaign-source-validation-authority-service");
 const VERSION = 1;
 const object = value => value && typeof value === "object" && !Array.isArray(value) ? value : {};
 const { CampaignTraversalError } = require("./campaign-traversal-errors");
@@ -31,20 +32,20 @@ function integer(value, code = "CAMPAIGN_PAGE_POSITION_INVALID") {
 const CURSOR_FIELDS = ["collectorVersion", "scanRunId", "scanStartedAt", "phase", "campaignMode", "offset", "page", "campaigns",
   "segmentCursor", "segmentRequestCursor", "segmentHasMore", "campaignIndex", "claimerOffset", "claimerPage", "claimerRejected",
   "directorySourceExhausted", "campaignPagesComplete", "truncated", "totalCampaignCount", "segmentTargetCount",
-  "campaignBatchCount", "claimerBatchCount", "campaignScannerRejected", "claimerScannerRejected", "fairPagesVersion"];
+  "campaignBatchCount", "claimerBatchCount", "campaignScannerRejected", "claimerScannerRejected", "fairPagesVersion", "sourceValidationVersion"];
 function state(job) {
   const driver = envelope(job.continuation);
   if (driver.driverPhase !== "execute") throw fault("CAMPAIGN_TRAVERSAL_ALREADY_COMPLETE");
   const raw = object(driver.jobContinuation), params = object(job.params);
-  const initial = { ...(fairPages.enabled(job) ? { fairPagesVersion: 1 } : {}), collectorVersion: "campaigns-v13", scanRunId: params.collectionGeneration,
+  sourceValidation.assertCurrent(job, params);
+  const initial = { sourceValidationVersion: sourceValidation.VERSION, ...(fairPages.enabled(job) ? { fairPagesVersion: 1 } : {}), collectorVersion: "campaigns-v13", scanRunId: params.collectionGeneration,
     scanStartedAt: new Date(params.collectionRequestedAt).toISOString(), phase: "campaigns",
     campaignMode: params.collectionMode === "catchup" ? "catchup" : "full", offset: 0, page: 0, campaigns: [],
     segmentCursor: null, segmentRequestCursor: null, segmentHasMore: false, campaignIndex: 0, claimerOffset: 0, claimerPage: 0, claimerRejected: 0,
     directorySourceExhausted: false, campaignPagesComplete: false, truncated: false, totalCampaignCount: 0,
     campaignBatchCount: 0, claimerBatchCount: 0, campaignScannerRejected: 0, claimerScannerRejected: 0 };
-  // Upgrading a leased legacy continuation is safe: existing pages retain the
-  // older job observation bound until a genuinely new campaign begins.
-  if (!raw.collectorVersion || raw.collectorVersion !== "campaigns-v13") return initial;
+  if (driver.jobContinuation == null) return initial;
+  if (raw.collectorVersion !== "campaigns-v13") throw fault("CAMPAIGN_SOURCE_VALIDATION_CHECKPOINT_INVALID");
   if (raw.fairPagesVersion !== initial.fairPagesVersion) throw fault("CAMPAIGN_FAIR_PROTOCOL_MISMATCH");
   if (raw.collectorVersion !== initial.collectorVersion || raw.scanRunId !== initial.scanRunId
     || raw.scanStartedAt !== initial.scanStartedAt) throw fault("CAMPAIGN_TRAVERSAL_GENERATION_MISMATCH");
@@ -90,7 +91,7 @@ function compareState(expected, requested) {
 function compareCompletion(expected, requested) {
   if (requested.driverPhase !== "complete") throw fault("CAMPAIGN_COMPLETION_TRANSITION_INVALID");
   const result = object(requested.result);
-  const proof = { schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: expected.scanRunId,
+  const proof = { sourceValidationVersion: sourceValidation.VERSION, schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: expected.scanRunId,
     scanStartedAt: expected.scanStartedAt, campaignMode: expected.campaignMode,
     campaignPagesComplete: expected.directorySourceExhausted && expected.campaignPagesComplete && expected.campaignScannerRejected === 0,
     claimersComplete: expected.directorySourceExhausted && !expected.truncated && expected.claimerScannerRejected === 0,
@@ -102,6 +103,7 @@ function compareCompletion(expected, requested) {
 function assertProgress(job, chunk, continuation) {
   if (!enabled(job)) return;
   const current = state(job), next = envelope(continuation), payload = object(chunk);
+  if (chunk != null) sourceValidation.assertCurrent(job, payload);
   if (payload.kind === "campaigns_page") {
     const count = pageCount(payload, "campaigns");
     if (current.phase !== "campaigns" || payload.pageNumber !== current.page + 1 || payload.sourceOffset !== current.offset) throw fault("CAMPAIGN_DIRECTORY_POSITION_STALE");
@@ -178,4 +180,24 @@ function assertCompletion(job, result) {
   if (current.driverPhase !== "complete" || !isDeepStrictEqual(current.result, result)) throw fault("CAMPAIGN_DURABLE_COMPLETION_REQUIRED");
 }
 
-module.exports = { CampaignTraversalError, VERSION, enabled, envelope, expectedMatches, currentPage, assertPage, assertProgress, canCompletePage, beginRead, observation, assertCompletion };
+function directoryProgress(job, chunk, requested, effect) {
+  if (!enabled(job) || effect?.replay === true || effect?.superseded === true) return null;
+  const next = envelope(requested);
+  if (next.driverPhase !== "execute" || next.jobContinuation?.phase !== "campaigns") return null;
+  const prior = object(envelope(job.continuation).jobContinuation).directoryNoProgressPages;
+  let stalled = Number.isSafeInteger(prior) && prior >= 0 ? prior : 0;
+  if (chunk?.kind === "campaigns_page" && chunk.sourceHasMore === true
+      && Number.isSafeInteger(effect?.directorySourceProgress)) {
+    stalled = effect.directorySourceProgress > 0 ? 0 : stalled + 1;
+    // Overlapping unordered pages can be legitimate. Three consecutive pages
+    // with no new identity in this exact run cannot advance discovery. Reject
+    // this transaction so retries retain the last accepted cursor and ordinary
+    // failure budget, rather than minting another receipt or a complete proof.
+    if (stalled >= 3) throw Object.assign(fault("CAMPAIGN_DIRECTORY_STALLED"), { retryable: false });
+  }
+  // A provider-free yield, keepalive or an older Desktop may omit this field.
+  // Always rebuild it from server state; client JSON cannot reset the budget.
+  return { ...next, jobContinuation: { ...next.jobContinuation, directoryNoProgressPages: stalled } };
+}
+
+module.exports = { CampaignTraversalError, VERSION, enabled, envelope, expectedMatches, currentPage, assertPage, assertProgress, canCompletePage, beginRead, observation, assertCompletion, directoryProgress };

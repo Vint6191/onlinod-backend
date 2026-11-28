@@ -16,7 +16,7 @@ const campaignControl = require("./campaign-scan-control-service");
 
 function directoryState(overrides = {}) {
   return {
-    campaignDirectoryGeneration: "directory-g1",
+    campaignDirectorySourceValidationVersion: 1, campaignDirectoryGeneration: "directory-g1",
     campaignDirectoryRequestedAt: new Date("2026-09-18T00:00:00.000Z"),
     campaignDirectoryVerifiedAt: new Date("2026-09-18T01:00:00.000Z"),
     campaignDirectoryRevision: 4,
@@ -38,7 +38,7 @@ test("INT5.9A-10 frontier due can reuse a fresh directory while pending discover
   assert.equal(orchestrator.campaignFrontierWorkDue(state, now), true);
   assert.equal(orchestrator.campaignDirectoryDiscoveryDue(state, now), false);
   assert.deepEqual(orchestrator.campaignDirectoryReuseBinding(state, now), {
-    campaignDirectoryReuseGeneration: "directory-g1",
+    campaignDirectoryReuseSourceValidationVersion: 1, campaignDirectoryReuseGeneration: "directory-g1",
     campaignDirectoryReuseRequestedAt: "2026-09-18T00:00:00.000Z",
     campaignDirectoryReuseRevision: 4,
     campaignDirectoryReuseCampaignCount: 2_000,
@@ -130,7 +130,7 @@ test("INT5.9A-10 explicit manual FULL immediately invalidates an active provider
     status: "CLAIMED", priority: 50, createdAt: new Date("2026-09-19T00:00:00.000Z"),
     params: {
       campaignDirectoryReuseVersion: 1,
-      campaignDirectoryReuseGeneration: "directory-g1",
+      campaignDirectoryReuseSourceValidationVersion: 1, campaignDirectoryReuseGeneration: "directory-g1",
       collectionMode: "catchup",
     },
   };

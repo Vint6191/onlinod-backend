@@ -44,6 +44,38 @@ async function revenue(db, scope, kind, ids, range) {
       AND "period">=$5 AND "period"<$6 GROUP BY "objectId"`, scope.agencyId, scope.id, kind, ids, range.startAt.slice(0, 10), range.endAt.slice(0, 10));
   return new Map(rows.map(r => [r.objectId, { revenueCents: num(r.revenue), paidSubscriptions: num(r.count) }]));
 }
+async function costCurrencies(db, scope, types) {
+  // Two index seeks prove whether all nonzero costs share a currency. DISTINCT
+  // would scan every source of the first currency before proving exhaustion.
+  // Type witnesses are batched; their cardinality is bounded by the type page.
+  const [total, groups] = await Promise.all([
+    db.$queryRawUnsafe(`/* traffic-cost-currencies:total */
+      SELECT first.currency, second.currency AS "otherCurrency" FROM (
+        SELECT "currency" FROM "TrafficSource" WHERE "agencyId"=$1 AND "creatorId"=$2 AND "costCents"<>0
+        ORDER BY "currency" LIMIT 1
+      ) first LEFT JOIN LATERAL (
+        SELECT "currency" FROM "TrafficSource" WHERE "agencyId"=$1 AND "creatorId"=$2 AND "costCents"<>0 AND "currency">first.currency
+        ORDER BY "currency" LIMIT 1
+      ) second ON true`, scope.agencyId, scope.id),
+    types.length ? db.$queryRawUnsafe(`/* traffic-cost-currencies:types */
+      SELECT kinds.kind, first.currency, second.currency AS "otherCurrency" FROM unnest($3::text[]) AS kinds(kind)
+      LEFT JOIN LATERAL (
+        SELECT "currency" FROM "TrafficSource" WHERE "agencyId"=$1 AND "creatorId"=$2 AND "sourceType"=kinds.kind AND "costCents"<>0
+        ORDER BY "currency" LIMIT 1
+      ) first ON true LEFT JOIN LATERAL (
+        SELECT "currency" FROM "TrafficSource" WHERE "agencyId"=$1 AND "creatorId"=$2 AND "sourceType"=kinds.kind AND "costCents"<>0 AND "currency">first.currency
+        ORDER BY "currency" LIMIT 1
+      ) second ON true`, scope.agencyId, scope.id, types) : [],
+  ]);
+  return { total: total[0], types: new Map(groups.map(row => [row.kind, row])) };
+}
+function costDto(metrics, currencies) {
+  const mixed = currencies?.otherCurrency != null;
+  const invalid = currencies?.currency != null && !/^[A-Z]{3}$/.test(currencies.currency);
+  const costUnavailableReason = mixed ? "MIXED_CURRENCIES" : invalid ? "COST_CURRENCY_INVALID" : null;
+  return { costCents: costUnavailableReason ? null : num(metrics?.costCents),
+    costCurrency: costUnavailableReason ? null : currencies?.currency || "USD", costUnavailableReason };
+}
 async function freshness(db, creator, now) {
   const state = await db.trafficProjectionBackfill.findUnique({ where: { creatorId: creator.id } });
   const pending = await db.domainWorkItem.findFirst({ where: { agencyId: creator.agencyId, creatorId: creator.id,
@@ -68,10 +100,16 @@ async function readSnapshot(db, input, reader) {
 }
 function rowFor(source, value = {}, rev = {}) {
   const cost = num(source.costCents), money = num(rev.revenueCents);
+  // Provider revenue/value is USD; manual costs retain their own currency.
+  // There is no FX authority here, so unlike amounts cannot form a valid ROI.
+  const costCurrency = /^[A-Z]{3}$/.test(source.currency || '') ? source.currency : null;
+  const roiUnavailableReason = cost <= 0 ? "NO_COST" : !costCurrency ? "COST_CURRENCY_INVALID" : costCurrency !== "USD" ? "COST_CURRENCY_MISMATCH" : null;
+  const comparableCost = roiUnavailableReason === null;
   return { ...source, bucket: "tracked_source", sourceLabel: source.sourceType === "of_campaign" ? "OF campaign / trial" : source.sourceType,
     claimers: num(value.sourceMembers), ...seed(), ...value, paidSubscriptions: num(rev.paidSubscriptions), revenueCents: money,
-    roiPercent: cost ? (money - cost) / cost * 100 : null,
-    valueRoiPercent: cost ? (num(value.fanValueCents) - cost) / cost * 100 : null };
+    costCurrency, roiUnavailableReason,
+    roiPercent: comparableCost ? (money - cost) / cost * 100 : null,
+    valueRoiPercent: comparableCost ? (num(value.fanValueCents) - cost) / cost * 100 : null };
 }
 
 async function getTrafficOverview(input) {
@@ -83,7 +121,10 @@ async function getTrafficOverview(input) {
     const values = await lifetime(db, creator, "source", ids), receipts = await revenue(db, creator, "source", ids, range);
     const total = (await lifetime(db, creator, "total", [""])).get("") || {}, totalRevenue = (await revenue(db, creator, "total", [""], range)).get("") || {};
     const typeRows = await db.trafficMetric.findMany({ where: { agencyId: creator.agencyId, creatorId: creator.id, kind: "type", period: "*" }, orderBy: { objectId: "asc" }, take: 65 });
-    const types = typeRows.slice(0, 64), typeRevenue = await revenue(db, creator, "type", types.map(r => r.objectId), range);
+    const types = typeRows.slice(0, 64);
+    const [typeRevenue, currencies] = await Promise.all([
+      revenue(db, creator, "type", types.map(r => r.objectId), range), costCurrencies(db, creator, types.map(r => r.objectId)),
+    ]);
     const unknown = receipts.get("") || {};
     const rows = visible.map(s => rowFor(s, values.get(s.id), receipts.get(s.id)));
     const unknownSource = { id: UNKNOWN, sourceType: "paid_unknown", externalId: "unattributed", name: "Paid subscriptions · unknown source", costCents: 0, isUnattributed: true };
@@ -91,12 +132,12 @@ async function getTrafficOverview(input) {
     if (!after && !offset && num(unknown.paidSubscriptions)) rows.unshift(unattributed);
     const lastTrafficJob = await db.jobInstance.findFirst({ where: { agencyId: creator.agencyId, creatorId: creator.id, jobKey: "fetch_campaigns" },
       orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { id: true, status: true, attempts: true, createdAt: true, completedAt: true, lastError: true, progress: true } });
-    return { range, totals: { ...seed(), ...total, subscriptionRevenueCents: num(totalRevenue.revenueCents),
+    return { range, totals: { ...seed(), ...total, ...costDto(total, currencies.total), subscriptionRevenueCents: num(totalRevenue.revenueCents),
       paidSubscriptions: num(totalRevenue.paidSubscriptions), sources: num(total.sources), sourceMembers: num(total.sourceMembers),
       unattributedRevenueCents: num(unknown.revenueCents), unattributedPaidSubscriptions: num(unknown.paidSubscriptions),
       trackedRevenueCents: num(totalRevenue.revenueCents) - num(unknown.revenueCents),
       trackedPaidSubscriptions: num(totalRevenue.paidSubscriptions) - num(unknown.paidSubscriptions) },
-    sources: rows, unattributed, buckets: types.map(r => ({ key: r.objectId, label: r.objectId, ...metricNumbers(r.metrics), claimers: num(r.metrics.sourceMembers),
+    sources: rows, unattributed, buckets: types.map(r => ({ key: r.objectId, label: r.objectId, ...metricNumbers(r.metrics), ...costDto(r.metrics, currencies.types.get(r.objectId)), claimers: num(r.metrics.sourceMembers),
       revenueCents: num(typeRevenue.get(r.objectId)?.revenueCents), paidSubscriptions: num(typeRevenue.get(r.objectId)?.paidSubscriptions) })),
     bucketsTruncated: typeRows.length > 64, lastTrafficJob,
     pagination: { limit: take, offset, hasMore: sources.length > take, nextCursor: sources.length > take ? visible.at(-1).id : null, total: num(total.sources) } };

@@ -21,6 +21,10 @@ const messages = {
   NONCONTIGUOUS_BASELINE_RECEIPTS: "A later migration is recorded while an earlier receipt is missing. Review migration history before retrying.",
   BASELINE_DEPLOY_FAILED: "Prisma migration deployment failed. Use the named stage, Prisma code and SQLSTATE below to diagnose it; completed database stages can be retried safely after correction.",
   DATABASE_CONTRACT_REQUIRED: "The installed core schema or required controls differ from this release. Review the schema contract and recorded migration history; no automatic reset was performed.",
+  ANALYTICS_TRAFFIC_INDEX_INVALID: "An existing Analytics/Traffic index differs from the required definition or is not valid. Inspect that index before retrying; the installer does not drop existing indexes automatically.",
+  ANALYTICS_TRAFFIC_INDEX_REQUIRED: "A required Analytics/Traffic index is missing. Run the current production installer before starting the backend.",
+  ANALYTICS_TRAFFIC_INDEX_BUILD_INVALID: "An Analytics/Traffic online index build did not produce the required valid index. Inspect the build and retry after resolving its cause.",
+  ANALYTICS_TRAFFIC_INDEX_LOCK_BUSY: "Another Analytics/Traffic index installer still owns the deployment lock. Wait for that installation to finish and retry.",
   CONVERSATION_DATABASES_NOT_CONFIGURED: "Set both DIALOGS_DATABASE_URL and CRM_DATABASE_URL, or omit both when conversation storage is not configured.",
   CONVERSATION_DATABASES_MUST_BE_SEPARATE: "Core, Dialogs and CRM must use distinct databases. Correct the connection configuration before retrying.",
   CONVERSATION_DATABASE_URL_INVALID: "A conversation connection is not a valid PostgreSQL URL. Check the named store's connection setting.",
@@ -75,7 +79,7 @@ const sqlCodes = {
   "0A000": "DATABASE_SERVER_INCOMPATIBLE",
 };
 const domains = new Set(["core", "dialogs", "crm", "conversation"]);
-const phases = new Set(["CONFIGURATION", "SOURCE_PREPARATION", "CORE_CONNECT", "CORE_INSPECT", "CORE_LEGACY_RESET", "CORE_DEPLOY", "CORE_VERIFY",
+const phases = new Set(["CONFIGURATION", "SOURCE_PREPARATION", "CORE_CONNECT", "CORE_INSPECT", "CORE_LEGACY_RESET", "CORE_DEPLOY", "CORE_ONLINE_INDEXES", "CORE_VERIFY",
   "CONVERSATION_PREFLIGHT", "CONVERSATION_INSTALL", "CONVERSATION_VERIFY", "DATABASE_DISCONNECT", "SOURCE_CLEANUP", "INSTALL_COMPLETE"]);
 const own = (object, key) => typeof key === "string" && Object.prototype.hasOwnProperty.call(object, key);
 const isPrismaCode = value => typeof value === "string" && /^P\d{4}$/.test(value);

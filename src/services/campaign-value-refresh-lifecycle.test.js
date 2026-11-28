@@ -10,6 +10,20 @@ const context={module:{exports:{}},require:createRequire(file),__dirname,Date,Bu
 vm.runInNewContext(fs.readFileSync(file,'utf8').split('\ntest("')[0]+'\nmodule.exports=queueHarness;',context);
 const harness=context.module.exports,start=new Date('2026-10-03T00:00:00Z');
 const input=h=>({db:h.db,planner:h.planner,job:{id:'campaign-job',agencyId:'agency-1',creatorId:'creator-1'},scanRunId:'run-1',scanStartedAt:start,now:start});
+test('a first empty claimer page initializes the zero-count coverage already assigned by generation acceptance',async()=>{
+ const h=harness();h.coverage.fanValueCoverageScanRunId='run-1';
+ assert.equal(h.coverage.fanValueFreshnessStatus,'MISSING');
+ const r=await enqueue({...input(h),candidates:[]});
+ assert.equal(r.expected,0);assert.equal(h.coverage.fanValueExpected,0);assert.equal(h.coverage.fanValueFreshnessStatus,'COMPLETE');
+ assert.equal(h.jobsByKey.size,0);assert.equal(h.demands.size,0);assert.equal(h.work.size,0);
+});
+for(const status of ['QUEUED','PARTIAL'])test('an empty later claimer page preserves existing '+status+' coverage',async()=>{
+ const h=harness();Object.assign(h.coverage,{fanValueCoverageScanRunId:'run-1',fanValueFreshnessStatus:status,
+  fanValueExpected:1,fanValueQueued:1,fanValueOutstanding:status==='QUEUED'?1:0,fanValueUnavailable:status==='PARTIAL'?1:0});
+ await enqueue({...input(h),candidates:[]});
+ assert.equal(h.coverage.fanValueFreshnessStatus,status);assert.equal(h.coverage.fanValueExpected,1);
+ assert.equal(h.coverage.fanValueOutstanding,status==='QUEUED'?1:0);assert.equal(h.coverage.fanValueUnavailable,status==='PARTIAL'?1:0);
+});
 test('long traversal does not accept a newly encountered thirteen-hour-old value',async()=>{
  const h=harness(),r=await enqueue({...input(h),now:new Date(+start+8*3600000),candidates:[{onlyFansUserId:'fan',valueObservedAt:new Date(+start-5*3600000)}]});
  assert.equal(r.alreadyFresh,0);assert.equal(r.queued,1);assert.equal(h.jobsByKey.size,1);
