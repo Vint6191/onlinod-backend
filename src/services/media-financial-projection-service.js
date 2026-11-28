@@ -331,7 +331,11 @@ async function processPage({ db, item, ownerToken }) {
 }
 
 async function financialProjectionState(db, creatorId) {
-  const [row] = await db.$queryRawUnsafe(`SELECT
+  const [row] = await db.$queryRawUnsafe(`WITH usd_scope AS (
+      SELECT (SELECT "activeGeneration" FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1) AS generation)
+    SELECT
+    (${require("./usd-money-read-authority").unsupportedLedgerCurrencySql('$1', 'usd_scope.generation')}
+      OR EXISTS(SELECT 1 FROM "CreatorSale" WHERE "creatorId"=$1 AND currency IS DISTINCT FROM 'USD')) AS "unsupportedCurrency",
     EXISTS(SELECT 1 FROM "CreatorMediaMessageEvidence" WHERE "creatorId"=$1 AND (dirty OR "pendingFacts")) AS "evidencePending",
     (EXISTS(SELECT 1 FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty)
       OR EXISTS(SELECT 1 FROM "CreatorMediaMessageEvidence" WHERE "creatorId"=$1 AND (dirty OR "pendingFacts"))
@@ -340,12 +344,14 @@ async function financialProjectionState(db, creatorId) {
     OR EXISTS(SELECT 1 FROM "CreatorMediaUsageSourceState" WHERE "creatorId"=$1 AND "factProtocol"=0)
     OR EXISTS(SELECT 1 FROM "MaintenanceLaneState" m WHERE m.key=$2 AND m."completedAt" IS NULL
       AND $1<=m.cursor->>'upperId' AND NOT EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1))
-    ) AS available`, creatorId, ADOPTION_KEY);
+    ) AS available FROM usd_scope`, creatorId, ADOPTION_KEY);
   // Evidence correction can redistribute or retract existing attachment
   // amounts across several bounded commits. A partially repaired sum is never
   // an available canonical amount, even while the previous counters remain.
-  const available = row?.available === true && row?.evidencePending !== true;
-  return { available, ready: available && row?.pending === false, pending: row?.pending === true };
+  const unsupportedCurrency = row?.unsupportedCurrency === true;
+  const available = row?.available === true && row?.evidencePending !== true && !unsupportedCurrency;
+  return { available, ready: available && row?.pending === false, pending: row?.pending === true,
+    ...(unsupportedCurrency ? { unsupportedCurrency: true, unavailableReason: "UNSUPPORTED_CURRENCY" } : {}) };
 }
 async function financialProjectionReady(db, creatorId) {
   return (await financialProjectionState(db, creatorId)).ready;

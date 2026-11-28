@@ -119,12 +119,16 @@ async function main() {
     result = await overview(); assert.equal(result.totals.subscriptionRevenueCents, 0); assert.equal(result.totals.paidSubscriptions, 0);
     await receipts.projectCanonicalSubscriptionReceipt({ db, job, fact }); await drain();
   });
-  await check('USD income cannot be divided by a cost stored in another currency without FX', async () => {
-    await setCost(newSource.id, 'EUR');
+  await check('Foreign cost writes are rejected and preserve the last authorized USD contribution', async () => {
+    await setCost(newSource.id, 'USD', 500);
+    const before = await db.trafficSource.findUnique({ where: { id: newSource.id } });
+    await assert.rejects(() => setCost(newSource.id, 'EUR'), /USD_CURRENCY_REQUIRED/);
+    const after = await db.trafficSource.findUnique({ where: { id: newSource.id } });
+    assert.equal(after.costRevision, before.costRevision);
     const result = await overview(), row = result.sources.find(item => item.id === newSource.id);
-    evidence.cases.foreignCurrency = row; evidence.cases.foreignCurrencyOverview = result;
-    assert.equal(row.currency, 'EUR'); assert.equal(row.revenueCents, 1000); assert.equal(row.costCents, 500);
-    assert.equal(row.roiPercent, null); assert.equal(row.valueRoiPercent, null);
+    evidence.cases.rejectedForeignCost = row; evidence.cases.usdAfterRejectedCost = result;
+    assert.equal(row.currency, 'USD'); assert.equal(row.revenueCents, 1000); assert.equal(row.costCents, 500);
+    assert.equal(row.roiPercent, 100); assert.equal(row.valueRoiPercent, 1700);
   });
   await check('USD source cost retains meaningful revenue and lifetime value ROI', async () => {
     await setCost(newSource.id, 'USD');
@@ -144,53 +148,57 @@ async function main() {
     assert.equal(new Set([...first.sources,...second.sources].map(row => row.id)).size, 2);
     assert.equal(first.totals.subscriptionRevenueCents, second.totals.subscriptionRevenueCents);
   });
-  await check('Mixed source currencies do not become one aggregated total or type cost', async () => {
-    await setCost(oldSource.id, 'USD', 500); await setCost(newSource.id, 'EUR', 700);
-    const result = await overview({ limit: 1 }); evidence.cases.mixedCosts = result;
-    assert.equal(result.totals.costCents, null); assert.equal(result.totals.costCurrency, null);
-    assert.equal(result.totals.costUnavailableReason, 'MIXED_CURRENCIES');
-    assert.equal(result.buckets[0].costCents, null); assert.equal(result.buckets[0].costUnavailableReason, 'MIXED_CURRENCIES');
+  await check('Rejected foreign source edits leave exact USD total and type costs across pages', async () => {
+    await setCost(oldSource.id, 'USD', 500); await setCost(newSource.id, 'USD', 700);
+    await assert.rejects(() => setCost(newSource.id, 'EUR', 1700), /USD_CURRENCY_REQUIRED/);
+    const result = await overview({ limit: 1 }); evidence.cases.usdCostsAfterRejectedEdit = result;
+    assert.equal(result.totals.costCents, 1200); assert.equal(result.totals.costCurrency, 'USD');
+    assert.equal(result.totals.costUnavailableReason, null);
+    assert.equal(result.buckets[0].costCents, 1200); assert.equal(result.buckets[0].costUnavailableReason, null);
     const next = await overview({ limit: 1, after: result.pagination.nextCursor });
-    assert.equal(next.totals.costCents, null); assert.equal(next.totals.costUnavailableReason, 'MIXED_CURRENCIES');
+    assert.equal(next.totals.costCents, 1200); assert.equal(next.totals.costUnavailableReason, null);
   });
-  await check('Single-currency totals preserve known amounts and zero cost in another currency does not invalidate them', async () => {
-    await setCost(oldSource.id, 'EUR', 500); await setCost(newSource.id, 'EUR', 700);
-    let result = await overview(); assert.equal(result.totals.costCents, 1200); assert.equal(result.totals.costCurrency, 'EUR');
-    assert.equal(result.totals.costUnavailableReason, null); assert.equal(result.buckets[0].costCents, 1200); assert.equal(result.buckets[0].costCurrency, 'EUR');
+  await check('USD totals preserve known amounts and an explicit zero retracts only that source cost', async () => {
+    await setCost(oldSource.id, 'USD', 500); await setCost(newSource.id, 'USD', 700);
+    let result = await overview(); assert.equal(result.totals.costCents, 1200); assert.equal(result.totals.costCurrency, 'USD');
+    assert.equal(result.totals.costUnavailableReason, null); assert.equal(result.buckets[0].costCents, 1200); assert.equal(result.buckets[0].costCurrency, 'USD');
     await setCost(oldSource.id, 'USD', 0); result = await overview();
-    assert.equal(result.totals.costCents, 700); assert.equal(result.totals.costCurrency, 'EUR');
+    assert.equal(result.totals.costCents, 700); assert.equal(result.totals.costCurrency, 'USD');
     await setCost(newSource.id, 'USD', 0); result = await overview();
     assert.equal(result.totals.costCents, 0); assert.equal(result.totals.costCurrency, 'USD');
   });
-  await check('Unknown legacy cost currency stays unknown in source, total and type responses', async () => {
-    // The current command rejects this input. Retained pre-contract data must
-    // still be readable without assigning it a fabricated USD currency.
-    await setCost(oldSource.id, '', 500); await setCost(newSource.id, 'USD', 0);
-    const result = await overview(); evidence.cases.invalidCostCurrency = result;
+  await check('A blank currency is rejected by command and database admission without changing known USD zero', async () => {
+    // Historical unsupported quarantine is seeded before migration in the
+    // USD cutover audit. New invalid writes must not bypass this SQL guard.
+    const { payloads } = require(path.join(root, 'src/services/human-control-command-contract'));
+    assert.equal(payloads['traffic.cost'].safeParse({ sourceId: oldSource.id, expectedRevision: 1, costCents: 500, currency: '' }).success, false);
+    await assert.rejects(() => setCost(oldSource.id, '', 500), /USD_CURRENCY_REQUIRED/);
+    const result = await overview(); evidence.cases.rejectedBlankCurrency = result;
     const source = result.sources.find(row => row.id === oldSource.id);
-    assert.equal(source.costCents, 500); assert.equal(source.costCurrency, null); assert.equal(source.roiUnavailableReason, 'COST_CURRENCY_INVALID');
-    assert.equal(result.totals.costCents, null); assert.equal(result.totals.costUnavailableReason, 'COST_CURRENCY_INVALID');
-    assert.equal(result.buckets[0].costCents, null); assert.equal(result.buckets[0].costUnavailableReason, 'COST_CURRENCY_INVALID');
-    await setCost(oldSource.id, 'USD', 0);
+    assert.equal(source.costCents, 0); assert.equal(source.costCurrency, 'USD'); assert.equal(source.roiUnavailableReason, 'NO_COST');
+    assert.equal(result.totals.costCents, 0); assert.equal(result.totals.costUnavailableReason, null);
+    assert.equal(result.buckets[0].costCents, 0); assert.equal(result.buckets[0].costUnavailableReason, null);
   });
-  await check('Cost currency witnesses use the installer-owned indexes and seek beyond the first currency', async () => {
-    await setCost(oldSource.id, 'USD', 500); await setCost(newSource.id, 'EUR', 700);
+  await check('Unsupported cost witnesses use the installer-owned partial index for total and type scopes', async () => {
+    await setCost(oldSource.id, 'USD', 500); await setCost(newSource.id, 'USD', 700);
     currencyQueries.length = 0; await overview(); assert.equal(currencyQueries.length, 2);
     const indexState = await require(path.join(root, 'scripts/database/analytics-traffic-indexes')).ensureIndexes(db);
+    const [currencyIndex] = await db.$queryRawUnsafe(`SELECT indexdef FROM pg_indexes
+      WHERE schemaname='public' AND indexname='TrafficSource_unsupported_usd_idx'`);
+    assert.match(currencyIndex?.indexdef || '', /currency IS DISTINCT FROM 'USD'/);
     const plans = [];
     await write(async tx => {
       // A two-row fixture naturally favors a sequential scan. This verifies
       // the real parameterized query's indexed path, not production load.
       await tx.$executeRawUnsafe('SET LOCAL enable_seqscan=off');
       for (const { query, params } of currencyQueries) {
+        assert.match(query, /currency IS DISTINCT FROM 'USD'/);
         const result = await tx.$queryRawUnsafe('EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ' + query, ...params);
         plans.push(result[0]['QUERY PLAN']);
       }
     });
-    const encoded = JSON.stringify(plans);
-    assert.match(encoded, /TrafficSource_cost_currency_v213/); assert.match(encoded, /TrafficSource_type_cost_currency_v213/);
-    assert.match(encoded, /currency.*>.*currency/);
-    evidence.cases.currencyIndexPlans = { indexState, forcedIndexedPath: true, plans };
+    for (const plan of plans) assert.match(JSON.stringify(plan), /TrafficSource_unsupported_usd_idx/);
+    evidence.cases.currencyIndexPlans = { indexState, currencyIndex, forcedIndexedPath: true, plans };
   });
   await check('Campaign projection completion retains missing provider proof and does not certify revenue as zero', async () => {
     await drainCampaigns();

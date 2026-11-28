@@ -6,11 +6,10 @@ const { serializableTxOptions } = require("../utils/prisma-transaction");
 
 const { teamFinancialStatus, publishTeamMoneyResult, financiallyActive } = require("./team-money-financial-state-service");
 const correlation = require("./financial-correlation-service");
+const { classifySentSource, findRecentTipCandidates } = require("./team-sent-message-provenance-service");
 
 const RESOLVE_JOB_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 const REFUND_STATUSES = new Set(["undo", "refunded", "refund", "chargeback", "reversed", "reversal"]);
-const MANUAL_SOURCE_MARKERS = ["manual"];
-const NON_HUMAN_SOURCE_MARKERS = ["automation", "auto_", "broadcast", "mass", "campaign", "queue", "system", "scheduler", "welcome", "bump"];
 const MANAGER_SOURCE_PREFIX = "manual_claim_";
 
 function clean(value, max = 255) {
@@ -24,14 +23,6 @@ function normalizedStatus(value) {
 
 function isRefundStatus(value) {
   return REFUND_STATUSES.has(normalizedStatus(value));
-}
-
-function classifySentSource(row) {
-  const source = String(row?.source || "").trim().toLowerCase();
-  if (!source) return "UNKNOWN";
-  if (NON_HUMAN_SOURCE_MARKERS.some((marker) => source.includes(marker))) return "NON_HUMAN";
-  if (MANUAL_SOURCE_MARKERS.some((marker) => source.includes(marker))) return "MANUAL";
-  return "UNKNOWN";
 }
 
 function purchaseIdentity(sale) { return require("./team-purchase-identity-service").purchaseId(sale); }
@@ -145,7 +136,7 @@ async function recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTr
       messageId: clean(sale.messageId, 160), dialogId: clean(fact.dialogId, 160),
       fanId: clean(fact.fanId, 160), buyerFanId: clean(fact.fanId, 160),
       amountCents: Number(fact.amountCents || sale.amountCents || 0),
-      currency: clean(fact.currency || sale.currency || "USD", 16) || "USD",
+      currency: fact.currency ?? sale.currency,
       purchasedAt: fact.occurredAt || sale.purchasedAt,
       status: clean(fact.businessStatus, 80) || "unresolved",
       attributedMemberId: clean(fact.memberId, 160), attributedUserId: clean(fact.userId, 160),
@@ -153,7 +144,7 @@ async function recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTr
       resolvedSource: "migration_fact_baseline",
       creatorSaleId: sale.id,
       financialTransactionId: financialTransactionId || clean(fact.financialTransactionId, 160),
-      financialStatus: clean(fact.financialStatus, 80),
+      financialStatus: teamFinancialStatus({ currency: fact.currency ?? sale.currency, amountCents: fact.amountCents, transactionStatus: fact.financialStatus }),
       attributionBasis: clean(fact.attributionBasis, 240) || "MIGRATION_FACT_BASELINE",
       historicalFactVersion: "team_money_fact_v2", historicalFactProjectedAt: new Date(),
       rootVersion: "team_money_root_v2", compactedAt: new Date(), migrationBaselineProtected: true,
@@ -242,7 +233,7 @@ async function upsertResolveJob(db, { purchase, sale, proposed, sent, previousRe
     purchaseId: purchase.purchaseId,
     messageId,
     amountCents: Number(sale.amountCents || 0),
-    currency: clean(sale.currency || "USD", 16) || "USD",
+    currency: sale.currency,
     purchasedAt: sale.purchasedAt,
     expiresAt: new Date(Date.now() + RESOLVE_JOB_RETENTION_MS),
   };
@@ -462,6 +453,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
     basis: "EXACT_MESSAGE_MANUAL",
   };
   else if (sentClass === "MANUAL" && !member) proposed = { status: "unresolved", memberId: null, userId: null, basis: "EXACT_MESSAGE_MEMBER_INACTIVE" };
+  if (financialStatus === "unsupported_currency") proposed = { status: "unresolved", memberId: null, userId: null, basis: "UNSUPPORTED_CURRENCY" };
 
   // Audit15 Closure3: manual Claims locks ResolveJob -> Purchase. Automatic
   // reconciliation must use the same order whenever the resolve job exists,
@@ -488,7 +480,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
     fanId: clean(sent?.fanId || fanExternalId, 160),
     buyerFanId: fanExternalId,
     amountCents: Number(sale.amountCents || 0),
-    currency: clean(sale.currency || "USD", 16) || "USD",
+    currency: sale.currency,
     purchasedAt: sale.purchasedAt,
     creatorSaleId: sale.id,
     financialTransactionId: financialTransaction?.id || null,
@@ -507,7 +499,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
       },
     });
     await require("./team-purchase-identity-service").bind(db,sale,existing);
-    if (!financiallyActive({financialStatus})) {
+    if (!financiallyActive({financialStatus, currency: sale.currency})) {
       await closeInactivePpvResolver(db, lockedResolveJob, "FINANCIAL_" + String(financialStatus).toUpperCase());
     } else if (correlationReview && correlation.reviewMessageId(sale)) {
       await upsertResolveJob(db, { purchase: existing, sale, proposed, sent, previousResult: lockedResolveJob?.result });
@@ -575,9 +567,9 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   }
 
   await require("./team-purchase-identity-service").bind(db,sale,purchase);
-  if (correlation.reviewMessageId(sale) && financiallyActive({ financialStatus })) {
+  if (correlation.reviewMessageId(sale) && financiallyActive({ financialStatus, currency: sale.currency })) {
     await upsertResolveJob(db, { purchase, sale, proposed, sent, previousResult: lockedResolveJob?.result });
-  } else if (!financiallyActive({financialStatus})) {
+  } else if (!financiallyActive({financialStatus, currency: sale.currency})) {
     await closeInactivePpvResolver(db, lockedResolveJob, "FINANCIAL_" + String(financialStatus).toUpperCase());
   }
 
@@ -616,45 +608,6 @@ async function loadTip(db, tipId) {
   });
 }
 
-async function findRecentTipCandidates(db, tip, fanExternalId) {
-  if (!db?.teamSentMessageLedger?.findMany) return { primary: [], weak: [] };
-  const receivedAt = tip.tippedAt instanceof Date ? tip.tippedAt : new Date(tip.tippedAt);
-  if (!Number.isFinite(receivedAt.getTime())) return { primary: [], weak: [] };
-  const rows = await db.teamSentMessageLedger.findMany({
-    where: {
-      agencyId: tip.agencyId,
-      creatorId: tip.creatorId,
-      memberId: { not: null },
-      sentAt: { gte: new Date(receivedAt.getTime() - 15 * 60 * 1000), lte: receivedAt },
-      ...(fanExternalId ? { OR: [{ fanId: fanExternalId }, { dialogId: fanExternalId }] } : {}),
-    },
-    orderBy: { sentAt: "desc" },
-    take: 200,
-  });
-  const byMember = new Map();
-  for (const row of rows || []) {
-    if (classifySentSource(row) !== "MANUAL" || !row.memberId) continue;
-    if (byMember.has(row.memberId)) continue;
-    const sentAt = row.sentAt instanceof Date ? row.sentAt : new Date(row.sentAt);
-    const ageMs = receivedAt.getTime() - sentAt.getTime();
-    if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > 15 * 60 * 1000) continue;
-    byMember.set(row.memberId, {
-      memberId: row.memberId,
-      userId: row.userId || null,
-      deviceId: row.deviceId || null,
-      shiftKey: row.shiftKey || null,
-      sentAtMs: sentAt.getTime(),
-      ageMinutes: Math.round(ageMs / 60000),
-      source: "recent_manual_message_evidence_only",
-    });
-  }
-  const all = [...byMember.values()];
-  return {
-    primary: all.filter((row) => row.ageMinutes !== null && row.ageMinutes <= 10),
-    weak: all.filter((row) => row.ageMinutes !== null && row.ageMinutes > 10),
-  };
-}
-
 function tipManualResolutionPreserved(row) {
   return row?.migrationBaselineProtected === true
     || String(row?.resolvedSource || "").startsWith("manual_");
@@ -691,11 +644,11 @@ async function recoverTipRootFromDurableFact(db, { tip, eventHash, aliasRootId =
       eventHash: clean(eventHash, 120) || `recovered:${fact.id}`,
       tipId: clean(fact.externalId || tip.externalNotificationId || tip.externalTransactionId || tip.eventFingerprint || tip.id, 220),
       messageId: clean(tip.messageId, 160), dialogId: clean(fact.dialogId, 160), fanId: clean(fact.fanId, 160),
-      amountCents: Number(fact.amountCents || tip.amountCents || 0), currency: clean(fact.currency || tip.currency || "USD", 8) || "USD",
+      amountCents: Number(fact.amountCents ?? tip.amountCents ?? 0), currency: fact.currency ?? tip.currency,
       receivedAt: fact.occurredAt || tip.tippedAt, status: clean(fact.businessStatus, 80) || "unresolved",
       attributedMemberId: clean(fact.memberId, 160), attributedUserId: clean(fact.userId, 160),
       resolvedAt: fact.attributionActive ? (fact.sourceUpdatedAt || new Date()) : null,
-      resolvedSource: "migration_fact_baseline", creatorTipId: tip.id, financialStatus: clean(fact.financialStatus, 80),
+      resolvedSource: "migration_fact_baseline", creatorTipId: tip.id, financialStatus: teamFinancialStatus({ currency: fact.currency ?? tip.currency, amountCents: fact.amountCents, transactionStatus: fact.financialStatus }),
       attributionBasis: clean(fact.attributionBasis, 240) || "MIGRATION_FACT_BASELINE",
       historicalFactVersion: "team_money_fact_v2", historicalFactProjectedAt: new Date(),
       rootVersion: "team_money_root_v2", compactedAt: new Date(), migrationBaselineProtected: true,
@@ -718,11 +671,14 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
   }
   const tip = await loadTip(db, tipId);
   if (!tip) return { ok: false, code: "TIP_NOT_FOUND" };
-  const fanExternalId = clean(tip.fan?.onlyFansUserId, 160);
+  const fanExternalId = clean(tip.fanOnlyFansUserIdAtEvent || tip.fan?.onlyFansUserId, 160);
   const sent = await findExactSentMessage(db, tip);
   const sentClass = classifySentSource(sent);
   const member = sentClass === "MANUAL" ? await ensureActiveMember(db, tip, sent) : null;
-  const recent = await findRecentTipCandidates(db, tip, fanExternalId);
+  const recent = await findRecentTipCandidates({
+    db, agencyId: tip.agencyId, creatorId: tip.creatorId,
+    fanId: fanExternalId, receivedAt: tip.tippedAt,
+  });
   const financialStatus = teamFinancialStatus(tip);
 
   let proposed = { status: "unresolved", memberId: null, userId: null, basis: "NO_EXACT_MESSAGE_PROVENANCE" };
@@ -737,6 +693,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
   } else if (recent.primary.length === 1) {
     proposed = { status: "unresolved", memberId: null, userId: null, basis: "SINGLE_RECENT_CANDIDATE_EVIDENCE_ONLY" };
   }
+  if (financialStatus === "unsupported_currency") proposed = { status: "unresolved", memberId: null, userId: null, basis: "UNSUPPORTED_CURRENCY" };
 
   const eventHash = clean(tip.eventFingerprint, 120) || clean(tip.id, 120);
   const identity = require("./team-tip-identity-service");
@@ -763,7 +720,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
     dialogId: clean(sent?.dialogId || fanExternalId, 160),
     fanId: clean(sent?.fanId || fanExternalId, 160),
     amountCents: Number(tip.amountCents || 0),
-    currency: clean(tip.currency || "USD", 8) || "USD",
+    currency: tip.currency,
     receivedAt: tip.tippedAt,
     creatorTipId: tip.id,
     financialStatus,

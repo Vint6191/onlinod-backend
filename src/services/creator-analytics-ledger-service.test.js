@@ -1798,6 +1798,7 @@ test("campaign fan reader scopes the campaign to the creator and pages concrete 
       if(sql.includes('FROM "CreatorCampaignFan" m'))return [{id:'link-1',fanId:'fan-1'},{id:'link-2',fanId:'fan-2'}];
       if(sql.includes('FROM "CampaignReadMetric"'))return [];
       if(sql.includes('JOIN "CreatorEarningsLedgerProof"'))return []; // No verified monetary baseline in this fixture.
+      if(sql.startsWith('SELECT EXISTS(SELECT 1 FROM "CreatorFinancialTransaction" usd_fact'))return [{unsupported:false}];
       throw Error('Unexpected Campaign SQL: '+sql);
     },
     creatorCampaign: { findFirst: async ({ where }) => where.creatorId === "creator-1" ? { id: "campaign-1", externalCampaignId: "of-campaign", name: "Link A", isActive: true } : null },
@@ -1817,7 +1818,15 @@ test("campaign fan reader scopes the campaign to the creator and pages concrete 
   assert.equal(result.contractVersion,1);
   assert.equal(result.fans[0].revenue.netCents,null);
   assert.equal(result.sourceCoverage.revenue.reason,'FINANCIAL_BASELINE_MISSING');
-  assert(queries.every(q=>!q.sql.includes('CreatorFinancialTransaction')));
+  const currencyWitness=queries.find(q=>q.sql.startsWith('SELECT EXISTS(SELECT 1 FROM "CreatorFinancialTransaction" usd_fact'));
+  assert(currencyWitness);
+  assert.match(currencyWitness.sql,/usd_fact\."creatorId"=\$1 AND usd_fact\."currency" IS DISTINCT FROM 'USD'/);
+  assert.match(currencyWitness.sql,/usd_fact\."occurredAt">=\$2 AND usd_fact\."occurredAt"<\$3\) AS unsupported/);
+  assert.deepEqual(currencyWitness.args,['creator-1',new Date('2016-01-01T00:00:00.000Z'),new Date('2026-08-08T00:00:00.001Z')]);
+  // Fan pages still use committed projection metrics; raw money is consulted
+  // only by bounded currency witnesses and the ledger authority coverage read.
+  assert(queries.filter(q=>q.sql.includes('CreatorFinancialTransaction')).every(q=>q===currencyWitness||q.sql.includes('JOIN "CreatorEarningsLedgerProof"')));
+  assert.doesNotMatch(currencyWitness.sql,/\b(?:SUM|GROUP BY)\b/i);
   const selection=queries.find(q=>q.sql.includes('FROM "CreatorCampaignFan" m'));
   assert.deepEqual(selection.args.slice(0,2),['creator-1','campaign-1']);
   assert.equal(await readCampaignFans({ db: commitDatabaseFixture(db), creatorId: "other", campaignId: "campaign-1" }), null);

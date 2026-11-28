@@ -7,6 +7,7 @@ const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./mana
 const { resolveHistoricalAttributionTarget } = require("./historical-attribution-target-authority-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { reconcileMoneyForSentMessageEvidence } = require("./team-money-reconciliation-service");
+const { isCanonicalUsdCurrency } = require("./usd-money-contract");
 
 const RAW_LEDGER_RETENTION_DAYS = 180;
 const RAW_LEDGER_RETENTION_MS = RAW_LEDGER_RETENTION_DAYS * 86400000;
@@ -207,6 +208,7 @@ async function upsertSentMessageFromEvent(row, db = prisma) {
     220
   );
   if (!localSeed) return null;
+  const supportedCurrency = isCanonicalUsdCurrency(event.currency === undefined ? extra.currency : event.currency);
 
   const next = {
     agencyId,
@@ -224,10 +226,10 @@ async function upsertSentMessageFromEvent(row, db = prisma) {
     sentAt: safeDate(extra.sentAt || extra.sentAtMs || event.ts),
     messageKind: clean(extra.messageKind || extra.message_kind || (event.isPpv === true || extra.isPpv ? "ppv" : "text"), 40) || "text",
     isPpv: Boolean(event.isPpv === true || extra.isPpv || extra.is_ppv || event.type === "ppv_message_sent_recorded"),
-    priceCents: event.priceCents !== null && event.priceCents !== undefined
+    priceCents: !supportedCurrency ? null : event.priceCents !== null && event.priceCents !== undefined
       ? Math.max(0, int(event.priceCents, 0))
       : (extra.priceCents === null || extra.priceCents === undefined ? null : Math.max(0, int(extra.priceCents, 0))),
-    currency: clean(event.currency || extra.currency || null, 16),
+    currency: supportedCurrency ? "USD" : null,
     mediaCount: Math.max(0, int(event.mediaCount ?? extra.mediaCount ?? extra.media_count, 0)),
     mediaIds: safeMediaIds(extra.mediaIds),
     campaignId: clean(extra.campaignId || extra.campaign_id || null, 160),
@@ -548,8 +550,8 @@ async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false, 
       accountId: r.accountId,
       creatorId: r.creatorId,
       creatorRef: r.creatorRef,
-      amountCents: r.amountCents,
-      currency: r.currency,
+      amountCents: isCanonicalUsdCurrency(r.currency) && !["gross_unknown", "unsupported_currency"].includes(purchase?.financialStatus) ? r.amountCents : null,
+      currency: isCanonicalUsdCurrency(r.currency) && purchase?.financialStatus !== "unsupported_currency" ? "USD" : null,
       purchasedAt: r.purchasedAt?.getTime?.() || null,
       resolvedByMemberId: r.resolvedByMemberId || null,
       purchaseStatus: purchase?.status || (r.status === "conflict" ? "conflict" : r.status),
@@ -704,6 +706,8 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
 
     if (Array.isArray(allowedCreatorIds) && !allowedCreatorIds.includes(job.creatorId)) return "creator_forbidden";
     const purchaseBefore = await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
+    if (!isCanonicalUsdCurrency(job.currency)
+      || (purchaseBefore && (!isCanonicalUsdCurrency(purchaseBefore.currency) || purchaseBefore.financialStatus === "unsupported_currency"))) return "UNSUPPORTED_CURRENCY";
 
     let selectedMember = null;
     if (finalAction === "assign") {
@@ -909,6 +913,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
   if (outcome === "skipped") return { resolved: 0, skipped: 1 };
   if (outcome === "creator_forbidden") return { resolved: 0, skipped: 1, code: "CREATOR_ACCESS_FORBIDDEN" };
   if (outcome === "actor_forbidden") return { resolved: 0, skipped: 1, code: "ACTOR_AUTHORITY_REVOKED" };
+  if (outcome === "UNSUPPORTED_CURRENCY") return { resolved: 0, skipped: 1, code: outcome };
   if (outcome === "HISTORICAL_ATTRIBUTION_TARGET_INVALID") return { resolved: 0, skipped: 1, code: outcome };
   return { resolved: 1, skipped: 0, action: outcome };
 }

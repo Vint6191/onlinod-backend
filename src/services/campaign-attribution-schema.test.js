@@ -30,7 +30,7 @@ test("campaign fan rows expose arrival time and settled/pending money", () => {
   assert.match(repository, /attributedAt:row\.attributedAt/);
   const {financialMetrics}=require('./campaign-read-projection-service');
   const {metricsDto}=require('./campaign-read-repository');
-  const m=metricsDto(financialMetrics({amountCents:100,netCents:80,transactionStatus:'done'}));
+  const m=metricsDto(financialMetrics({currency:'USD',amountCents:100,netCents:80,transactionStatus:'done'}));
   assert.equal(m.settledNetCents,80);assert.equal(m.pendingNetCents,0);assert.equal(m.transactionsCount,1);
   assert.match(ledger, /readCampaignFanPage/);assert.match(ledger, /readCampaignPage/);
 });

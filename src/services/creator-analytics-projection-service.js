@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { boundedIds, stateEvents } = require("./subscription-projection-source");
 const { writeStates, writePayments } = require("./subscription-projection-store");
+const { isCanonicalUsdCurrency } = require("./usd-money-contract");
 
 const PAID_EVENT_TYPES = new Set(["SUBSCRIBED_PAID", "RENEWED", "RESUBSCRIBED"]);
 const ACTIVE_EVENT_TYPES = new Set(["SUBSCRIBED_FREE", "SUBSCRIBED_PAID", "SUBSCRIBED_UNKNOWN", "RENEWED", "RESUBSCRIBED"]);
@@ -39,8 +40,11 @@ function projectSubscriptionState(events) {
     const occurredAt = toDate(event.occurredAt);
     if (!occurredAt) continue;
     lastEvent = event;
-    if (typeof event.currency === "string" && /^[A-Z]{3}$/.test(event.currency)) currency = event.currency;
-    if (Number.isInteger(event.observedPriceCents) && event.observedPriceCents >= 0) currentPriceCents = event.observedPriceCents;
+    // Subscription lifecycle can remain known while its monetary evidence is
+    // quarantined. A newer unsupported observation must not revive an older
+    // price or relabel that amount as USD.
+    if (!isCanonicalUsdCurrency(event.currency)) currentPriceCents = null;
+    else if (Number.isInteger(event.observedPriceCents) && event.observedPriceCents >= 0) currentPriceCents = event.observedPriceCents;
 
     if (ACTIVE_EVENT_TYPES.has(event.eventType)) {
       status = "ACTIVE";
@@ -110,7 +114,7 @@ async function projectSubscriptionFacts({ db = null, agencyId, creatorId, fanRec
   existingRows.forEach(index);
 
   for (const event of events) {
-    if (!PAID_EVENT_TYPES.has(event.eventType) || !Number.isInteger(event.observedPriceCents) || event.observedPriceCents <= 0) {
+    if (!isCanonicalUsdCurrency(event.currency) || !PAID_EVENT_TYPES.has(event.eventType) || !Number.isInteger(event.observedPriceCents) || event.observedPriceCents <= 0) {
       // A corrected source event can cease to prove a payment. Remove only its
       // own projection; never remove a different transaction's canonical row.
       inactive.push(event.id);
@@ -136,7 +140,7 @@ async function projectSubscriptionFacts({ db = null, agencyId, creatorId, fanRec
       subscriptionEventId: event.id,
       paymentType: paidPaymentType(event.eventType),
       amountCents: event.observedPriceCents,
-      currency: event.currency || "USD",
+      currency: "USD",
       paidAt: event.occurredAt,
       periodFrom: event.occurredAt,
       periodTo: null,

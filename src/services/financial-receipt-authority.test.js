@@ -31,7 +31,7 @@ test('legacy date-filtered full receipt cannot certify all available history; re
   const j = job(); j.params.collectionMode = 'full'; j.params.financialWindows = authority.planWindows(j.params, null);
   const row = { id: authority.runId(j), jobId:j.id, agencyId:j.agencyId, creatorId:j.creatorId, generation:j.params.collectionGeneration,
     windows:j.params.financialWindows, cursor:{phase:'done'}, proof:{complete:true,windows:[{exhausted:true}]} };
-  const result = await authority.completionProof({financialReceiptRun:{findUnique:async()=>row}},j);
+  const result = await authority.completionProof({financialReceiptRun:{findUnique:async()=>row},$queryRawUnsafe:async()=>[]},j);
   assert.equal(result.complete,false); assert.equal(result.filteredHistory,true); assert.equal(authority.historyRead(row),false); assert.equal(result.row,row);
 });
 test('full traversal has no lower filter; comparison scope is derived separately from source receipts', () => {

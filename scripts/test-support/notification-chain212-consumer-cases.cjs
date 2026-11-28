@@ -89,11 +89,11 @@ async function runConsumerCases(h, check) {
     const initial = (await ledger(scope))[0];
     assert.equal(initial.eventHash, receipts.canonicalReceiptIdentity(scope.agencyId, scope.creatorId, first.id));
     const head = await h.db.creatorEntityChangeHead.findUnique({ where: { creatorId: scope.creatorId } });
-    await writer.write({ ...raw, amount: 25, currency: 'EUR', user: { id: '212821' }, createdAt: new Date(+new Date(sourceTime) + 1000).toISOString() });
+    await writer.write({ ...raw, amount: 25, currency: 'USD', user: { id: '212821' }, createdAt: new Date(+new Date(sourceTime) + 1000).toISOString() });
     await project();
     let rows = await ledger(scope);
     assert.equal(rows.length, 1); assert.equal(rows[0].id, initial.id); assert.equal(rows[0].amountCents, 2500);
-    assert.equal(rows[0].currency, 'EUR'); assert.equal(rows[0].fanId, '212821');
+    assert.equal(rows[0].currency, 'USD'); assert.equal(rows[0].fanId, '212821');
     const changes = await h.db.creatorEntityChange.findMany({ where: { creatorId: scope.creatorId, revision: { gt: head.lastRevision }, entityType: { in: ['FAN','CRM'] } } });
     for (const type of ['FAN','CRM']) assert.deepEqual([...new Set(changes.filter(row => row.entityType === type).map(row => row.entityId))].sort(), ['212820','212821']);
     // A queued caller with an old projection cannot restore its old fan/price.

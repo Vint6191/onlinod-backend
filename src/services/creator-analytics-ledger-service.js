@@ -82,8 +82,7 @@ function dateOnly(value) {
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value ? date : null;
 }
 function currency(value) {
-  const code = String(value || "USD").trim().toUpperCase();
-  return /^[A-Z]{3}$/.test(code) ? code : null;
+  return require("./usd-money-contract").normalizeUsdCurrency(value, { allowMissing: true });
 }
 function timezone(value) {
   const zone = text(value || "UTC", 100);
@@ -1532,6 +1531,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
 
 function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
   const item = object(payload);
+  require("./usd-money-contract").requireUsdCurrency(item.currency, { allowMissing: true });
   // Desktop observation time is retained as provenance only. Canonical FanData
   // ordering is server-owned: causal jobs consume the post-read token chronology;
   // pre-cutover legacy jobs retain PostgreSQL receipt time as their rollout fallback.

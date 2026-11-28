@@ -294,19 +294,26 @@ test("Closure3 mounted alerts/flags treat canonical money read failure as UNAVAI
   await assert.rejects(analytics.buildTeamFlags({ agencyId: "agency-1", rangeKey: "7d", includeMoney: true }), (err) => err?.code === "TEAM_ANALYTICS_DATA_UNAVAILABLE" && err?.status === 503 && err?.section === "money_conflicts");
 });
 
-test("Closure3 alerts render EUR and mixed currencies explicitly, never hardcoded dollar or mixed zero", async () => {
+test("Closure3 alerts mark foreign historical money unavailable and keep supported USD exact", async () => {
   let analytics = loadWithPrisma(analyticsPath, analyticsFake({ currencies: { EUR: 10000 } }));
   let payload = await analytics.buildTeamAlerts({ agencyId: "agency-1", rangeKey: "7d", includeMoney: true });
   let focus = payload.alerts.find((row) => String(row.id).startsWith("focus_dialog_"));
-  assert.match(focus.text, /EUR 100\.00/);
+  assert.match(focus.text, /attributed revenue unavailable/);
+  assert.doesNotMatch(focus.text, /EUR|USD 100|\$100|\$0/);
   assert.doesNotMatch(focus.text, /\$100|\$0/);
 
   analytics = loadWithPrisma(analyticsPath, analyticsFake({ currencies: { USD: 10000, EUR: 10000 } }));
   payload = await analytics.buildTeamAlerts({ agencyId: "agency-1", rangeKey: "7d", includeMoney: true });
   focus = payload.alerts.find((row) => String(row.id).startsWith("focus_dialog_"));
-  assert.match(focus.text, /EUR 100\.00/);
-  assert.match(focus.text, /USD 100\.00/);
+  assert.match(focus.text, /attributed revenue unavailable/);
+  assert.doesNotMatch(focus.text, /EUR|USD 100|\$100|\$0/);
   assert.doesNotMatch(focus.text, /\$0/);
+
+  analytics = loadWithPrisma(analyticsPath, analyticsFake({ currencies: { USD: 10000 } }));
+  payload = await analytics.buildTeamAlerts({ agencyId: "agency-1", rangeKey: "7d", includeMoney: true });
+  focus = payload.alerts.find((row) => String(row.id).startsWith("focus_dialog_"));
+  assert.match(focus.text, /USD 100\.00/);
+  assert.doesNotMatch(focus.text, /unavailable|EUR/);
 });
 
 

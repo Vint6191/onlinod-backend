@@ -14,6 +14,14 @@ const {
 } = require("./server-store-utils");
 const { classifyProgrammaticCustomMediaProvenance } = require("./custom-content-delivery-service");
 const { normalizeBumpContent } = require("./bump-content");
+const { normalizeUsdCurrency, requireUsdCurrency } = require("./usd-money-contract");
+
+function normalizeConfiguredMoney(value) {
+  if (Array.isArray(value)) return value.map(normalizeConfiguredMoney);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key,
+    key === "currency" ? requireUsdCurrency(child) : normalizeConfiguredMoney(child)]));
+}
 
 const TASK_TYPE_ALIASES = Object.freeze({
   winback: "sfs_hunter",
@@ -91,6 +99,7 @@ function parseOffset(value) {
 }
 
 function normalizeTaskInput(input = {}, { agencyId, userId, patch = false, existingType } = {}) {
+  requireUsdCurrency(input.currency, { allowMissing: true });
   const data = {};
   if (!patch || input.type !== undefined) data.type = normalizeTaskType(input.type);
   if (!patch || input.title !== undefined || input.name !== undefined) data.title = clean(input.title || input.name || "Untitled automation", 180) || "Untitled automation";
@@ -99,7 +108,7 @@ function normalizeTaskInput(input = {}, { agencyId, userId, patch = false, exist
   if (!patch || input.creatorId !== undefined || input.accountId !== undefined) data.creatorId = optional(input.creatorId || input.accountId, 100);
   if (!patch || input.clientId !== undefined || input.id !== undefined) data.clientId = optional(input.clientId || input.id, 120);
   if (!patch || input.config !== undefined) data.config = normalizeTaskType(input.type ?? existingType) === "bump_online"
-    ? normalizeBumpContent(input.config || {}) : compactJson(input.config || {}, 16000);
+    ? normalizeBumpContent(input.config || {}) : compactJson(normalizeConfiguredMoney(input.config || {}), 16000);
   if (!patch || input.triggers !== undefined) data.triggers = compactJson(input.triggers || {}, 8000);
   if (!patch || input.rules !== undefined) data.rules = compactJson(input.rules || {}, 8000);
   if (!patch || input.schedule !== undefined) data.schedule = compactJson(input.schedule || {}, 8000);
@@ -306,12 +315,12 @@ function taskToBump(task) {
     serverTaskId: task.id,
     accountId: task.creatorId || "",
     creatorId: task.creatorId || null,
-    enabled: task.enabled === true && task.status !== "deleted" && !task.deletedAt,
+    enabled: task.enabled === true && task.status !== "deleted" && !task.deletedAt && normalizeUsdCurrency(config.currency, { allowMissing: true }) !== null,
     title: task.title || config.messageText?.slice?.(0, 42) || "Bump",
     messageText: clean(config.messageText || config.text || "", 12000),
-    price: Number(config.price ?? (Number(config.priceCents || 0) / 100)) || 0,
+    price: normalizeUsdCurrency(config.currency, { allowMissing: true }) ? Number(config.price ?? (Number(config.priceCents || 0) / 100)) || 0 : null,
     lockedText: config.lockedText === true || config.paidMode === "paid_text",
-    currency: clean(config.currency || "USD", 12).toUpperCase() || "USD",
+    currency: normalizeUsdCurrency(config.currency, { allowMissing: true }),
     media: Array.isArray(config.media) ? config.media : [],
     triggers,
     rules,
@@ -355,7 +364,16 @@ async function listTasks({ agencyId, query = {} }) {
     const sql=clauses.join(' AND ');
     const items=await tx.$queryRawUnsafe(`SELECT * FROM "AutomationTask" WHERE ${sql} ORDER BY "updatedAt" DESC,id DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`,...params,take,skip);
     const count=Number((await tx.$queryRawUnsafe(`SELECT count(*) n FROM "AutomationTask" WHERE ${sql}`,...params))[0].n);
-    return {ok:true,items,count,nextOffset:skip+items.length,hasMore:skip+items.length<count,snapshotRevision:revision};
+    const presented = items.map(task => {
+      try { normalizeConfiguredMoney(task.config); return task; }
+      catch (error) {
+        if (error.code !== "UNSUPPORTED_CURRENCY") throw error;
+        const redact = value => Array.isArray(value) ? value.map(redact) : value && typeof value === "object"
+          ? Object.fromEntries(Object.entries(value).map(([key, child]) => [key, key === "currency" || /^(price|amount|gross|net|fee)(Cents)?$/.test(key) ? null : redact(child)])) : value;
+        return { ...task, enabled: false, config: redact(task.config), monetaryUnavailableReason: "UNSUPPORTED_CURRENCY" };
+      }
+    });
+    return {ok:true,items:presented,count,nextOffset:skip+items.length,hasMore:skip+items.length<count,snapshotRevision:revision};
   },{isolationLevel:"RepeatableRead",maxWait:5000,timeout:15000});
 }
 
@@ -463,6 +481,7 @@ async function patchTask({ agencyId, userId, taskId, patch = {}, creatorId = nul
     throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Creator-owned task requires its canonical creator boundary", 409);
   }
   const data = normalizeTaskInput(patch, { agencyId, userId, patch: true, existingType: existing.type });
+  if (data.enabled === true || data.status === "active") normalizeConfiguredMoney(data.config ?? existing.config);
   delete data.agencyId;
   delete data.createdByUserId;
   if (existing.creatorId) {
@@ -517,6 +536,7 @@ async function restoreTask({ agencyId, userId, taskId, creatorId = null, db = pr
   const cid = clean(creatorId, 100);
   const existing = await db.automationTask.findFirst({ where: { id, agencyId } });
   if (!existing) throw automationTaskError("AUTOMATION_TASK_NOT_FOUND", "Automation task not found", 404);
+  normalizeConfiguredMoney(existing.config);
   if (existing.creatorId && (!cid || String(existing.creatorId) !== cid)) {
     throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Creator-owned task is outside the requested creator boundary", 409);
   }
@@ -590,6 +610,7 @@ async function trashBump({ agencyId, userId, accountId, bumpId, permanent = fals
 }
 
 function normalizeSfsCommentToTask(input = {}, accountId = null) {
+  requireUsdCurrency(input.currency, { allowMissing: true });
   const id = clean(input.id || input.clientId, 120);
   const commentText = clean(input.commentText || input.messageText || input.text || "", 5000);
   const title = clean(input.title || commentText.slice(0, 80) || "SFS comment", 180) || "SFS comment";

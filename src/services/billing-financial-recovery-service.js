@@ -46,6 +46,8 @@ async function publish({db,job,receipt,now}) {
   if(!receipt.complete||run?.jobId!==job.id||run.agencyId!==job.agencyId||run.creatorId!==job.creatorId
     ||window?.kind!=="BILLING"||!proof?.exhausted||!proof.matched||proof.rejected!==0||run.proof.semanticsVersion!==3)
     throw fail("BILLING_FINANCIAL_PROOF_INCOMPLETE");
+  const currency=await receipts.currencyAuthority(db,run);
+  if(!currency.currencySupported)throw fail(currency.unavailableReason||"CURRENCY_EVIDENCE_UNAVAILABLE");
   const totals=receipts.earningsTotals(proof),observedAt=require("./analytics-observation-time").observationStartForJob(job);
   if(!observedAt||!Number.isSafeInteger(totals.netCents)||totals.netCents<0)throw fail("BILLING_FINANCIAL_PROOF_INVALID");
   await receipts.enter(db);
@@ -60,7 +62,7 @@ async function publish({db,job,receipt,now}) {
     WHERE "CreatorBillingRecoverySnapshot"."agencyId"=EXCLUDED."agencyId"
       AND "CreatorBillingRecoverySnapshot"."observedAt"<=EXCLUDED."observedAt"`,job.creatorId,job.agencyId,
     job.params.scanFrom,job.params.scanTo,totals.netCents,totals.transactionsCount,observedAt,now,run.id,
-    JSON.stringify({version:1,semanticsVersion:3,windows:run.windows,proof:run.proof}));
+    JSON.stringify({version:1,semanticsVersion:3,currencyContract:receipts.CURRENCY_CONTRACT,windows:run.windows,proof:run.proof}));
   return {ok:true,complete:true,protocolCurrent:true,type:"billing_financial_recovery",traversalComplete:true,
     verification:"VERIFIED",published:true,historyRead:false,scanRunId:run.generation};
 }

@@ -4,6 +4,7 @@
 // a canonical row left by an old failed scan supplies no monetary proof.
 const { createHash } = require("node:crypto");
 const { lockCreatorFacts } = require("./creator-fact-write-authority");
+const { isCanonicalUsdCurrency } = require("./usd-money-contract");
 const PAGE = 100;
 async function repairPage({ db, agencyId, creatorId, afterId = "", throughId = null, repairingGenerationId = null, now }) {
   // A verified snapshot applies canonical pages before its final pointer swap.
@@ -48,10 +49,32 @@ async function repairPage({ db, agencyId, creatorId, afterId = "", throughId = n
     WHERE f."agencyId"=$1 AND f."creatorId"=$2 AND f.id>$3 AND ($5::text IS NULL OR f.id<=$5)
     ORDER BY f.id LIMIT $4`, agencyId, creatorId, afterId, PAGE, throughId);
   if (!rows.length) return { processed: 0, complete: true, afterId };
+  const category=require("./financial-transaction-category");
+  const sources = new Map(rows.map(row => {
+    let source=row.verifiedFact?.version===1?row.verifiedFact.value:null;
+    const receipt=row.verifiedReceipt;
+    if (!source && receipt && Number(receipt.netCents)===Number(row.verifiedNet)
+      && receipt.transactionStatus===row.verifiedStatus && +new Date(receipt.occurredAt)===+row.verifiedOccurredAt
+      && category.earningsCategory(receipt)===row.verifiedCategory
+      && (receipt.amountCents==null?null:Number(receipt.amountCents))===(row.verifiedGross==null?null:Number(row.verifiedGross))) source={...receipt,
+        sourceJobId:row.verifiedReceiptJobId,scanRunId:row.verifiedReceiptGeneration,collectedAt:row.verifiedObservedAt};
+    return [row.id, source];
+  }));
+  const currencyQuarantine = rows.filter(row => {
+    const source=sources.get(row.id);
+    return (source?.currency !== undefined && !isCanonicalUsdCurrency(source.currency))
+      || (!isCanonicalUsdCurrency(row.currency) && !(row.verifiedNet != null && isCanonicalUsdCurrency(source?.currency)));
+  });
+  const unsupported = new Set(currencyQuarantine.map(row => row.id));
+  // Retained foreign evidence is neither a USD fact nor disposable failed-scan
+  // residue. Preserve its original amount/currency/ownership; the USD cutover
+  // quarantines projections and a fresh source proof must resolve it.
+  if (unsupported.size) await require("./financial-recovery-intent-service").requestFull({db,agencyId,creatorId,now,
+    reason:"UNSUPPORTED_CURRENCY",identity:repairingGenerationId||"legacy-financial-usd-only-v1"});
   // Absence from the current ledger is expected for a withdrawn FULL member.
   // Keep its snapshot revision fence; replacing it with an unverified fact at
   // `now` would reject a valid later provider revision between those clocks.
-  const values = rows.filter(row=>!(row.verifiedNet==null && row.transactionStatus==="superseded"
+  const values = rows.filter(row=>!unsupported.has(row.id)).filter(row=>!(row.verifiedNet==null && row.transactionStatus==="superseded"
     && row.reasonCode==="VERIFIED_SNAPSHOT_ABSENT" && row.activePublishedAt
     && row.activeProofPolicyVersion===require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION
     && row.sourceUpdatedAt && row.sourceUpdatedAt<=row.activeSnapshotAt && row.occurredAt>=row.activeFromAt && row.occurredAt<=row.activeThroughAt))
@@ -85,25 +108,18 @@ async function repairPage({ db, agencyId, creatorId, afterId = "", throughId = n
   // a Sale and a Tip for one identity. Restore the verified category and use
   // the same canonical publisher as new verified facts, including withdrawal
   // of the opposite projection and recreation of a missing correct one.
-  const category=require("./financial-transaction-category");
   const categoryTypes={messages:"message",posts:"post",streams:"stream",tips:"tip",subscriptions:"subscription",other:"other"};
   const existing=new Map(rows.map(row=>[row.externalTransactionId,{...row,fanRecordId:row.fanId}]));
   let revisionUnavailable=false;
-  const verified=rows.filter(row=>row.verifiedNet!=null).map((row,index)=>{
-    let source=row.verifiedFact?.version===1?row.verifiedFact.value:null;
-    const receipt=row.verifiedReceipt;
-    if (!source && receipt && Number(receipt.netCents)===Number(row.verifiedNet)
-      && receipt.transactionStatus===row.verifiedStatus && +new Date(receipt.occurredAt)===+row.verifiedOccurredAt
-      && category.earningsCategory(receipt)===row.verifiedCategory
-      && (receipt.amountCents==null?null:Number(receipt.amountCents))===(row.verifiedGross==null?null:Number(row.verifiedGross))) source={...receipt,
-        sourceJobId:row.verifiedReceiptJobId,scanRunId:row.verifiedReceiptGeneration,collectedAt:row.verifiedObservedAt};
+  const verified=rows.filter(row=>row.verifiedNet!=null && !unsupported.has(row.id)).map((row,index)=>{
+    const source=sources.get(row.id);
     if(!source) revisionUnavailable=true;
     const transactionType=source?.transactionType||categoryTypes[row.verifiedCategory];
     if(!transactionType)throw new Error("LEGACY_FINANCIAL_CATEGORY_INVALID");
     const normalized=require("./financial-transactions-service").normalizeTransaction({...(source||{}),
       externalTransactionId:row.externalTransactionId,transactionType,
       amountCents:row.verifiedGross==null?null:Number(row.verifiedGross),netCents:Number(row.verifiedNet),
-      transactionStatus:row.verifiedStatus,occurredAt:row.verifiedOccurredAt,currency:"USD",
+      transactionStatus:row.verifiedStatus,occurredAt:row.verifiedOccurredAt,currency:source?.currency ?? row.currency,
       fanOnlyFansUserId:source?.fanOnlyFansUserId??row.verifiedFan,
       fanUsername:source?.fanUsername??source?.fanUsernameAtEvent??null,
       fanDisplayName:source?.fanDisplayName??source?.fanDisplayNameAtEvent??null,
@@ -143,6 +159,7 @@ async function repairPage({ db, agencyId, creatorId, afterId = "", throughId = n
   // client/media corrections use the existing canonical publication owner.
   if (sales.length) await require("./creator-entity-change-service").publishCanonicalSales({ db, agencyId, creatorId, saleIds: sales.map(row => row.id) });
   if (tips.length) await require("./creator-entity-change-service").publishCanonicalFactInvalidations({ db, agencyId, creatorId, model: "creatorTip", ids: tips.map(row => row.id) });
-  return { processed: rows.length, quarantined: unverified.length, complete: rows.length < PAGE, afterId: rows.at(-1).id };
+  return { processed: rows.length, quarantined: unverified.length + unsupported.size, unsupportedCurrency: unsupported.size,
+    complete: rows.length < PAGE, afterId: rows.at(-1).id };
 }
 module.exports = { repairPage, PAGE };

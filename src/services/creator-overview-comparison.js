@@ -45,7 +45,8 @@ function financialRangeCoverage({ current, coverage, range, now }) {
   // promise that observations arriving after it have already been collected.
   const ready = Boolean(current?.ready && current.generation && from && through
     && from <= requested.startAt && through >= requested.endDay);
-  const reason = !current?.ready || !coverage ? "NO_BASELINE"
+  const reason = current?.unavailableReason === "UNSUPPORTED_CURRENCY" || coverage?.unsupportedCurrency ? "UNSUPPORTED_CURRENCY"
+    : !current?.ready || !coverage ? "NO_BASELINE"
     : coverage.proofPolicyVersion !== require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION ? "POLICY_ADOPTION_REQUIRED"
     : coverage.publishing ? "FINANCIAL_PUBLICATION_PENDING"
     : coverage.recoveryStopped ? "RECOVERY_STOPPED"
@@ -65,7 +66,7 @@ async function readCreatorFinancialReadState({ db, creatorId, range, now, curren
   const previous = previousDisplayRange(range, now);
   const [published, coverage] = await Promise.all([
     readPublishedFinancialSummary({ db, creatorId, from: previous.startAt, to: previous.endAt }),
-    readLiveEarningsCoverage(db, creatorId, now),
+    readLiveEarningsCoverage(db, creatorId, now, { from: displayRangeBounds(range, now).startAt, to: new Date(+now + 1) }),
   ]);
   return {
     comparison: financeComparison({ current, previous: published, coverage, range, now }),

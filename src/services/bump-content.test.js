@@ -38,7 +38,7 @@ test("Cents-only input, primitive media IDs and duplicates have one stable contr
 
 test("Invalid message intent is rejected before persistence instead of changed or truncated", async () => {
   for (const input of [{ price: -1 }, { price: Infinity }, { price: "nonsense" }, { price: 1, currency: "EUR" }, { media: "broken" }, { media: ["bad"] }, { media: [1.5] }, { media: [Number.MAX_SAFE_INTEGER + 1] }, { media: Array.from({ length: 201 }, (_, i) => i + 1) }, { messageText: "x".repeat(12001) }]) {
-    await assert.rejects(roundTrip({ messageText: "hello", ...input }), error => error.code === "AUTOMATION_BUMP_CONTENT_INVALID");
+    await assert.rejects(roundTrip({ messageText: "hello", ...input }), error => error.code === (input.currency ? "UNSUPPORTED_CURRENCY" : "AUTOMATION_BUMP_CONTENT_INVALID"));
   }
 });
 

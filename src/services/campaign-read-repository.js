@@ -1,4 +1,5 @@
 "use strict";
+const { readUnsupportedFinancialCurrency } = require("./usd-money-read-authority");
 const { valueFieldState } = require("./fan-value-field-authority");
 const { readCampaignRefreshDebt } = require("./campaign-refresh-debt-service");
 
@@ -19,14 +20,16 @@ function safeInteger(value) {
   return number;
 }
 const n=(m,k)=>safeInteger(m?.[k]??0);
-function metricsDto(m={},ready=true,revenueReady=ready) {
-  const moneyReady=ready && revenueReady && n(m,"unknownAttributionFans")===0 && n(m,"unverifiedTransactions")===0;
+function metricsDto(m={},ready=true,revenueReady=ready,unsupportedCurrency=false) {
+  const supported = !unsupportedCurrency && n(m,"unsupportedCurrencyTransactions") === 0;
+  const moneyReady=supported && ready && revenueReady && n(m,"unknownAttributionFans")===0 && n(m,"unverifiedTransactions")===0;
   const amount=(known,unknown)=>moneyReady && n(m,unknown)===0?n(m,known):null;
   return {
     campaigns:n(m,"campaigns"),activeCampaigns:n(m,"activeCampaigns"),memberships:n(m,"memberships"),
     fans:n(m,"memberships"),fansCount:n(m,"memberships"),uniqueFans:n(m,"uniqueFans"),newFans:n(m,"newFans"),
     payingFans:moneyReady?n(m,"payingFans"):null,unknownAttributionFans:n(m,"unknownAttributionFans"),
-    grossCents:amount("grossCents","unknownGrossTransactions"),unknownGrossTransactions:n(m,"unknownGrossTransactions"),knownNetCents:ready?n(m,"knownNetCents"):null,
+    grossCents:amount("grossCents","unknownGrossTransactions"),unknownGrossTransactions:n(m,"unknownGrossTransactions"),knownNetCents:ready&&supported?n(m,"knownNetCents"):null,
+    revenueUnavailableReason:supported?null:"UNSUPPORTED_CURRENCY",unsupportedCurrencyTransactions:n(m,"unsupportedCurrencyTransactions"),
     unknownNetTransactions:n(m,"unknownNetTransactions"),unverifiedTransactions:n(m,"unverifiedTransactions"),netCents:amount("knownNetCents","unknownNetTransactions"),
     transactionsCount:n(m,"transactionsCount"),transactions:n(m,"transactionsCount"),
     settledGrossCents:amount("settledGrossCents","settledUnknownGrossTransactions"),settledNetCents:amount("settledKnownNetCents","settledUnknownNetTransactions"),
@@ -91,7 +94,8 @@ async function readiness(db,creatorId,now) {
     valueFreshnessMs:row.valueFreshnessMs,nextChangeAt:!row.empty&&current?row.nextChangeAt?.toISOString()||null:null};
 }
 async function sourceCoverage(db,creatorId,now,key) {
-  const [storedFinancial,campaigns,refreshDebt,liveCoverage]=await Promise.all([
+  const currencyWindow = { from: displayRangeBounds(key,now).startAt, to: new Date(+now + 1) };
+  const [storedFinancial,campaigns,refreshDebt,liveCoverage,unsupportedCurrency]=await Promise.all([
     // Creator Demand survives current coverage generation changes.
 
     db.creatorFinancialCollectionState.findUnique({where:{creatorId},select:{status:true,baselineVerifiedAt:true,lastCatchupCompletedAt:true,baselineObservedAt:true,lastCatchupObservedAt:true,retryAfterAt:true,
@@ -99,7 +103,8 @@ async function sourceCoverage(db,creatorId,now,key) {
       historyAuditCursor:true,historyAuditObservedAt:true}}),
     db.creatorCampaignCollectionState.findUnique({where:{creatorId},select:CAMPAIGN_COVERAGE_SELECT}),
     readCampaignRefreshDebt({db,creatorId}),
-    require("./earnings-live-read-sql").readLiveEarningsCoverage(db,creatorId,now),
+    require("./earnings-live-read-sql").readLiveEarningsCoverage(db,creatorId,now,currencyWindow),
+    readUnsupportedFinancialCurrency(db,creatorId,currencyWindow),
   ]);
   const financial=storedFinancial ? {...storedFinancial,liveCoverage} : null;
   // Provider coverage evidence is separate from processing all locally known
@@ -109,7 +114,10 @@ async function sourceCoverage(db,creatorId,now,key) {
   const campaignState=evaluateCampaignCollectionState(campaigns,now,refreshDebt);
   return {financial:financial?{...coverageDto(financial),status:stateVocabulary({...financialState,fresh:financialFresh,stale:financialState.proven&&!financialFresh}),proven:financialState.proven,fresh:financialFresh,
     coverage:financialAuthority.coverageView(financial,now)}:null,
-    revenue:campaignRevenueCoverage(financial,campaignState,displayRangeBounds(key,now),now),campaigns:campaigns?{
+    revenue:unsupportedCurrency || liveCoverage?.unsupportedCurrency ? {
+      ...campaignRevenueCoverage(financial,campaignState,displayRangeBounds(key,now),now),
+      ready:false,fresh:false,status:"UNAVAILABLE",unsupportedCurrency:true,reason:"UNSUPPORTED_CURRENCY"
+    } : campaignRevenueCoverage(financial,campaignState,displayRangeBounds(key,now),now),campaigns:campaigns?{
     ...coverageDto(campaigns),status:stateVocabulary(campaignState),proven:campaignState.proven,fresh:campaignState.fresh,
     providerFresh:campaignState.providerFresh,refreshDebt,
     due:campaignState.due,freshnessAuthority:campaignState.freshnessAuthority,
@@ -138,8 +146,8 @@ async function readCampaignPage({db,creatorId,rangeKey:key="all",cursor=null,lim
   };
   const bounds=displayRangeBounds(key,now);
   return {ok:true,contractVersion:VERSION,creatorId,range:{key,startAt:bounds.startAt.toISOString(),endAt:bounds.endAt.toISOString()},
-    projection,sourceCoverage:coverage,totals:projection.available?metricsDto(byId.get(""),true,coverage.revenue.ready):null,
-    rows:page.map(row=>({...row,...metricsDto(byId.get(row.id),projection.available,coverage.revenue.ready)})),
+    projection,sourceCoverage:coverage,totals:projection.available?metricsDto(byId.get(""),true,coverage.revenue.ready,coverage.revenue.unsupportedCurrency):null,
+    rows:page.map(row=>({...row,...metricsDto(byId.get(row.id),projection.available,coverage.revenue.ready,coverage.revenue.unsupportedCurrency)})),
     pagination:{limit:take,returned:page.length,hasMore:rows.length>take,nextCursor:rows.length>take?encodeCursor(scope,page.at(-1).id):null,order:"IMMUTABLE_ID",semantics:"LIVE_PAGES"}};
 }
 function fanValueDto(value,now,freshnessMs=CAMPAIGN_FAN_VALUE_FRESHNESS_MS) {
@@ -193,7 +201,7 @@ async function readCampaignFanPage({db,creatorId,campaignId,rangeKey:key="all",f
       return [{id:row.id,externalClaimerId:row.externalClaimerId,attributedAt:row.attributedAt?.toISOString()||null,collectedAt:row.collectedAt.toISOString(),
         fan:{id:fan.id,onlyFansUserId:fan.onlyFansUserId,username:fan.username,displayName:fan.displayName,firstSeenAt:fan.firstSeenAt.toISOString(),lastSeenAt:fan.lastSeenAt.toISOString()},
         fanDataStatus,fanDataError:fanDataStatus==="FAILED"?demand.lastError:null,fanDataRetryAttempts:demand?.retryAttempts||0,
-        fanValue:value,revenue:metricsDto(byFan.get(row.fanRecordId),projection.available,coverage.revenue.ready && row.attributedAt!=null)}];
+        fanValue:value,revenue:metricsDto(byFan.get(row.fanRecordId),projection.available,coverage.revenue.ready && row.attributedAt!=null,coverage.revenue.unsupportedCurrency)}];
     }),pagination:{limit:take,returned:pageIds.length,hasMore:ids.length>take,nextCursor:ids.length>take?encodeCursor(scope,pageIds.at(-1).fanId):null,order:"IMMUTABLE_FAN_ID",semantics:"LIVE_PAGES"}};
 }
 module.exports={VERSION,safeInteger,metricsDto,rangeKey,decodeCursor,encodeCursor,readiness,fanValueDto,readCampaignPage,readCampaignFanPage};

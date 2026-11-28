@@ -2,6 +2,7 @@
 const crypto = require("node:crypto");
 const { retainKnownFan } = require("./creator-fact-write-authority");
 const correlation = require("./financial-correlation-service");
+const { isCanonicalUsdCurrency } = require("./usd-money-contract");
 const COMMON = ["agencyId","creatorId","fanId","fanOnlyFansUserIdAtEvent","fanUsernameAtEvent","fanDisplayNameAtEvent","fanAvatarUrlAtEvent",
   "externalTransactionId","amountCents","feeCents","netCents","taxCents","vatCents","mediaTaxCents","transactionStatus","currency",
   "source","sourceUpdatedAt","collectedAt","sourceDeviceId","sourceJobId","updatedAt","financialCorrelation"];
@@ -80,6 +81,7 @@ async function supersede({db,job,rows,observedAt,now,restoringVerifiedLedger=fal
 }
 async function publish({db,job,rows,existing,participants,deviceId,observedAt,now,scanRunId,catchup,restoringVerifiedLedger=false}) {
   if(rows.length>500)throw Error("FINANCIAL_PUBLICATION_PAGE_TOO_LARGE");
+  if(rows.some(row=>!isCanonicalUsdCurrency(row.currency)))throw Object.assign(Error("UNSUPPORTED_CURRENCY"),{code:"UNSUPPORTED_CURRENCY",status:422});
   const financial=rows.map(row=>{
     const previous=existing.get(row.externalTransactionId),fan=participants.fans.get(`${job.creatorId}\u0000${row.fanOnlyFansUserId}`);
     return retainKnownFan(restoringVerifiedLedger?null:previous,{...previous,id:previous?.id||crypto.randomUUID(),createdAt:previous?.createdAt||now,

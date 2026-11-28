@@ -595,6 +595,7 @@ function normalizeChunkItem(item, {
   observationTimeBasis = "SERVER_SCAN_GENERATION_LEGACY",
 }) {
   const raw = object(item);
+  require("./usd-money-contract").requireUsdCurrency(raw.currency, { allowMissing: true });
   const fanId = exactFanId(raw.fanId ?? raw.userId ?? raw.id);
   if (!fanId) return null;
   // Missing/malformed provider fields carry no observation. Explicit null keeps

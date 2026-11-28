@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { normalizeUsdCurrency } = require("./usd-money-contract");
 const {
   runDbTransaction
 } = require("./db-transaction-service");
@@ -106,6 +107,22 @@ function normalizeObservation(input) {
     } else if (key === "replacePairs") {
       if (!value || Array.isArray(value) || Object.entries(value).some(([k, v]) => !["{AMOUNT}", "{PRICE}", "{MESSAGE_LINK}", "{POST_LINK}", "{NAME}"].includes(k) || typeof v !== "string" || v.length > 1200)) fail("NOTIFICATION_EVIDENCE_INVALID");
     } else if (value !== null && !["string", "number", "boolean"].includes(typeof value)) fail("NOTIFICATION_EVIDENCE_INVALID");else if (typeof value === "string" && value.length > 1200) fail("NOTIFICATION_EVIDENCE_INVALID");
+  }
+  if (row.disposition === "FACT" && ["purchases", "tips", "subscriptions"].includes(row.category)) {
+    const currency = normalizeUsdCurrency(input.currency, { allowMissing: true });
+    const explicitEvidenceCurrency = evidence.currency !== undefined
+      && !normalizeUsdCurrency(evidence.currency);
+    const amountEvidence = [evidence.amount, evidence.price, evidence.replacePairs?.["{AMOUNT}"], evidence.replacePairs?.["{PRICE}"]];
+    const foreignAmountEvidence = amountEvidence.some(value => typeof value === "string" && (
+      /[€£¥₽₹₩₺₴₿]/u.test(value)
+      || (value.match(/[A-Za-z]+/g) || []).some(token => !["USD", "US"].includes(token.toUpperCase()))
+    ));
+    if (!currency || explicitEvidenceCurrency || foreignAmountEvidence) {
+      // Keep the original observation for diagnosis, but do not let a stale or
+      // forged normalizer result promote unsupported money into canonical facts.
+      row.disposition = "REJECTED";
+      row.reasonCode = "UNSUPPORTED_CURRENCY";
+    } else row.currency = currency;
   }
   return {
     ...row,

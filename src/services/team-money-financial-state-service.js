@@ -1,9 +1,11 @@
 "use strict";
-const INACTIVE_FINANCIAL_STATUSES = Object.freeze(["undo", "refunded", "refund", "chargeback", "reversed", "reversal", "unverified", "gross_unknown", "superseded"]);
+const { isCanonicalUsdCurrency } = require("./usd-money-contract");
+const INACTIVE_FINANCIAL_STATUSES = Object.freeze(["undo", "refunded", "refund", "chargeback", "reversed", "reversal", "unverified", "gross_unknown", "superseded", "unsupported_currency"]);
 const inactive = new Set(INACTIVE_FINANCIAL_STATUSES);
-function financiallyActive(row) { return !inactive.has(String(row?.financialStatus || "").trim().toLowerCase()); }
-function activeFinancialWhere() { return { OR: [{ financialStatus: null }, { financialStatus: { notIn: INACTIVE_FINANCIAL_STATUSES } }] }; }
+function financiallyActive(row) { return isCanonicalUsdCurrency(row?.currency) && !inactive.has(String(row?.financialStatus || "").trim().toLowerCase()); }
+function activeFinancialWhere() { return { currency: "USD", OR: [{ financialStatus: null }, { financialStatus: { notIn: INACTIVE_FINANCIAL_STATUSES } }] }; }
 function teamFinancialStatus(row, fallback) {
+  if (!isCanonicalUsdCurrency(row?.currency)) return "unsupported_currency";
   const status = String(row?.transactionStatus || fallback || "").trim().toLowerCase();
   return row?.amountCents == null && !inactive.has(status) ? "gross_unknown" : status || null;
 }

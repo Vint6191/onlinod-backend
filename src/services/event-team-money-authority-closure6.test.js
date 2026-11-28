@@ -237,6 +237,7 @@ test("Closure6 senior manager can resolve historical quarantine beyond 48h with 
 test("Closure6 ordinary 48h lock remains for non-senior or non-review manager_override", async () => {
   const old = {
     id: "tip-normal", agencyId: "agency-1", creatorId: "creator-1", eventHash: "H-normal",
+    currency: "USD",
     receivedAt: new Date(Date.now() - 72 * 60 * 60 * 1000), status: "conflict", financialStatus: "done",
     resolvedSource: "creator_tip_conflict", result: {}, history: [],
   };

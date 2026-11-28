@@ -1,5 +1,6 @@
 "use strict";
 const { runDbTransaction } = require("./db-transaction-service");
+const { assertUsdBillingRow } = require("./billing-usd-contract");
 const { runBillingProviderEvent } = require("./billing-provider-event-service");
 
 
@@ -194,6 +195,7 @@ async function updateOrderStatusMonotonically(client, initialOrder, providerStat
 
 function validateProviderPaymentForOrder(order, payload, { requirePrice = false } = {}) {
   if (!order) return { ok: false, reason: "ORDER_NOT_FOUND" };
+  assertUsdBillingRow(order);
   const providerPaymentId = clean(payload?.payment_id ?? payload?.id, 180);
   if (requirePrice && !providerPaymentId) {
     const err = new Error("NOWPayments final payment is missing payment_id");
@@ -489,11 +491,13 @@ function validateHostedCheckoutUrl(value, cfg = providerConfig()) {
 
 function checkoutUrlForOrder(order, cfg = providerConfig()) {
   if (!order) return "";
+  assertUsdBillingRow(order);
   if ((order.testMode === true) !== cfg.sandbox) return "";
   return validateHostedCheckoutUrl(order.providerInvoiceUrl, cfg);
 }
 
 function validateInvoiceResponseForOrder(order, invoice) {
+  assertUsdBillingRow(order);
   const providerOrderId = clean(invoice?.order_id, 180);
   if (providerOrderId && providerOrderId !== String(order.id)) {
     throw permanentBindingError("NOWPayments invoice order_id does not match the NOD billing order", "BILLING_PROVIDER_ORDER_MISMATCH");
@@ -1050,13 +1054,14 @@ async function reconcileOrder({ agencyId, orderId, providerPaymentId = null, act
 
 function publicOrder(row) {
   if (!row) return null;
+  assertUsdBillingRow(row);
   return {
     id: String(row.id),
     provider: String(row.provider || PROVIDER),
     purpose: String(row.purpose || "SUBSCRIPTION"),
     status: String(row.status),
     amountCents: Number(row.amountCents || 0),
-    currency: String(row.currency || "USD"),
+    currency: "USD",
     billingPeriod: String(row.billingPeriod || "MONTHLY"),
     periodMonths: Number(row.periodMonths || 1),
     billedCreators: Number(row.billedCreators || 0),

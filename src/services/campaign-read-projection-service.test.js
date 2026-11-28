@@ -23,7 +23,7 @@ test('FanData TTL, unavailable state, future clock ceiling, unknown and known ze
  assert.equal(valueMetrics({...v,fetchedAt:new Date(+now+300001)},now).metrics.ofValueKnownFans,'0');
 });
 test('unknown NET cannot be normalized to zero; a known zero stays zero',()=>{
- const base={amountCents:100,transactionType:'tip',transactionStatus:'done'};
+ const base={currency:'USD',amountCents:100,transactionType:'tip',transactionStatus:'done'};
  const unknown=metricsDto(financialMetrics({...base,netCents:null}));assert.equal(unknown.netCents,null);assert.equal(unknown.settledNetCents,null);assert.equal(unknown.tipsRevenueCents,null);
  const zero=metricsDto(financialMetrics({...base,netCents:0}));assert.equal(zero.netCents,0);assert.equal(zero.unknownNetTransactions,0);
  assert.equal(metricsDto(financialMetrics({...base,netCents:80}),false).netCents,null);
@@ -37,14 +37,14 @@ test('quarantined old financial evidence is not confirmed or pending money',()=>
  assert.equal(dto.unverifiedTransactions,1);assert.equal(dto.transactionsCount,0);assert.equal(dto.pendingTransactionsCount,0);
 });
 test('superseded canonical projection retracts the old contribution without creating uncertainty',()=>{
- const old={amountCents:1000,netCents:800,transactionType:'tip',transactionStatus:'done'};
+ const old={currency:'USD',amountCents:1000,netCents:800,transactionType:'tip',transactionStatus:'done'};
  const after=financialMetrics({...old,transactionStatus:'superseded',amountCents:null,netCents:null});
  assert.deepEqual(after,{});
  const diff=deltas([{campaignId:'c',fanId:'f',rangeKey:'all',metrics:financialMetrics(old)}],[]);
  assert.equal(diff[0].metrics.knownNetCents,'-800');assert.equal(metricsDto(after).unverifiedTransactions,0);
 });
 test('verified NET without known gross preserves the NET and masks only gross',()=>{
- const evidence=financialMetrics({amountCents:null,netCents:800,transactionType:'tip',transactionStatus:'done'});
+ const evidence=financialMetrics({currency:'USD',amountCents:null,netCents:800,transactionType:'tip',transactionStatus:'done'});
  const dto=metricsDto(evidence);assert.equal(dto.netCents,800);assert.equal(dto.tipsRevenueCents,800);
  assert.equal(dto.grossCents,null);assert.equal(dto.settledGrossCents,null);assert.equal(dto.unknownGrossTransactions,1);
  assert.doesNotThrow(()=>deltas([],[{campaignId:'c',rangeKey:'all',fanId:'f',metrics:evidence}]));
@@ -60,4 +60,17 @@ test('cursor is bound to creator, range, campaign and filter',()=>{
  assert.equal(decodeCursor(cursor,scope),'fan-50');
  for(const index of [2,3,4,5]){const changed=[...scope];changed[index]='other';assert.throws(()=>decodeCursor(cursor,changed),/SCOPE/);}
  assert.throws(()=>decodeCursor('x'.repeat(5000),scope),/INVALID/);
+});
+
+test('unsupported persisted currency reverses old amounts into explicit uncertainty, including foreign zero',()=>{
+ for (const currency of ['EUR','GBP','usd','',null,undefined]) {
+  const evidence=financialMetrics({currency,amountCents:1000,netCents:0,transactionType:'tip',transactionStatus:'done'});
+  assert.deepEqual(evidence,{unsupportedCurrencyTransactions:'1'});
+  const dto=metricsDto(evidence);
+  for (const field of ['grossCents','netCents','knownNetCents','settledNetCents','tipsRevenueCents']) assert.equal(dto[field],null,field);
+  assert.equal(dto.revenueUnavailableReason,'UNSUPPORTED_CURRENCY');
+ }
+ const before=[{campaignId:'c',rangeKey:'all',fanId:'f',metrics:financialMetrics({currency:'USD',amountCents:1000,netCents:800,transactionType:'tip',transactionStatus:'done'})}];
+ const after=[{...before[0],metrics:financialMetrics({currency:'EUR',amountCents:1000,netCents:800,transactionType:'tip',transactionStatus:'done'})}];
+ const diff=deltas(before,after);assert.equal(diff[0].metrics.knownNetCents,'-800');assert.equal(diff[0].metrics.unsupportedCurrencyTransactions,'1');
 });

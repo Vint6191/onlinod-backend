@@ -78,7 +78,7 @@ const payloads = {
       sourceId: id,
       expectedRevision: z.number().int().min(0),
       costCents: z.number().int().min(0).max(2147483647),
-      currency: z.string().regex(/^[A-Z]{3}$/),
+      currency: z.literal("USD"),
     })
     .strict(),
   "media.metadata": z

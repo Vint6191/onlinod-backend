@@ -59,6 +59,7 @@ function financialMetrics(row) {
   if (String(row.transactionStatus || "").toLowerCase() === "unverified" || row.reasonCode === "LEGACY_FINANCIAL_UNVERIFIED") {
     return { unverifiedTransactions: "1" };
   }
+  if (row.currency !== "USD") return { unsupportedCurrencyTransactions: "1" };
   const net = row.netCents, settled = String(row.transactionStatus || "").toLowerCase() === "done";
   const type = String(row.transactionType || "").toLowerCase();
   const category = type.startsWith("subscription") ? "subscription" : ["message","chat_message","chat_messages"].includes(type) ? "sales" : ["tip","tips"].includes(type) ? "tips" : null;

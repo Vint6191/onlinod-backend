@@ -203,8 +203,8 @@ function messageFromBlock(block = {}, index = 0) {
     role: block.role || "message",
     title: block.title || block.role || `Message ${index + 1}`,
     text: block.text || "",
-    price: dollarsFromCents(block.priceCents),
-    currency: block.currency || "USD",
+    price: require("../services/usd-money-contract").isCanonicalUsdCurrency(block.currency) ? dollarsFromCents(block.priceCents) : null,
+    currency: require("../services/usd-money-contract").isCanonicalUsdCurrency(block.currency) ? "USD" : null,
     lockedText: block.lockedText === true,
     media: normalizeMlMedia(block.media),
     note: block.note || "",
@@ -280,7 +280,7 @@ function normalizeMlMessage(message = {}, index = 0) {
     title: optionalString(message.title || message.role || `Message ${index + 1}`, 180),
     text: mlText(message.text ?? message.messageText ?? message.body ?? "", 12000),
     priceCents: message.priceCents !== undefined ? centsFromAny(message, "priceCents", "price") : centsFromDollars(message.price),
-    currency: cleanString(message.currency || "USD", 10).toUpperCase() || "USD",
+    currency: require("../services/usd-money-contract").requireUsdCurrency(message.currency, { allowMissing: true }),
     lockedText: message.lockedText === true,
     media: normalizeMlMedia(message.media),
     note: optionalString(message.note, 2000),
@@ -578,7 +578,8 @@ router.get("/message-library/usage", async (req, res) => {
       WHERE e."agencyId"=$1 AND e."creatorId"=$2 AND (c."kind"=$3 OR e."metadata"->>'product'=$3)
       ORDER BY e."createdAt" DESC,e."id" DESC LIMIT $4 OFFSET $5`,
       req.auth.agencyId, creatorId, MESSAGE_LIBRARY_KIND, parseLimit(req.query.limit,500,2000), parseOffset(req.query.offset));
-    return res.json({ ok: true, source: "server", creatorId, events, count: events.length });
+    return res.json({ ok: true, source: "server", creatorId,
+      events: events.map(require("../services/message-library-usage-service").usageEventForRead), count: events.length });
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_USAGE_LIST_FAILED");
   }

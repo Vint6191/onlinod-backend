@@ -323,12 +323,16 @@ function cleanMetric(metric) {
     metric.seenResponseAvgSeconds = mean(metric._seenResponseSeconds);
     metric.seenResponseMedianSeconds = median(metric._seenResponseSeconds);
   }
-  metric.dollarsPerMessageCents = metric.messagesSent > 0 ? Math.round(metric.revenueAttributedCents / metric.messagesSent) : 0;
+  metric.dollarsPerMessageCents = metric.revenueAttributedCents !== null && metric.messagesSent > 0
+    ? Math.round(metric.revenueAttributedCents / metric.messagesSent)
+    : (metric.revenueAttributedCents === 0 ? 0 : null);
   const ppvRevenue = singleCurrencyValue(metric._ppvRevenueByCurrency);
   metric.ppvRevenueByCurrency = currencyBucketObject(metric._ppvRevenueByCurrency);
   metric.ppvRevenueCurrency = ppvRevenue.currency;
+  metric.ppvRevenueUnavailableReason = ppvRevenue.unsupported ? "UNSUPPORTED_CURRENCY" : null;
   metric.ppvRevenueCents = ppvRevenue.cents;
-  metric.ppvOpenRatePct = metric.ppvSentMessages > 0 ? (metric.ppvSoldMessages / metric.ppvSentMessages) * 100 : null;
+  if (ppvRevenue.unsupported) metric.ppvSoldMessages = null;
+  metric.ppvOpenRatePct = !ppvRevenue.unsupported && metric.ppvSentMessages > 0 ? (metric.ppvSoldMessages / metric.ppvSentMessages) * 100 : null;
   metric.topDialogSessions = dialogSessions.map((item) => ({
     fanId: item.fanId || null,
     accountId: item.accountId || null,
@@ -445,6 +449,7 @@ async function loadHistoricalCoverage({ agencyId }) {
       activityCoverageFrom: row.activityCoverageFrom ? new Date(row.activityCoverageFrom) : null,
       moneyCoverageFrom: row.moneyCoverageFrom ? new Date(row.moneyCoverageFrom) : null,
       activityProjectionVersion: String(row.activityProjectionVersion || "team_activity_daily_v1"),
+      activityContributionCutoverAt: row.activityContributionCutoverAt ? new Date(row.activityContributionCutoverAt) : null,
       moneyProjectionVersion: String(row.moneyProjectionVersion || "team_money_fact_v2"),
       source: String(row.source || "phase2_historical_authority"),
     };
@@ -659,15 +664,28 @@ async function teamScaleQuery(section, sql, params) {
 }
 
 async function loadMoneyEvidenceStatus({ agencyId, range, allowedCreatorIds = null }) {
-  const where = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds, range, field: "occurredAt",
-    extra: [`m."financialStatus" IN ('unverified','gross_unknown')`] });
-  if (where.empty) return { hasUnverifiedFinancialFacts: false, hasUnknownGross: false };
-  // Presence, not a history count: both probes use partial agency/range or
-  // creator/range indexes and stop at their first matching unresolved fact.
+  const where = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds, range, field: "occurredAt" });
+  if (where.empty) return { hasUnverifiedFinancialFacts: false, hasUnknownGross: false, hasUnsupportedCurrency: false, unsupportedMembers: [] };
   const [row] = await teamScaleQuery("money_evidence", `SELECT
     EXISTS(SELECT 1 FROM "TeamMoneyAttributionFact" m WHERE ${where.sql} AND m."financialStatus"='unverified') AS "hasUnverifiedFinancialFacts",
     EXISTS(SELECT 1 FROM "TeamMoneyAttributionFact" m WHERE ${where.sql} AND m."financialStatus"='gross_unknown') AS "hasUnknownGross"`, where.params);
-  return { hasUnverifiedFinancialFacts: row?.hasUnverifiedFinancialFacts === true, hasUnknownGross: row?.hasUnknownGross === true };
+  // Keep retained foreign facts and stale foreign rollups as explicit debt.
+  // Filtering the amount alone would turn an unsupported historical payment
+  // into a trustworthy zero and could hide a removed member's only activity.
+  const factWhere = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds, range, field: "occurredAt",
+    extra: [`(m."currency" IS DISTINCT FROM 'USD' OR m."financialStatus"='unsupported_currency')`] });
+  const fullStart = ceilUtcDay(range.startAt), fullEnd = floorUtcDay(range.endAt);
+  const rollupWhere = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds,
+    range: { startAt: fullStart, endAt: new Date(+fullEnd - 1) }, field: "day",
+    extra: [`m."currency" IS DISTINCT FROM 'USD'`] });
+  const [facts, rollups] = await Promise.all([
+    teamScaleQuery("money_currency_evidence", `SELECT m."memberId",bool_or(m."sourceType"='PPV') AS ppv
+      FROM "TeamMoneyAttributionFact" m WHERE ${factWhere.sql} GROUP BY m."memberId"`, factWhere.params),
+    fullStart < fullEnd ? teamScaleQuery("money_currency_rollup_evidence", `SELECT m."memberId",bool_or(m."sourceType"='PPV') AS ppv
+      FROM "TeamMoneyDailyRollup" m WHERE ${rollupWhere.sql} GROUP BY m."memberId"`, rollupWhere.params) : Promise.resolve([]),
+  ]);
+  return { hasUnverifiedFinancialFacts: row?.hasUnverifiedFinancialFacts === true, hasUnknownGross: row?.hasUnknownGross === true,
+    hasUnsupportedCurrency: facts.length > 0 || rollups.length > 0, unsupportedMembers: [...facts, ...rollups] };
 }
 
 async function financialPublicationState({ agencyId, allowedCreatorIds = null }) {
@@ -709,38 +727,19 @@ function rowIso(row, key) {
   return Number.isFinite(date.getTime()) ? date.toISOString() : null;
 }
 
-async function loadActivitySummarySql({ agencyId, range, allowedCreatorIds = null, exactRaw = false }) {
-  if (exactRaw) {
-    const where = sqlScopedWhere({
-      alias: "e", agencyId, allowedCreatorIds, range, field: "ts",
-      extra: [`e."memberId" IS NOT NULL`, currentTelemetrySql("e")],
-    });
-    if (where.empty) return [];
-    const sql = `
-      SELECT
-        e."memberId" AS "memberId",
-        COUNT(*) FILTER (WHERE e."eventKind" = 'MESSAGE_SEND_CONFIRMED' AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "messagesSent",
-        COUNT(*) FILTER (WHERE e."eventKind" = 'MESSAGE_SEND_CONFIRMED' AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED' AND (e."isPpv" = TRUE OR COALESCE(e."priceCents", 0) > 0))::bigint AS "ppvSentMessages",
-        COUNT(*) FILTER (WHERE e."eventKind" = 'BROADCAST_DISPATCH_CONFIRMED')::bigint AS "broadcastDispatches",
-        COUNT(*) FILTER (WHERE e."eventKind" = 'CONTENT_POST_PUBLISHED_CONFIRMED' AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "postsCreated",
-        COUNT(*) FILTER (WHERE e."eventKind" = 'CONTENT_STORY_PUBLISHED_CONFIRMED' AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "storiesCreated",
-        COUNT(*) FILTER (WHERE e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "contentActions",
-        COALESCE(SUM(CASE WHEN e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED' THEN COALESCE(e."mediaCount",0) ELSE 0 END), 0)::bigint AS "contentMediaItemsPublished",
-        COUNT(DISTINCT e."creatorId") FILTER (WHERE e."creatorId" IS NOT NULL AND e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "contentCreatorCoverage",
-        COUNT(DISTINCT DATE_TRUNC('day', e."ts")) FILTER (WHERE e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "contentActiveDays",
-        MAX(e."ts") FILTER (WHERE e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED') AS "lastContentActivityAt"
-      FROM "TeamActivityEvent" e
-      WHERE ${where.sql}
-      GROUP BY e."memberId"
-    `;
-    return teamScaleQuery("activity_summary", sql, where.params);
-  }
-
+async function loadActivitySummarySql({ agencyId, range, allowedCreatorIds = null, exactInstant = false }) {
+  // A transport observation is not a new human action. The compact owner keeps
+  // the first actor/time across device retries and rolling localId generations.
+  // Exact windows use that same contribution as the daily ledger, including its
+  // timestamp when a replay arrives after the original left the rolling window.
   const where = sqlScopedWhere({
-    alias: "d", agencyId, allowedCreatorIds, range, field: "day",
-    extra: [`d."memberId" IS NOT NULL`],
+    alias: "d", agencyId, allowedCreatorIds, range, field: exactInstant ? "sourceEventAt" : "day",
+    extra: [`d."memberId" IS NOT NULL`, ...(exactInstant
+      ? [`d."state" IN ('APPLIED','APPLIED_BASELINE')`, `d."projectionVersion" = 'team_activity_contribution_v2'`] : [])],
   });
   if (where.empty) return [];
+  const table = exactInstant ? "TeamActivityContribution" : "TeamMemberActivityDaily";
+  const contentAt = exactInstant ? `MAX(d."sourceEventAt") FILTER (WHERE d."contentActions" > 0)` : `MAX(d."lastContentActivityAt")`;
   const sql = `
     SELECT
       d."memberId" AS "memberId",
@@ -753,8 +752,8 @@ async function loadActivitySummarySql({ agencyId, range, allowedCreatorIds = nul
       COALESCE(SUM(d."contentMediaItemsPublished"),0)::bigint AS "contentMediaItemsPublished",
       COUNT(DISTINCT d."creatorId") FILTER (WHERE d."creatorId" IS NOT NULL AND d."contentActions" > 0)::bigint AS "contentCreatorCoverage",
       COUNT(DISTINCT d."day") FILTER (WHERE d."contentActions" > 0)::bigint AS "contentActiveDays",
-      MAX(d."lastContentActivityAt") AS "lastContentActivityAt"
-    FROM "TeamMemberActivityDaily" d
+      ${contentAt} AS "lastContentActivityAt"
+    FROM "${table}" d
     WHERE ${where.sql}
     GROUP BY d."memberId"
   `;
@@ -826,11 +825,11 @@ async function loadDialogSummarySql({ agencyId, range, allowedCreatorIds = null,
   if (where.empty) return [];
   let params = [...where.params];
   let moneyJoin = "";
-  let moneySelect = `NULL::text AS "currency", 0::bigint AS "revenueCents"`;
+  let moneySelect = `NULL::text AS "currency", 0::bigint AS "revenueCents", false AS "unsupportedCurrency"`;
   let moneyGroup = "";
   if (includeMoney) {
     const scope = normalizedCreatorScope(allowedCreatorIds);
-    const moneyClauses = [`m."agencyId" = $1`, `m."classificationState" = 'CANONICAL'`, `m."attributionActive" = TRUE`, `m."memberId" = r."memberId"`, `m."creatorId" = r."creatorId"`, `COALESCE(NULLIF(m."fanId",''), NULLIF(m."dialogId",'')) = r."fanKey"`];
+    const moneyClauses = [`m."agencyId" = $1`, `m."classificationState" = 'CANONICAL'`, `(m."attributionActive" = TRUE OR m."currency" IS DISTINCT FROM 'USD' OR m."financialStatus"='unsupported_currency')`, `m."memberId" = r."memberId"`, `m."creatorId" = r."creatorId"`, `COALESCE(NULLIF(m."fanId",''), NULLIF(m."dialogId",'')) = r."fanKey"`];
     if (scope) {
       const scopeIndex = where.params.findIndex((value) => Array.isArray(value)) + 1;
       if (scopeIndex > 0) moneyClauses.push(`m."creatorId" = ANY($${scopeIndex}::text[])`);
@@ -844,8 +843,8 @@ async function loadDialogSummarySql({ agencyId, range, allowedCreatorIds = null,
       moneyClauses.push(`m."occurredAt" <= $${params.length}`);
     }
     moneyJoin = `LEFT JOIN "TeamMoneyAttributionFact" m ON ${moneyClauses.join(" AND ")}`;
-    moneySelect = `m."currency" AS "currency", COALESCE(SUM(m."amountCents"),0)::bigint AS "revenueCents"`;
-    moneyGroup = `, m."currency"`;
+    moneySelect = `'USD'::text AS "currency", COALESCE(SUM(m."amountCents") FILTER (WHERE m."currency"='USD' AND m."attributionActive"=TRUE),0)::bigint AS "revenueCents",
+      COALESCE(bool_or(m."id" IS NOT NULL AND (m."currency" IS DISTINCT FROM 'USD' OR m."financialStatus"='unsupported_currency')),false) AS "unsupportedCurrency"`;
   }
   const sql = `
     WITH grouped AS (
@@ -951,26 +950,25 @@ async function loadMoneySummaryRollupSql({ agencyId, range, allowedCreatorIds = 
 
   const sql = `
     WITH money_slices AS (
-      SELECT r."memberId", r."sourceType", r."currency",
+      SELECT r."memberId", r."sourceType",
              SUM(r."factCount")::bigint AS "factCount", SUM(r."amountCents")::bigint AS "amountCents"
       FROM "TeamMoneyDailyRollup" r
-      WHERE r."agencyId"=$1 AND r."memberId" IS NOT NULL
+      WHERE r."agencyId"=$1 AND r."memberId" IS NOT NULL AND r."currency"='USD'
         AND r."day" >= $2::date AND r."day" < $3::date${rollupScope}
-      GROUP BY r."memberId", r."sourceType", r."currency"
+      GROUP BY r."memberId", r."sourceType"
       UNION ALL
-      SELECT m."memberId", m."sourceType", m."currency",
+      SELECT m."memberId", m."sourceType",
              COUNT(*)::bigint AS "factCount", COALESCE(SUM(m."amountCents"),0)::bigint AS "amountCents"
       FROM "TeamMoneyAttributionFact" m
-      WHERE m."agencyId"=$1 AND m."classificationState"='CANONICAL' AND m."attributionActive"=TRUE AND m."memberId" IS NOT NULL
+      WHERE m."agencyId"=$1 AND m."classificationState"='CANONICAL' AND m."attributionActive"=TRUE AND m."currency"='USD' AND m."memberId" IS NOT NULL
         AND m."occurredAt" >= $4 AND m."occurredAt" <= $5
         AND (m."occurredAt" < $2 OR m."occurredAt" >= $3)${factScope}
-      GROUP BY m."memberId", m."sourceType", m."currency"
+      GROUP BY m."memberId", m."sourceType"
     )
-    SELECT x."memberId" AS "memberId", x."sourceType" AS "sourceType", x."currency" AS "currency",
-           GROUPING(x."sourceType")::int AS "sourceGrouped", GROUPING(x."currency")::int AS "currencyGrouped",
+    SELECT x."memberId" AS "memberId", x."sourceType" AS "sourceType", 'USD'::text AS "currency",
            COALESCE(SUM(x."factCount"),0)::bigint AS "factCount", COALESCE(SUM(x."amountCents"),0)::bigint AS "amountCents"
     FROM money_slices x
-    GROUP BY GROUPING SETS ((x."memberId",x."sourceType",x."currency"),(x."memberId"))
+    GROUP BY x."memberId",x."sourceType"
   `;
   return teamScaleQuery("money_summary_rollup", sql, params);
 }
@@ -980,15 +978,14 @@ async function loadMoneySummarySql({ agencyId, range, allowedCreatorIds = null, 
     const rolled = await loadMoneySummaryRollupSql({ agencyId, range, allowedCreatorIds });
     if (rolled !== null) return rolled;
   }
-  const where = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds, range, field: "occurredAt", extra: [`m."classificationState" = 'CANONICAL'`, `m."attributionActive" = TRUE`, `m."memberId" IS NOT NULL`] });
+  const where = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds, range, field: "occurredAt", extra: [`m."classificationState" = 'CANONICAL'`, `m."attributionActive" = TRUE`, `m."currency" = 'USD'`, `m."memberId" IS NOT NULL`] });
   if (where.empty) return [];
   const sql = `
-    SELECT m."memberId" AS "memberId", m."sourceType" AS "sourceType", m."currency" AS "currency",
-           GROUPING(m."sourceType")::int AS "sourceGrouped", GROUPING(m."currency")::int AS "currencyGrouped",
+    SELECT m."memberId" AS "memberId", m."sourceType" AS "sourceType", 'USD'::text AS "currency",
            COUNT(*)::bigint AS "factCount", COALESCE(SUM(m."amountCents"),0)::bigint AS "amountCents"
     FROM "TeamMoneyAttributionFact" m
     WHERE ${where.sql}
-    GROUP BY GROUPING SETS ((m."memberId",m."sourceType",m."currency"),(m."memberId"))
+    GROUP BY m."memberId",m."sourceType"
   `;
   return teamScaleQuery("money_summary", sql, where.params);
 }
@@ -1114,10 +1111,11 @@ function responseSummaryFromAggregate(row, source, coverageFrom) {
 async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
   const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   const range = resolveRange(rangeKey, authorityNow);
+  const exactActivity = String(range.key || "") === "24h";
   // Enclose coverage as well as aggregates: old ready flags must not be paired
   // with a first boundary sampled after a concurrently completed publication.
   const publicationAtStart = includeMoney ? await financialPublicationState({ agencyId, allowedCreatorIds }) : null;
-  const [projectionCoverage, historicalCoverage, retentionPolicy, members, moneyRootCoverageStatus, moneyReadSummaryStatus, dialogGenerationStatus, responseRepairStatus] = await Promise.all([
+  const [projectionCoverage, historicalCoverage, retentionPolicy, members, moneyRootCoverageStatus, moneyReadSummaryStatus, dialogGenerationStatus, responseRepairStatus, activityContributionStatus] = await Promise.all([
     loadProjectionCoverage({ agencyId }),
     loadHistoricalCoverage({ agencyId }),
     getRetentionSettings(),
@@ -1126,6 +1124,7 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
     includeMoney ? teamMoneyReadSummaryGenerationStatus({ agencyId }) : Promise.resolve({ ready: false, coverage: { state: "NOT_REQUIRED" }, outstanding: false }),
     phase2CoverageStatus({ agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION, generation: PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION }),
     phase2CoverageStatus({ agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR, generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR }),
+    exactActivity ? phase2CoverageStatus({ agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_ACTIVITY_CONTRIBUTION, generation: PHASE2_COVERAGE_GENERATION.TEAM_ACTIVITY_CONTRIBUTION }) : Promise.resolve(null),
   ]);
   // Physical readers are already mapped to the Current tables. Freshness is a
   // separate live-convergence axis; it must never select legacy rows fail-open.
@@ -1143,19 +1142,18 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
     dialogCoverageFrom: projectionCoverage.dialogCoverageFrom,
   });
   const rawRange = clampRangeToDetail(range, detailDays);
-  const exactRawActivity = String(range.key || "") === "24h";
   const activityRange = range;
   const responseRange = projectionDetail.responseRange;
   const dialogRange = projectionDetail.dialogRange;
 
   const [activityRows, legacyRows, responseRows, dialogRows, pendingRows, moneyRows, audienceRows, moneyEvidence] = await Promise.all([
-    loadActivitySummarySql({ agencyId, range: activityRange, allowedCreatorIds, exactRaw: exactRawActivity }),
+    loadActivitySummarySql({ agencyId, range: activityRange, allowedCreatorIds, exactInstant: exactActivity }),
     rawRange ? loadLegacyBoundedSummarySql({ agencyId, range: rawRange, allowedCreatorIds }) : Promise.resolve([]),
     responseRange ? loadResponseSummarySql({ agencyId, range: responseRange, allowedCreatorIds, currentGenerationOnly: currentResponseGeneration }) : Promise.resolve([]),
     dialogRange ? loadDialogSummarySql({ agencyId, range: dialogRange, allowedCreatorIds, includeMoney }) : Promise.resolve([]),
     loadPendingSummarySql({ agencyId, allowedCreatorIds, authorityNow, currentGenerationOnly: currentDialogGeneration }),
     includeMoney ? loadMoneySummarySql({ agencyId, range, allowedCreatorIds, rollupReady: moneyReadSummaryStatus.ready === true }) : Promise.resolve([]),
-    loadAudienceCoverageSummarySql({ agencyId, range, rawRange, allowedCreatorIds, includeMoney, exactRawActivity }),
+    loadAudienceCoverageSummarySql({ agencyId, range, rawRange, allowedCreatorIds, includeMoney, exactRawActivity: exactActivity }),
     includeMoney ? loadMoneyEvidenceStatus({ agencyId, range, allowedCreatorIds }) : Promise.resolve({}),
   ]);
   // Canonical sales/tips and their Team projections are rebuilt in bounded
@@ -1228,6 +1226,7 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
       dialogBuckets.set(key, item);
     }
     if (includeMoney && row.currency) item.revenue.set(normalizeCurrency(row.currency), Math.max(0, rowNumber(row, "revenueCents", 0)));
+    if (includeMoney && row.unsupportedCurrency === true) item.revenue.set("UNSUPPORTED_CURRENCY", 0);
   }
   for (const item of dialogBuckets.values()) {
     const metric = metricFor(item.memberId);
@@ -1282,9 +1281,6 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
   for (const row of moneyRows || []) {
     const metric = metricFor(row.memberId);
     if (!metric) continue;
-    if (Number(row?.sourceGrouped) === 1 && Number(row?.currencyGrouped) === 1) {
-          continue;
-    }
     const currency = normalizeCurrency(row.currency);
     const cents = Math.max(0, rowNumber(row, "amountCents", 0));
     addCurrencyToMap(revenueByMember, row.memberId, currency, cents);
@@ -1294,6 +1290,12 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
     }
   }
 
+  for (const issue of moneyEvidence.unsupportedMembers || []) {
+    if (!issue.memberId) continue;
+    const metric = metricFor(issue.memberId);
+    addCurrencyToMap(revenueByMember, issue.memberId, null, 0);
+    if (issue.ppv && metric) metric._ppvRevenueByCurrency.set("UNSUPPORTED_CURRENCY", 0);
+  }
   const byMember = new Map();
   for (const [memberId, metric] of metricsByMember.entries()) {
     const revenueBucket = revenueByMember.get(memberId) || new Map();
@@ -1302,16 +1304,17 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
       metric.revenueByCurrency = currencyBucketObject(revenueBucket);
       metric.revenueAttributedCents = revenue.cents;
       metric.revenueCurrency = revenue.currency;
-      metric.moneySource = revenue.mixed ? "team_money_fact_v2_multi_currency" : "team_money_fact_v2";
+      metric.moneySource = "team_money_fact_v2";
+      metric.revenueUnavailableReason = revenue.unsupported ? "UNSUPPORTED_CURRENCY" : null;
     }
     const cleaned = cleanMetric(metric);
     if (includeMoney && Array.isArray(cleaned.topDialogSessions)) {
       cleaned.topDialogSessions = cleaned.topDialogSessions.map((dialog) => {
         const item = dialogBuckets.get(`${memberId}|${dialog.accountId || ""}|${dialog.fanId || ""}`);
-        const bucket = item?._revenue || new Map();
+        const bucket = item?.revenue || new Map();
         const revenue = singleCurrencyValue(bucket);
         const sharePct = cleaned.dialogDwellSeconds > 0 ? Math.round((num(dialog.dwellSeconds, 0) / cleaned.dialogDwellSeconds) * 100) : 0;
-        return { ...dialog, shiftRevenueByCurrency: currencyBucketObject(bucket), shiftRevenueCents: revenue.cents, shiftRevenueCurrency: revenue.currency, shiftRevenueUsd: revenue.currency === "USD" ? Math.round(revenue.cents || 0) / 100 : null, shiftTimeSharePct: sharePct };
+        return { ...dialog, shiftRevenueUnavailableReason: revenue.unsupported ? "UNSUPPORTED_CURRENCY" : null, shiftRevenueByCurrency: currencyBucketObject(bucket), shiftRevenueCents: revenue.cents, shiftRevenueCurrency: revenue.currency, shiftRevenueUsd: revenue.currency === "USD" ? Math.round(revenue.cents || 0) / 100 : null, shiftTimeSharePct: sharePct };
       });
     } else if (Array.isArray(cleaned.topDialogSessions)) {
       cleaned.topDialogSessions = cleaned.topDialogSessions.map((dialog) => ({ ...dialog, shiftTimeSharePct: cleaned.dialogDwellSeconds > 0 ? Math.round((num(dialog.dwellSeconds, 0) / cleaned.dialogDwellSeconds) * 100) : 0 }));
@@ -1335,15 +1338,26 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
     ? (projectionDetail.responseCoverage.status === "FULL" ? "team_response_case_v2" : (responseRange ? "bounded_projection_partial_v2" : "unavailable"))
     : (projectionDetail.responseCoverage.status === "FULL" ? "team_response_case_legacy_transition" : (responseRange ? "bounded_projection_partial" : "unavailable"));
   const responseSummary = responseSummaryFromAggregate(totalResponseRow || {}, responseSource, projectionDetail.responseAvailableFrom?.toISOString?.() || null);
-  const activityCoverage = coverageState(range, historicalCoverage.activityCoverageFrom);
+  const baseActivityCoverage = coverageState(range, historicalCoverage.activityCoverageFrom);
+  const activityUnresolved = Math.max(0, Number(activityContributionStatus?.row?.unresolvedCount || 0));
+  const activityCoverage = exactActivity ? {
+    ...baseActivityCoverage,
+    status: activityContributionStatus?.currentReady === true && activityUnresolved === 0 ? baseActivityCoverage.status : "PARTIAL",
+    contributionGeneration: activityContributionStatus?.semanticState || activityContributionStatus?.state || "MISSING",
+    unresolvedContributions: activityUnresolved,
+    contributionCutoverAt: historicalCoverage.activityContributionCutoverAt?.toISOString?.() || null,
+  } : baseActivityCoverage;
   const baseMoneyCoverage = coverageState(range, historicalCoverage.moneyCoverageFrom);
   const classificationUnresolved = Math.max(0, Number(moneyRootCoverageStatus?.row?.unresolvedCount || 0));
   const moneyCoverage = includeMoney ? {
     ...baseMoneyCoverage,
     status: moneyRootCoverageStatus?.currentReady && classificationUnresolved === 0
-      && !moneyEvidence.hasUnverifiedFinancialFacts && !moneyEvidence.hasUnknownGross
+      && !moneyEvidence.hasUnverifiedFinancialFacts && !moneyEvidence.hasUnknownGross && !moneyEvidence.hasUnsupportedCurrency
       && !publicationPending ? baseMoneyCoverage.status : "PARTIAL",
-    ...moneyEvidence,
+    hasUnverifiedFinancialFacts: moneyEvidence.hasUnverifiedFinancialFacts,
+    hasUnknownGross: moneyEvidence.hasUnknownGross,
+    hasUnsupportedCurrency: moneyEvidence.hasUnsupportedCurrency,
+    currencyUnavailableReason: moneyEvidence.hasUnsupportedCurrency ? "UNSUPPORTED_CURRENCY" : null,
     financialPublicationPending: publicationPending,
     rootClassification: moneyRootCoverageStatus?.semanticState || moneyRootCoverageStatus?.state || "MISSING",
     unresolvedRootGenerations: classificationUnresolved,
@@ -1384,8 +1398,8 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
         rawDetailRetainedFrom: projectionDetail.detailRetainedFrom.toISOString(),
         rawDetailDays: detailDays,
         families: {
-          manualActivity: { ...activityCoverage, source: exactRawActivity ? "team_activity_event_v13_exact_sql" : historicalCoverage.activityProjectionVersion },
-          content: { ...activityCoverage, source: exactRawActivity ? "team_activity_event_v13_exact_sql" : historicalCoverage.activityProjectionVersion },
+          manualActivity: { ...activityCoverage, source: exactActivity ? "team_activity_contribution_v2_exact_sql" : historicalCoverage.activityProjectionVersion },
+          content: { ...activityCoverage, source: exactActivity ? "team_activity_contribution_v2_exact_sql" : historicalCoverage.activityProjectionVersion },
           money: { ...moneyCoverage, source: historicalCoverage.moneyProjectionVersion },
           responses: { ...projectionDetail.responseCoverage, source: "bounded_team_response_case_v1_sql" },
           dialogs: { ...projectionDetail.dialogCoverage, source: "bounded_team_dialog_session_v1_sql" },
@@ -1906,57 +1920,43 @@ const ATTRIBUTED_PPV_STATUSES = ["attributed", "resolved"];
 const ATTRIBUTED_TIP_STATUSES = ["attributed", "claimed", "resolved"];
 
 function normalizeCurrency(value) {
-  const currency = String(value || "USD").trim().toUpperCase();
-  return /^[A-Z]{3}$/.test(currency) ? currency : "USD";
+  return value === "USD" ? "USD" : "UNSUPPORTED_CURRENCY";
 }
 
 function addCurrencyToMap(map, key, currency, cents) {
   const safeKey = String(key || "").trim();
   if (!safeKey) return;
-  const code = normalizeCurrency(currency);
-  const bucket = map.get(safeKey) || new Map();
-  bucket.set(code, (bucket.get(code) || 0) + Math.max(0, num(cents, 0)));
+  const code = normalizeCurrency(currency), bucket = map.get(safeKey) || new Map();
+  bucket.set(code, code === "USD" ? (bucket.get(code) || 0) + Math.max(0, num(cents, 0)) : 0);
   map.set(safeKey, bucket);
 }
 
 function mergeRevenueCurrencyMaps(...maps) {
   const out = new Map();
-  for (const map of maps || []) {
-    for (const [key, bucket] of map?.entries?.() || []) {
-      for (const [currency, cents] of bucket?.entries?.() || []) addCurrencyToMap(out, key, currency, cents);
-    }
-  }
+  for (const map of maps || []) for (const [key, bucket] of map?.entries?.() || [])
+    for (const [currency, cents] of bucket?.entries?.() || []) addCurrencyToMap(out, key, currency, cents);
   return out;
 }
 
 function currencyBucketObject(bucket) {
-  return Object.fromEntries([...(bucket?.entries?.() || [])].sort(([a], [b]) => a.localeCompare(b)));
+  if ([...(bucket?.keys?.() || [])].some(code => code !== "USD")) return null;
+  return bucket?.has("USD") ? { USD: bucket.get("USD") } : {};
 }
 
 function singleCurrencyValue(bucket) {
-  const entries = [...(bucket?.entries?.() || [])];
-  if (entries.length === 0) return { cents: 0, currency: null, mixed: false };
-  if (entries.length === 1) return { cents: entries[0][1], currency: entries[0][0], mixed: false };
-  return { cents: null, currency: null, mixed: true };
+  if ([...(bucket?.keys?.() || [])].some(code => code !== "USD")) return { cents: null, currency: null, unsupported: true };
+  return { cents: bucket?.get("USD") || 0, currency: "USD", unsupported: false };
 }
 
 function bucketTotal(bucket) {
-  let total = 0;
-  for (const value of bucket?.values?.() || []) total += Math.max(0, num(value, 0));
-  return total;
+  return singleCurrencyValue(bucket).cents;
 }
 
 function formatCurrencyBucketForAlert(bucketObject) {
-  const entries = Object.entries(bucketObject && typeof bucketObject === "object" ? bucketObject : {})
-    .map(([currency, cents]) => [normalizeCurrency(currency), Math.max(0, num(cents, 0))])
-    .filter(([, cents]) => cents > 0)
-    .sort(([a], [b]) => a.localeCompare(b));
-  if (entries.length === 0) return { text: "no attributed revenue", hasRevenue: false, mixed: false };
-  return {
-    text: entries.map(([currency, cents]) => `${currency} ${(cents / 100).toFixed(2)}`).join(" + "),
-    hasRevenue: true,
-    mixed: entries.length > 1,
-  };
+  if (bucketObject == null || Object.keys(bucketObject).some(code => code !== "USD"))
+    return { text: "attributed revenue unavailable", hasRevenue: false };
+  const cents = Math.max(0, num(bucketObject.USD, 0));
+  return { text: cents > 0 ? `USD ${(cents / 100).toFixed(2)}` : "no attributed revenue", hasRevenue: cents > 0 };
 }
 
 async function getPpvLedgerRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
@@ -2018,6 +2018,10 @@ async function getTipLedgerRevenueByMemberDialog({ agencyId, range, allowedCreat
 
 function memberHasHistoricalActivity(metrics, revenueCents = 0) {
   if (Math.max(0, num(revenueCents, 0)) > 0) return true;
+  if (metrics?.revenueUnavailableReason === "UNSUPPORTED_CURRENCY") return true;
+  // Supported historical USD revenue also proves retained membership activity.
+  // historical attribution, including removed members with tips only.
+  if (Object.values(metrics?.revenueByCurrency || {}).some((value) => Math.max(0, num(value, 0)) > 0)) return true;
   const numericKeys = [
     "messagesSent", "manualMessages", "massMessages", "broadcastDispatches", "automationDeliveries",
     "incomingMessages", "freshReplies", "backlogReplies", "handoffReplies", "unknownReplies",
@@ -2091,7 +2095,8 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
       metrics.revenueAttributedCents = revenue.cents;
       metrics.revenueCurrency = revenue.currency;
       metrics.dollarsPerMessageCents = revenue.cents !== null && metrics.messagesSent > 0 ? Math.round(revenue.cents / metrics.messagesSent) : (revenue.cents === 0 ? 0 : null);
-      metrics.moneySource = revenue.mixed ? "team_money_fact_v2_multi_currency" : "team_money_fact_v2";
+      metrics.moneySource = "team_money_fact_v2";
+      metrics.revenueUnavailableReason = revenue.unsupported ? "UNSUPPORTED_CURRENCY" : null;
     }
     if (!includeMoney) {
       metrics.revenueAttributedCents = null;
@@ -2111,7 +2116,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
         const dialogRevenue = singleCurrencyValue(dialogBucket);
         const sharePct = metrics.dialogDwellSeconds > 0 ? Math.round((num(item.dwellSeconds, 0) / metrics.dialogDwellSeconds) * 100) : 0;
         return includeMoney
-          ? { ...item, shiftRevenueByCurrency: currencyBucketObject(dialogBucket), shiftRevenueCents: dialogRevenue.cents, shiftRevenueCurrency: dialogRevenue.currency, shiftRevenueUsd: dialogRevenue.currency === "USD" ? Math.round(dialogRevenue.cents || 0) / 100 : null, shiftTimeSharePct: sharePct }
+          ? { ...item, shiftRevenueUnavailableReason: dialogRevenue.unsupported ? "UNSUPPORTED_CURRENCY" : null, shiftRevenueByCurrency: currencyBucketObject(dialogBucket), shiftRevenueCents: dialogRevenue.cents, shiftRevenueCurrency: dialogRevenue.currency, shiftRevenueUsd: dialogRevenue.currency === "USD" ? Math.round(dialogRevenue.cents || 0) / 100 : null, shiftTimeSharePct: sharePct }
           : { ...item, shiftTimeSharePct: sharePct };
       });
     }
@@ -2230,9 +2235,11 @@ function combineOverview(metricsList, membersCount) {
     out.ppvSentMessages += num(m.ppvSentMessages, 0);
     out.ppvSoldMessages += num(m.ppvSoldMessages, 0);
     for (const [currency, cents] of Object.entries(m.ppvRevenueByCurrency || {})) {
+      if (currency !== "USD") continue;
       out.ppvRevenueByCurrency[currency] = (out.ppvRevenueByCurrency[currency] || 0) + Math.max(0, num(cents, 0));
     }
     for (const [currency, cents] of Object.entries(m.revenueByCurrency || {})) {
+      if (currency !== "USD") continue;
       out.revenueByCurrency[currency] = (out.revenueByCurrency[currency] || 0) + Math.max(0, num(cents, 0));
     }
     if (num(m.activeEvents, 0) > 0) out.activeMembers += 1;
@@ -2251,24 +2258,16 @@ function combineOverview(metricsList, membersCount) {
   }
   out.avgResponseSeconds = responseWeightedSamples > 0 ? responseWeightedSeconds / responseWeightedSamples : null;
   out.slaReply15mPct = sla15Samples > 0 ? (sla15Good / sla15Samples) * 100 : null;
-  const overviewCurrencies = Object.entries(out.revenueByCurrency || {});
-  if (overviewCurrencies.length === 0) {
-    out.revenueAttributedCents = 0; out.revenueCurrency = null;
-  } else if (overviewCurrencies.length === 1) {
-    out.revenueCurrency = overviewCurrencies[0][0]; out.revenueAttributedCents = overviewCurrencies[0][1];
-  } else {
-    out.revenueCurrency = null; out.revenueAttributedCents = null;
-  }
+  out.revenueUnavailableReason = metricsList.some(m => m?.revenueUnavailableReason === "UNSUPPORTED_CURRENCY") ? "UNSUPPORTED_CURRENCY" : null;
+  out.ppvRevenueUnavailableReason = metricsList.some(m => m?.ppvRevenueUnavailableReason === "UNSUPPORTED_CURRENCY") ? "UNSUPPORTED_CURRENCY" : null;
+  out.revenueAttributedCents = out.revenueUnavailableReason ? null : Math.max(0, num(out.revenueByCurrency?.USD, 0));
+  out.revenueCurrency = out.revenueUnavailableReason ? null : "USD";
+  if (out.revenueUnavailableReason) out.revenueByCurrency = null;
   out.dollarsPerMessageCents = out.revenueAttributedCents !== null && out.messagesSent > 0 ? Math.round(out.revenueAttributedCents / out.messagesSent) : (out.revenueAttributedCents === 0 ? 0 : null);
-  const ppvOverviewCurrencies = Object.entries(out.ppvRevenueByCurrency || {});
-  if (ppvOverviewCurrencies.length === 0) {
-    out.ppvRevenueCents = 0; out.ppvRevenueCurrency = null;
-  } else if (ppvOverviewCurrencies.length === 1) {
-    out.ppvRevenueCurrency = ppvOverviewCurrencies[0][0]; out.ppvRevenueCents = ppvOverviewCurrencies[0][1];
-  } else {
-    out.ppvRevenueCurrency = null; out.ppvRevenueCents = null;
-  }
-  out.ppvOpenRatePct = out.ppvSentMessages > 0 ? (out.ppvSoldMessages / out.ppvSentMessages) * 100 : null;
+  out.ppvRevenueCents = out.ppvRevenueUnavailableReason ? null : Math.max(0, num(out.ppvRevenueByCurrency?.USD, 0));
+  out.ppvRevenueCurrency = out.ppvRevenueUnavailableReason ? null : "USD";
+  if (out.ppvRevenueUnavailableReason) { out.ppvRevenueByCurrency = null; out.ppvSoldMessages = null; }
+  out.ppvOpenRatePct = !out.ppvRevenueUnavailableReason && out.ppvSentMessages > 0 ? (out.ppvSoldMessages / out.ppvSentMessages) * 100 : null;
   return out;
 }
 

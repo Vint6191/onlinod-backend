@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v41_vault_message_media_evidence",
+  "version": "nod_current_v42_usd_only_money_contract",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -184,6 +184,10 @@
     {
       "migration": "20261128090000_vault_message_media_evidence",
       "checksum": "9d4c83911dd5a6c6dc4a4b30348a7aae8c7e0503164626ea60612f1835bca6ed"
+    },
+    {
+      "migration": "20261128100000_usd_only_money_contract",
+      "checksum": "d59eb2d959c569c1050df45ab9b5caa4eb8a608c91fbd85144f0f08536a8be8a"
     }
   ],
   "extension": {
@@ -3916,11 +3920,6 @@
         "hash": "a8996803881264d23ecb4fd64849209978d79155c21d6fa876351405a4506ac9"
       },
       {
-        "name": "onlinod_guard_team_financial_authority_v1",
-        "args": "",
-        "hash": "2e12a2ebc76176c567157119dfb9ec307b3459ea9a4012563724fe4cb533f0d3"
-      },
-      {
         "name": "onlinod_guard_team_purchase_identity_v3",
         "args": "",
         "hash": "a52cf235081fab8464c26d0faaa547d405d4326536803259577a20bf784f4cd2"
@@ -3964,6 +3963,41 @@
         "name": "onlinod_traffic_member_metrics_v2",
         "args": "member_id text",
         "hash": "85dbdfde605ff69021ba66b982863774b8c72de803df15352c4fbf005b2dbe3b"
+      },
+      {
+        "name": "onlinod_guard_team_financial_authority_v1",
+        "args": "",
+        "hash": "49e8a5fbf4d5e5864e116471393bcff7aee20be3d46b8eb75e7983f519907f65"
+      },
+      {
+        "name": "onlinod_traffic_receipt_capture_v2",
+        "args": "",
+        "hash": "5a0d66e2a810c4f751429d7456593c23f31c6960f1a2a07cbd5211ae8553b60d"
+      },
+      {
+        "name": "onlinod_traffic_receipt_project_v2",
+        "args": "receipt_id text",
+        "hash": "df324a8b3d373e5c1cd11835584d2b745722c08c159b2333053b1785ea766a72"
+      },
+      {
+        "name": "onlinod_traffic_source_metrics_v2",
+        "args": "",
+        "hash": "e62bd2843190a56cd6152c240b6b75740b9f871ca0c156683f2fa609d33b0aa5"
+      },
+      {
+        "name": "onlinod_usd_currency_guard_v1",
+        "args": "",
+        "hash": "e7913dc80e21f62301b27cda093c82ab7bc0a6dc105cd161e458c26c71f885ae"
+      },
+      {
+        "name": "onlinod_usd_earnings_entry_guard_v1",
+        "args": "",
+        "hash": "428198da03c5261430d8f0cc27f8524ca6f5c10a3944b917b92dd30940a22ec4"
+      },
+      {
+        "name": "onlinod_usd_transaction_supported_v1",
+        "args": "p_agency text, p_creator text, p_transaction text",
+        "hash": "56dccd459cecd71aa1f3bd0b0026a2652c917f2676121b3b6ee34ea1bc464b89"
       }
     ],
     "triggers": [
@@ -4246,6 +4280,238 @@
         "definition": "CREATE TRIGGER \"TeamTipLedger_00_identity_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamTipLedger\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_tip_identity_v4()",
         "args": "",
         "function": "onlinod_guard_team_tip_identity_v4"
+      },
+      {
+        "table": "AgencyBillingWallet",
+        "name": "AgencyBillingWallet_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"AgencyBillingWallet_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"AgencyBillingWallet\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "BillingOrder",
+        "name": "BillingOrder_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"BillingOrder_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"BillingOrder\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "BillingWalletTransaction",
+        "name": "BillingWalletTransaction_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"BillingWalletTransaction_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"BillingWalletTransaction\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "ContentBlock",
+        "name": "ContentBlock_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"ContentBlock_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"ContentBlock\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorEarningsDaily",
+        "name": "CreatorEarningsDaily_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorEarningsDaily_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorEarningsDaily\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "CreatorEarningsGenerationEntry_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorEarningsGenerationEntry_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorEarningsGenerationEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_earnings_entry_guard_v1()",
+        "args": "",
+        "function": "onlinod_usd_earnings_entry_guard_v1"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "CreatorEarningsLedgerEntry_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorEarningsLedgerEntry_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorEarningsLedgerEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_earnings_entry_guard_v1()",
+        "args": "",
+        "function": "onlinod_usd_earnings_entry_guard_v1"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorEarningsPublishedDay_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorEarningsPublishedDay\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorEarningsTotal",
+        "name": "CreatorEarningsTotal_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorEarningsTotal_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorEarningsTotal\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorFinancialTransaction",
+        "name": "CreatorFinancialTransaction_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorFinancialTransaction_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorFinancialTransaction\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "CreatorNotificationEvent_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorNotificationEvent_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorNotificationEvent\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorNotificationScanItem",
+        "name": "CreatorNotificationScanItem_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorNotificationScanItem_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorNotificationScanItem\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorPaidSubscription",
+        "name": "CreatorPaidSubscription_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorPaidSubscription_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorPaidSubscription\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorSale",
+        "name": "CreatorSale_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorSale_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorSale\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorSubscriptionEvent",
+        "name": "CreatorSubscriptionEvent_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorSubscriptionEvent_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorSubscriptionEvent\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorSubscriptionLedger",
+        "name": "CreatorSubscriptionLedger_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorSubscriptionLedger_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorSubscriptionLedger\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorSubscriptionState",
+        "name": "CreatorSubscriptionState_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorSubscriptionState_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorSubscriptionState\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "CreatorTip",
+        "name": "CreatorTip_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorTip_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"CreatorTip\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "MoneyAttribution",
+        "name": "MoneyAttribution_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"MoneyAttribution_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"MoneyAttribution\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TeamActivityEvent",
+        "name": "TeamActivityEvent_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamActivityEvent_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamActivityEvent\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TeamMoneyAttributionFact",
+        "name": "TeamMoneyAttributionFact_zz_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamMoneyAttributionFact_zz_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamMoneyAttributionFact\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('fact')",
+        "args": "6661637400",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TeamMoneyDailyRollup",
+        "name": "TeamMoneyDailyRollup_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamMoneyDailyRollup_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamMoneyDailyRollup\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TeamMoneyLifetimeRollup",
+        "name": "TeamMoneyLifetimeRollup_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamMoneyLifetimeRollup_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamMoneyLifetimeRollup\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TeamMoneyRollupContribution",
+        "name": "TeamMoneyRollupContribution_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamMoneyRollupContribution_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamMoneyRollupContribution\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('contribution')",
+        "args": "636f6e747269627574696f6e00",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TeamPpvPurchaseLedger",
+        "name": "TeamPpvPurchaseLedger_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamPpvPurchaseLedger_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamPpvPurchaseLedger\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('team')",
+        "args": "7465616d00",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TeamPpvResolveJob",
+        "name": "TeamPpvResolveJob_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamPpvResolveJob_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamPpvResolveJob\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TeamSentMessageLedger",
+        "name": "TeamSentMessageLedger_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamSentMessageLedger_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamSentMessageLedger\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TeamTipLedger",
+        "name": "TeamTipLedger_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamTipLedger_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamTipLedger\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('team')",
+        "args": "7465616d00",
+        "function": "onlinod_usd_currency_guard_v1"
+      },
+      {
+        "table": "TrafficSource",
+        "name": "TrafficSource_01_usd_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TrafficSource_01_usd_guard\" BEFORE INSERT OR UPDATE ON public.\"TrafficSource\" FOR EACH ROW EXECUTE FUNCTION onlinod_usd_currency_guard_v1('source')",
+        "args": "736f7572636500",
+        "function": "onlinod_usd_currency_guard_v1"
       }
     ],
     "constraints": [
@@ -6645,6 +6911,105 @@
         "options": "0",
         "expressions": null,
         "predicate": "(dirty OR \"pendingFacts\")"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "CreatorEarningsGenerationEntry_unsupported_usd_idx",
+        "unique": false,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(((\"financialFact\" ? 'currency'::text) AND ((\"financialFact\" ->> 'currency'::text) IS DISTINCT FROM 'USD'::text)) OR (((\"financialFact\" -> 'value'::text) ? 'currency'::text) AND (((\"financialFact\" -> 'value'::text) ->> 'currency'::text) IS DISTINCT FROM 'USD'::text)))"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "CreatorEarningsLedgerEntry_unsupported_usd_idx",
+        "unique": false,
+        "keys": "2 4",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(((\"financialFact\" ? 'currency'::text) AND ((\"financialFact\" ->> 'currency'::text) IS DISTINCT FROM 'USD'::text)) OR (((\"financialFact\" -> 'value'::text) ? 'currency'::text) AND (((\"financialFact\" -> 'value'::text) ->> 'currency'::text) IS DISTINCT FROM 'USD'::text)))"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_unsupported_usd_idx",
+        "unique": false,
+        "keys": "3 4",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(currency IS DISTINCT FROM 'USD'::text)"
+      },
+      {
+        "table": "CreatorFinancialTransaction",
+        "name": "CreatorFinancialTransaction_unsupported_usd_idx",
+        "unique": false,
+        "keys": "3 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(currency IS DISTINCT FROM 'USD'::text)"
+      },
+      {
+        "table": "CreatorSale",
+        "name": "CreatorSale_unsupported_usd_idx",
+        "unique": false,
+        "keys": "3",
+        "options": "0",
+        "expressions": null,
+        "predicate": "(currency IS DISTINCT FROM 'USD'::text)"
+      },
+      {
+        "table": "CreatorSubscriptionLedger",
+        "name": "CreatorSubscriptionLedger_unsupported_usd_idx",
+        "unique": false,
+        "keys": "2 3 10 6 5",
+        "options": "0 0 0 0 0",
+        "expressions": null,
+        "predicate": "(currency IS DISTINCT FROM 'USD'::text)"
+      },
+      {
+        "table": "CreatorTip",
+        "name": "CreatorTip_unsupported_usd_idx",
+        "unique": false,
+        "keys": "3",
+        "options": "0",
+        "expressions": null,
+        "predicate": "(currency IS DISTINCT FROM 'USD'::text)"
+      },
+      {
+        "table": "FinancialObservedFact",
+        "name": "FinancialObservedFact_unsupported_usd_idx",
+        "unique": false,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "((value ->> 'currency'::text) IS DISTINCT FROM 'USD'::text)"
+      },
+      {
+        "table": "TeamMoneyAttributionFact",
+        "name": "TeamMoneyAttributionFact_unsupported_usd_idx",
+        "unique": false,
+        "keys": "2 6 13 7",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": "((currency IS DISTINCT FROM 'USD'::text) OR (\"financialStatus\" = 'unsupported_currency'::text))"
+      },
+      {
+        "table": "TeamMoneyDailyRollup",
+        "name": "TeamMoneyDailyRollup_unsupported_usd_idx",
+        "unique": false,
+        "keys": "2 5 8",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(currency IS DISTINCT FROM 'USD'::text)"
+      },
+      {
+        "table": "TrafficSource",
+        "name": "TrafficSource_unsupported_usd_idx",
+        "unique": false,
+        "keys": "4 5 7 3",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": "(currency IS DISTINCT FROM 'USD'::text)"
       }
     ]
   }

@@ -358,7 +358,7 @@ function tipDbFixture({ exactSent = null, recent = [], financialStatus = "done",
       async update({ data }) { attribution = { ...attribution, ...data }; return { ...attribution }; },
     },
   };
-  return { db: commitDatabaseFixture(db), getAttribution: () => attribution, getTipCreates: () => tipCreates, setExactSent: (value) => { exactSentCurrent = value; }, setAttribution: (value) => { attribution = value ? { ...value } : null; } };
+  return { db: commitDatabaseFixture(db), getAttribution: () => attribution, getTipCreates: () => tipCreates, setExactSent: (value) => { exactSentCurrent = value; }, setAttribution: (value) => { attribution = value ? { ...value } : null; }, setTip: (value) => Object.assign(tip, value) };
 }
 
 function tipSent({ memberId = "member-1", source = "manual", minutesBefore = 2 } = {}) {
@@ -415,6 +415,38 @@ test("multiple recent tip candidates create conflict but no guessed owner", asyn
   assert.equal(result.proposedStatus, "conflict");
   assert.equal(fx.getAttribution().attributedMemberId, null);
   assert.equal(fx.getAttribution().candidates.length, 2);
+});
+
+test("tip with unknown buyer has no dialog candidates even when another conversation was recently worked", async () => {
+  const fx = tipDbFixture({ recent: [tipSent()] });
+  fx.setTip({ fan: null, fanOnlyFansUserIdAtEvent: null });
+  await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  assert.equal(fx.getAttribution().status, "unresolved");
+  assert.equal(fx.getAttribution().attributedMemberId, null);
+  assert.deepEqual(fx.getAttribution().candidates, []);
+  assert.deepEqual(fx.getAttribution().weakCandidates, []);
+});
+
+test("retained event buyer scopes candidate evidence after the live fan relation disappears", async () => {
+  const recent = [tipSent({ memberId: "member-correct" }),
+    { ...tipSent({ memberId: "member-unrelated" }), fanId: "different-fan", dialogId: "different-fan" }];
+  const fx = tipDbFixture({ recent });
+  fx.setTip({ fan: null, fanOnlyFansUserIdAtEvent: "of-fan-1" });
+  await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  assert.equal(fx.getAttribution().fanId, "of-fan-1");
+  assert.equal(fx.getAttribution().status, "unresolved");
+  assert.deepEqual(fx.getAttribution().candidates.map(row => row.memberId), ["member-correct"]);
+});
+
+test("tip primary and weak windows use exact milliseconds rather than rounded display minutes", async () => {
+  for (const [ageMs, expectedPrimary, expectedWeak] of [
+    [-1, 0, 0], [0, 1, 0], [600000, 1, 0], [600001, 0, 1], [900000, 0, 1], [900001, 0, 0],
+  ]) {
+    const fx = tipDbFixture({ recent: [tipSent({ minutesBefore: ageMs / 60000 })] });
+    await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+    assert.equal(fx.getAttribution().candidates.length, expectedPrimary, `primary at age ${ageMs}ms`);
+    assert.equal(fx.getAttribution().weakCandidates.length, expectedWeak, `weak at age ${ageMs}ms`);
+  }
 });
 
 test("tip payout undo is retained as evidence but marked financially reversed", async () => {

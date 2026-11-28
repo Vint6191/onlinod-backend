@@ -5,6 +5,7 @@ const { randomUUID, createHash } = require("node:crypto");
 const { runRootCommit } = require("./db-commit-kernel");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { lockCreatorFacts } = require("./creator-fact-write-authority");
+const { isCanonicalUsdCurrency } = require("./usd-money-contract");
 const PAID_TYPES = new Set(["paid_subscribed", "subscription_renewed", "subscription_resubscribed"]);
 const SOURCE = "canonical_subscription_fact";
 function clean(value, max = 220) { return String(value ?? "").trim().slice(0, max) || null; }
@@ -56,7 +57,7 @@ async function projectWithinTransaction({ db, job, fact, historyPolicy }) {
     ? canonicalReceiptIdentity(agencyId, creatorId, fact.canonicalEventId) : clean(fact.eventHash);
   const eventType = String(fact.eventType || "").toLowerCase();
   const fanId = clean(fact.fanId, 180), amountCents = fact.amountCents;
-  if (!PAID_TYPES.has(eventType) || !fanId || !Number.isSafeInteger(amountCents) || amountCents <= 0) {
+  if (!isCanonicalUsdCurrency(fact.currency) || !PAID_TYPES.has(eventType) || !fanId || !Number.isSafeInteger(amountCents) || amountCents <= 0) {
     if (!eventHash) return { ignored: true };
     const removed = await db.creatorSubscriptionLedger.deleteMany({ where: receiptScope(job, fact, eventHash) });
     return { ignored: true, invalidReceiptRemoved: removed.count };
@@ -89,7 +90,7 @@ async function projectWithinTransaction({ db, job, fact, historyPolicy }) {
   const data = {
     accountId: job.params?.accountId || row?.accountId || creatorId,
     fanId, sourceId: source?.sourceId || null, eventHash, eventType, amountCents,
-    currency: clean(fact.currency, 8) || "USD", occurredAt,
+    currency: "USD", occurredAt,
     externalEventId: clean(fact.externalEventId || fact.notificationId || eventHash),
     source: SOURCE,
     ...(row && !sameFan ? { attributionAttempts: 0, organicConfirmed: false } : {}),

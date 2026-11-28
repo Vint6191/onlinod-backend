@@ -30,7 +30,7 @@ function loadService({ liveCreatorIds = ["creator-1"] } = {}) {
     status: "conflict",
     result: { candidates: [] },
   };
-  const purchase = { purchaseId: "purchase-1", status: "conflict" };
+  const purchase = { purchaseId: "purchase-1", status: "conflict", currency: "USD" };
   const tx = {
     async $queryRaw() {
       state.queryCount += 1;

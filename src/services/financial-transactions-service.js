@@ -7,6 +7,7 @@ const { dbAuthorityNow } = require("./db-time-authority-service");
 const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
 const { projectEventFanIdentities } = require("./fan-data-authority-service");
 const { lockCreatorFacts } = require("./creator-fact-write-authority");
+const { normalizeUsdCurrency, requireUsdCurrency } = require("./usd-money-contract");
 const {
   COLLECTOR_TYPES, collectionCommand, acceptFinancialGeneration, completeFinancialCollection, recordFinancialCollectionFailure,
 } = require("./analytics-collector-control-service");
@@ -100,12 +101,14 @@ function normalizeTransaction(row, index, page) {
   const gross = sourceCents(source.amountCents, source.amount);
   const amountCents = gross !== null && gross >= 0 ? gross : null;
   const netCents = sourceCents(source.netCents, source.net);
-  const currency = (clean(source.currency, 10) || "USD").toUpperCase();
+  // OnlyFans transaction amounts are USD when the provider omits the code.
+  // An explicit unsupported or malformed code is never a request to relabel.
+  const currency = normalizeUsdCurrency(source.currency, { allowMissing: true });
   if (!externalTransactionId) return { rejected: true, reasonCode: "transaction_id_missing", page, ordinal: index };
   if (!transactionType) return { rejected: true, reasonCode: "transaction_type_missing", page, ordinal: index, externalTransactionId };
   if (!occurredAt) return { rejected: true, reasonCode: "occurred_at_invalid", page, ordinal: index, externalTransactionId, transactionType };
   if (netCents === null || netCents < 0) return { rejected: true, reasonCode: "net_invalid", page, ordinal: index, externalTransactionId, transactionType, occurredAt: occurredAt.toISOString() };
-  if (!/^[A-Z]{3}$/.test(currency)) return { rejected: true, reasonCode: "currency_invalid", page, ordinal: index, externalTransactionId, transactionType, occurredAt: occurredAt.toISOString(), amountCents };
+  if (!currency) return { rejected: true, reasonCode: typeof source.currency === "string" && /^[A-Z]{3}$/.test(source.currency.trim().toUpperCase()) ? "UNSUPPORTED_CURRENCY" : "currency_invalid", page, ordinal: index, externalTransactionId, transactionType, occurredAt: occurredAt.toISOString(), amountCents, currency: source.currency };
   const mapped = classification(transactionType);
   if (mapped.projectionStatus === "PROJECTED" && Math.max(amountCents ?? 0, netCents) <= 0) {
     mapped.projectionStatus = "STORED_ONLY";
@@ -222,6 +225,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
 }
 
 async function ingestFinancialChartChunk({ db = prisma, job, deviceId, chunk }) {
+  requireUsdCurrency(chunk?.currency, { allowMissing: true });
   const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   const category = CHART_CATEGORY_MAP[String(chunk?.category || "").trim().toLowerCase()];
   if (!category) throw new Error("Unsupported financial chart category");
@@ -299,7 +303,7 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
       changes: ["HOME", "TEAM", "CAMPAIGN", "AUDIENCE", "TRAFFIC"].map(entityType => ({ entityType, entityId: job.creatorId,
         sourceIdentity: "FINANCIAL_PUBLICATION", sourceVersion: receipt.row.id, payload: { dataVersion: receipt.row.id, reason: "FINANCIAL_PUBLISHED" } })) });
   }
-  return {
+  const outcome = {
     // A completed traversal with a mismatch is a retained terminal outcome.
     // It must not re-enter the provider traversal through generic job retry.
     ok: authoritativeComplete,
@@ -354,12 +358,23 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
     collectionStateId: stateResult?.state?.id || null,
     staleGeneration: stateResult?.stale === true,
   };
+  if (receipt.currencySupported === false) {
+    // A retained count is not monetary proof. Keep traversal diagnostics, but
+    // do not expose historic foreign/compacted summaries as USD or as zero.
+    const redactMoney = value => Array.isArray(value) ? value.map(redactMoney)
+      : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).map(([key, child]) => [key,
+        key.endsWith("Cents") ? null : redactMoney(child)])) : value;
+    return { ...redactMoney(outcome), currency: null, monetaryUnavailableReason: receipt.unavailableReason,
+      reconciliation: { ...redactMoney(outcome.reconciliation), comparable: false, chartReady: false,
+        grossComparable: false, grossMatched: null, netMatched: null } };
+  }
+  return { ...outcome, currency: "USD", monetaryUnavailableReason: null };
 }
 
 async function ingestExactLiveTransaction({db,agencyId,creatorId,deviceId,money,observedAt,now}) {
-  await lockCreatorFacts(db,agencyId,creatorId);
   const row=normalizeTransaction({ ...money, externalTransactionId:money.transactionId, transactionStatus:money.status },0,1);
-  if(row.rejected) throw new Error("LIVE_FINANCIAL_NORMALIZATION_FAILED");
+  if(row.rejected) throw Object.assign(new Error("LIVE_FINANCIAL_NORMALIZATION_FAILED"), { code: row.reasonCode, status: 422 });
+  await lockCreatorFacts(db,agencyId,creatorId);
   const job={agencyId,creatorId,sourceJobId:null};
   const where={creatorId_externalTransactionId:{creatorId,externalTransactionId:row.externalTransactionId}};
   const previous=await db.creatorFinancialTransaction.findUnique({where});
@@ -383,6 +398,7 @@ async function ingestExactLiveTransaction({db,agencyId,creatorId,deviceId,money,
 // source revisions retain authority when an older history page is published.
 async function publishVerifiedFinancialFactsPage({ db, job, facts, now }) {
   if (!facts.length) return;
+  if (facts.some(fact => fact.value?.currency !== "USD")) throw Object.assign(new Error("UNSUPPORTED_CURRENCY"), { code: "UNSUPPORTED_CURRENCY", status: 422 });
   await lockCreatorFacts(db, job.agencyId, job.creatorId);
   const observedAt = observationStartForJob(job);
   const rows = facts.map((fact, index) => normalizeTransaction(fact.value, index, 1));

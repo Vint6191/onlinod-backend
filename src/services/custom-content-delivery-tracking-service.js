@@ -192,6 +192,7 @@ async function recordCustomDeliverySendInClient({
   messageId,
   mediaIds,
   priceCents = 0,
+  currency,
   occurredAt = new Date(),
   overrideReason = null,
   duplicateOverride = false,
@@ -199,6 +200,7 @@ async function recordCustomDeliverySendInClient({
   enforceAccess = true,
   db = null,
 } = {}) {
+  require("./usd-money-contract").requireUsdCurrency(currency, { allowMissing: true });
   const client = db || require("../prisma");
   const creator = clean(creatorId, 180); const dialog = clean(dialogId, 180); const message = clean(messageId, 220);
   if (!agencyId || !creator || !dialog || !message) throw fail("CUSTOM_DELIVERY_CONFIRM_INVALID", "creatorId, dialogId and messageId are required");
@@ -344,6 +346,7 @@ async function emitDeliveryAudits(client, result) {
 }
 
 async function recordCustomDeliverySend(input = {}) {
+  require("./usd-money-contract").requireUsdCurrency(input.currency, { allowMissing: true });
   const client = input.db || require("../prisma");
   const run = (tx) => recordCustomDeliverySendInClient({ ...input, db: tx });
   const result = await runDbTransaction(client, run, { timeout: 30_000 });
@@ -548,6 +551,7 @@ async function projectCustomDeliveryFromTeamEvent(row, { db = null } = {}) {
     messageId: row.messageId,
     mediaIds,
     priceCents: row.priceCents || 0,
+    currency: row.currency,
     occurredAt: row.ts,
     guardMetadata: guard,
     enforceAccess: false,

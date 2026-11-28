@@ -5,19 +5,14 @@ const fs = require("node:fs"), path = require("node:path"), os = require("node:o
 const { createRequire } = require("node:module"), { pathToFileURL } = require("node:url");
 async function loadDesktopFinancialHandler(desktopRoot) {
   const desktop = path.resolve(desktopRoot, "apps/desktop"), sourceRoot = path.join(desktop, "electron/main");
-  const ts = createRequire(path.join(desktop, "package.json"))("typescript"), compiled = fs.mkdtempSync(path.join(os.tmpdir(), "financial-bridge-"));
+  const load = createRequire(path.join(desktop, "package.json")), compiled = fs.mkdtempSync(path.join(os.tmpdir(), "financial-bridge-"));
   fs.writeFileSync(path.join(compiled, "package.json"), '{"type":"module"}');
-  const visited = new Set();
-  function compile(file) {
-    if (visited.has(file)) return; visited.add(file);
-    const result = ts.transpileModule(fs.readFileSync(file, "utf8"), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 }, fileName: file });
-    const target = path.join(compiled, path.relative(sourceRoot, file).replace(/\.ts$/, ".js"));
-    fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, result.outputText);
-    for (const match of result.outputText.matchAll(/(?:from\s*|import\s*)['"](\.[^'"]+)['"]/g)) compile(path.resolve(path.dirname(file), match[1].replace(/\.js$/, ".ts")));
-  }
   try {
-    compile(path.join(sourceRoot, "services/backend-jobs/handlers/financial-transactions-handler.ts"));
-    const { financialTransactionsHandler } = await import(pathToFileURL(path.join(compiled, "services/backend-jobs/handlers/financial-transactions-handler.js")));
+    const bundle = path.join(compiled, "financial-transactions-handler.js");
+    await load("esbuild").build({ entryPoints: [path.join(sourceRoot, "services/backend-jobs/handlers/financial-transactions-handler.ts")],
+      outfile: bundle, bundle: true, platform: "node", format: "esm", logLevel: "silent",
+      alias: { "@nod/shared": path.join(desktopRoot, "packages/shared/src/index.ts") } });
+    const { financialTransactionsHandler } = await import(pathToFileURL(bundle));
     return { handler: financialTransactionsHandler, close: () => fs.rmSync(compiled, { recursive: true, force: true }) };
   } catch (error) { fs.rmSync(compiled, { recursive: true, force: true }); throw error; }
 }

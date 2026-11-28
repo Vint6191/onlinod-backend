@@ -1,5 +1,7 @@
 "use strict";
 
+const { unsupportedLedgerCurrencySql } = require("./usd-money-read-authority");
+
 // Overview and Home read the same active generation. Raw payout observations
 // are retained for diagnostics and verification, never mixed with an older
 // successful baseline. Range cost is days × fixed category/status vocabulary.
@@ -49,7 +51,7 @@ async function readPublishedFinancialSummary({ db, creatorId, from, to }) {
   // Bind UTC calendar text: a Prisma Date is timestamptz, whose ::date cast
   // otherwise selects a different day under a non-UTC SQL session timezone.
   const [row] = await db.$queryRawUnsafe(`WITH authority AS MATERIALIZED (
-      SELECT p.* FROM "CreatorAccount" c JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=c.id AND p."agencyId"=c."agencyId"
+      SELECT p.*,${unsupportedLedgerCurrencySql('c.id', 'p."activeGeneration"', { from: '$2::date', to: "$3::date+interval '1 day'" })} AS "unsupportedCurrency" FROM "CreatorAccount" c JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=c.id AND p."agencyId"=c."agencyId"
       WHERE c.id=$1 AND c."deletedAt" IS NULL
     ), metric_rows AS (
       SELECT d.category,d."netCents",d."financialMetrics" AS metrics FROM authority p
@@ -59,12 +61,14 @@ async function readPublishedFinancialSummary({ db, creatorId, from, to }) {
       SELECT d.category,d."netCents",d."financialMetrics" FROM authority p
         JOIN "CreatorEarningsLedgerHour" d ON d."creatorId"=p."creatorId" AND d."agencyId"=p."agencyId"
         WHERE p."activeGeneration" IS NULL AND d.hour >= $2::timestamp AND d.hour < $3::timestamp+interval '1 day'
-    ) SELECT p."fromAt",p."throughAt",p.generation,p."activeGeneration",
+    ) SELECT p."fromAt",p."throughAt",p.generation,p."activeGeneration",p."unsupportedCurrency",
       COALESCE((SELECT jsonb_agg(jsonb_build_object('category',category,'netCents',"netCents",'metrics',metrics)) FROM metric_rows),'[]') AS rows
       FROM authority p`, creatorId, start.toISOString().slice(0, 10), end.toISOString().slice(0, 10));
-  return { ready: Boolean(row), state: row ? "READY" : "REBUILDING", generation: row?.activeGeneration || row?.generation || null,
+  const supported = Boolean(row) && row.unsupportedCurrency !== true;
+  return { ready: supported, state: row?.unsupportedCurrency ? "UNSUPPORTED_CURRENCY" : row ? "READY" : "REBUILDING",
+    unavailableReason: row?.unsupportedCurrency ? "UNSUPPORTED_CURRENCY" : null, currency: supported ? "USD" : null, generation: row?.activeGeneration || row?.generation || null,
     fromAt: row?.fromAt?.toISOString() || null, throughAt: row?.throughAt?.toISOString() || null,
-    finance: row ? summarize(row.rows) : { grossCents: null, netCents: null, transactions: null, refundGrossCents: null,
+    finance: supported ? summarize(row.rows) : { grossCents: null, netCents: null, transactions: null, refundGrossCents: null,
       refundNetCents: null, refundTransactions: null, payoutPendingNetCents: null, payoutPendingTransactions: null, types: [] } };
 }
 

@@ -3,7 +3,7 @@ const {createMemoryDb}=require("./admin-command-memory-db");
 // Fault model only: does not emulate PostgreSQL lock contention.
 function createContentDb(options={}){
  const at=new Date("2026-01-01T00:00:00Z");
- return createMemoryDb({...options,extendState:{collections:[{id:"collection-a",agencyId:"agency-a",creatorId:"creator-a",clientId:"script-a",kind:"message_library_script",status:"active",deletedAt:null,purgeAfter:null,updatedAt:at,createdAt:at}],blocks:[{id:"block-a",collectionId:"collection-a",clientId:"message-a",status:"active",deletedAt:null,purgeAfter:null}],contentAudit:[],usageEvents:[],member:{id:"member-a",userId:"user-a",agencyId:"agency-a",role:"OWNER",roleKey:"owner",accessEpoch:1,assignedCreators:"all",deletedAt:null},...options.extendState},extendClient(api,{read,copy,clock}){
+ return createMemoryDb({...options,extendState:{collections:[{id:"collection-a",agencyId:"agency-a",creatorId:"creator-a",clientId:"script-a",kind:"message_library_script",status:"active",deletedAt:null,purgeAfter:null,updatedAt:at,createdAt:at}],blocks:[{id:"block-a",collectionId:"collection-a",clientId:"message-a",status:"active",deletedAt:null,purgeAfter:null,currency:"USD"}],contentAudit:[],usageEvents:[],member:{id:"member-a",userId:"user-a",agencyId:"agency-a",role:"OWNER",roleKey:"owner",accessEpoch:1,assignedCreators:"all",deletedAt:null},...options.extendState},extendClient(api,{read,copy,clock}){
   const raw=api.$queryRawUnsafe;
   api.$queryRawUnsafe=async(sql,...args)=>{
    if(sql.includes('FROM "User"'))return options.disabledUser?[]:[{id:args[0]}];

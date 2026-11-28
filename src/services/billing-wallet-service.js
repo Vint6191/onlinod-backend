@@ -1,5 +1,6 @@
 "use strict";
 const { runDbTransaction } = require("./db-transaction-service");
+const { assertUsdBillingRow } = require("./billing-usd-contract");
 
 
 const prisma = require("../prisma");
@@ -236,11 +237,12 @@ function walletUniqueWhere(agencyId, testMode) {
 }
 
 async function ensureWallet(tx, agencyId, testMode) {
-  return tx.agencyBillingWallet.upsert({
+  const wallet = await tx.agencyBillingWallet.upsert({
     where: walletUniqueWhere(agencyId, testMode),
     create: { agencyId, testMode: testMode === true, balanceCents: 0n, currency: "USD" },
     update: {},
   });
+  return assertUsdBillingRow(wallet);
 }
 
 async function assertWalletDebitAllowed(tx, agencyId, testMode) {
@@ -268,16 +270,18 @@ async function assertWalletDebitAllowed(tx, agencyId, testMode) {
 }
 
 function publicWallet(row) {
+  if (row) assertUsdBillingRow(row);
   return {
     id: row ? String(row.id) : null,
     testMode: row?.testMode === true,
     balanceCents: row ? publicBigInt(row.balanceCents) : 0,
-    currency: String(row?.currency || "USD"),
+    currency: "USD",
     updatedAt: row?.updatedAt ? asDate(row.updatedAt)?.toISOString() || null : null,
   };
 }
 
 function publicWalletTransaction(row) {
+  assertUsdBillingRow(row);
   return {
     id: String(row.id),
     type: String(row.type),
@@ -287,7 +291,7 @@ function publicWalletTransaction(row) {
     testMode: row.testMode === true,
     amountCents: publicBigInt(row.amountCents),
     balanceAfterCents: publicBigInt(row.balanceAfterCents),
-    currency: String(row.currency || "USD"),
+    currency: "USD",
     description: row.description || null,
     createdAt: asDate(row.createdAt)?.toISOString() || null,
   };
@@ -318,6 +322,7 @@ function publicBillingPeriod(row) {
 
 function assertWalletTransactionBinding(row, { agencyId, testMode, amountCents, type, creatorId = null, orderId = null, periodId = null, idempotencyKey }) {
   if (!row) return;
+  assertUsdBillingRow(row);
   const mismatches = [];
   if (String(row.agencyId || "") !== String(agencyId || "")) mismatches.push("agencyId");
   if ((row.testMode === true) !== (testMode === true)) mismatches.push("testMode");
@@ -344,6 +349,7 @@ async function mutateWallet(tx, { agencyId, testMode, amountCents, type, idempot
     if (!wallet || String(wallet.id || "") !== String(existing.walletId || "")) {
       throw billingError("Wallet transaction does not belong to the expected agency wallet", "BILLING_WALLET_TRANSACTION_SCOPE_MISMATCH", 409);
     }
+    assertUsdBillingRow(wallet);
     return { transaction: existing, wallet, replayed: true };
   }
 
@@ -380,6 +386,7 @@ async function creditPaidTopUp({ orderId, paymentAttemptId, settlement, sandboxA
     await lockAgencyBillingMutation(tx, identity.agencyId);
     const order = await tx.billingOrder.findUnique({ where: { id: orderId } });
     if (!order || order.purpose !== "WALLET_TOP_UP") return { credited: false, reason: "ORDER_NOT_TOP_UP" };
+    assertUsdBillingRow(order);
     const attempt = paymentAttemptId ? await tx.billingPaymentAttempt.findUnique({ where: { id: paymentAttemptId } }) : null;
     if (!attempt || attempt.orderId !== order.id || attempt.testMode !== order.testMode) return { credited: false, reason: "PAYMENT_SETTLEMENT_REQUIRED" };
     if (!["finished", "partially_paid"].includes(attempt.providerStatus) || attempt.reversedAt) return { credited: false, reason: "PAYMENT_NOT_SETTLED" };
@@ -445,6 +452,7 @@ async function refundTopUp({ order, paymentAttemptId, db = null }) {
     const current = await tx.billingOrder.findUnique({ where: { id: orderId } });
     const attempt = await tx.billingPaymentAttempt.findUnique({ where: { id: paymentAttemptId } });
     if (!current || current.purpose !== "WALLET_TOP_UP" || !attempt || attempt.orderId !== current.id || attempt.testMode !== current.testMode || attempt.providerStatus !== "refunded") return { reversed: false, reason: "PAYMENT_NOT_REFUNDED" };
+    assertUsdBillingRow(current);
     if (attempt.reversedAt) return { reversed: false, reason: "ALREADY_REVERSED" };
     const amount = bigintCents(attempt.settledCents);
     let result = null;

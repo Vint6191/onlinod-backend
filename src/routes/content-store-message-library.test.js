@@ -294,7 +294,7 @@ test("usage attribution is creator-bound and stores only the safe metadata allow
     id: "server-script-1", creatorId: "creator-1",
     blocks: [{ id: "server-block-1", clientId: "block-1" }],
   });
-  db.contentBlock.findFirst = async () => ({ id: "server-block-1", clientId: "block-1" });
+  db.contentBlock.findFirst = async () => ({ id: "server-block-1", clientId: "block-1", currency: "USD" });
   let created = null;
   db.contentUsageEvent.create = async ({ data }) => { created = data; return { id: "event-1", ...data }; };
   const api = loadRoute(db);

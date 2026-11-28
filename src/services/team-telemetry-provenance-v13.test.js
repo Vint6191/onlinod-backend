@@ -305,7 +305,7 @@ test("v13 localId replay is idempotent", async () => {
 test("v13 localId replay projects only the stored durable payload, never mutated replay fields", async () => {
   const { service, rows, sideEffects } = loadService();
   await ingest(service, [canonical({ localId: "immutable-local", messageId: "message-original", priceCents: 1200 })]);
-  const replay = await ingest(service, [canonical({ localId: "immutable-local", messageId: "message-mutated", priceCents: 9900 })]);
+  const replay = await ingest(service, [canonical({ localId: "immutable-local", messageId: "message-original", priceCents: 9900 })]);
   assert.equal(replay.duplicated, 1);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].messageId, "message-original");
@@ -313,6 +313,19 @@ test("v13 localId replay projects only the stored durable payload, never mutated
   assert.equal(sideEffects.length, 2);
   assert.equal(sideEffects[1].messageId, "message-original");
   assert.equal(sideEffects[1].priceCents, 1200);
+});
+
+test('localId reused for another provider message or dialog is rejected without an ACK or replaying projections', async () => {
+  const { service, rows, sideEffects } = loadService();
+  await ingest(service, [canonical({ localId: 'identity-collision' })]);
+  for (const changes of [{ messageId: 'different-message' }, { dialogId: 'different-dialog', fanId: 'different-dialog' }]) {
+    const replay = await ingest(service, [canonical({ localId: 'identity-collision', ...changes })]);
+    assert.equal(replay.accepted, 0);
+    assert.deepEqual(replay.acknowledgedLocalIds, []);
+    assert.deepEqual(replay.rejectedEvents, [{ localId: 'identity-collision', reason: 'local_id_identity_conflict' }]);
+  }
+  assert.equal(rows.length, 1);
+  assert.equal(sideEffects.length, 1);
 });
 
 test("v13 localId idempotency is device-scoped and does not alias another workstation", async () => {

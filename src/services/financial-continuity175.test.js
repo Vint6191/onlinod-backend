@@ -29,7 +29,7 @@ function job(bound = false) {
 function row(j) {
   return { id: receipts.runId(j), jobId: j.id, generation: j.params.collectionGeneration, agencyId: j.agencyId, creatorId: j.creatorId,
     windows: structuredClone(j.params.financialWindows), cursor: { phase: "done" },
-    proof: { complete: true, traversalComplete: true, kind: "FRONTIER_PLUS_TWO_AND_CHART",
+    proof: { complete: true, currencyContract: "USD_ONLY_V1", traversalComplete: true, kind: "FRONTIER_PLUS_TWO_AND_CHART",
       windows: [{ comparisonFrom: j.params.financialWindows[0].comparisonFrom, traversalComplete: true, matched: true }] } };
 }
 function db(current, receipt = null) {

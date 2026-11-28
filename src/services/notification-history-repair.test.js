@@ -18,7 +18,7 @@ function receiptDb() {
 test("a canonical paid receipt does not query or write the retired daily aggregate", async () => {
   const {db,rows}=receiptDb();
   const result=await projectCanonicalSubscriptionCompatibility({db,job:{agencyId:"a",creatorId:"c"},
-    fact:{fanId:"123",eventType:"paid_subscribed",amountCents:100,eventHash:"fact",occurredAt:new Date()}});
+    fact:{fanId:"123",eventType:"paid_subscribed",amountCents:100,currency:"USD",eventHash:"fact",occurredAt:new Date()}});
   assert.equal(result.ignored,false); assert.equal(rows.size,1);
 });
 test("nonpayment repair cannot delete foreign or legacy receipts", async () => {
@@ -69,7 +69,7 @@ test("paid receipt replay returns the same identity without duplicating money or
   const {db,rows,calls}=receiptDb(); const ids=[];
   for(let n=0;n<3;n++) {
     const result=await projectCanonicalSubscriptionCompatibility({db,job:{agencyId:"a",creatorId:"c"},
-      fact:{fanId:"123",eventType:"paid_subscribed",amountCents:100,eventHash:"same",occurredAt:new Date("2026-09-24")}});
+      fact:{fanId:"123",eventType:"paid_subscribed",amountCents:100,currency:"USD",eventHash:"same",occurredAt:new Date("2026-09-24")}});
     ids.push(result.ledgerId); assert.equal(result.duplicate,n>0);
   }
   assert.equal(rows.size,1); assert.equal(new Set(ids).size,1);

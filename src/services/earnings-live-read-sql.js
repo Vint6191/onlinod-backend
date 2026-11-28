@@ -1,9 +1,11 @@
 "use strict";
+const { unsupportedLedgerCurrencySql } = require("./usd-money-read-authority");
 const { FINANCIAL_PROOF_POLICY_VERSION, uncoveredReceiverDebtSql, financialPublicationPendingSql } = require("./earnings-coverage-service");
 // Arguments are source-owned SQL aliases/parameter positions, never user input.
 function ledgerAuthoritySql(source) {
   return `  ledger_authority AS MATERIALIZED (
     SELECT c.id,p."fromAt",p."throughAt",p."proofPolicyVersion",p."activeGeneration",l."lastDeliveredAt",
+      ${unsupportedLedgerCurrencySql('c.id', 'p."activeGeneration"')} AS "unsupportedCurrency",
       ${financialPublicationPendingSql('c.id')} AS publishing,
       CASE WHEN p."proofPolicyVersion">=1 THEN p."confirmedThroughAt" ELSE p."throughAt" END AS "confirmedThroughAt",
       EXISTS(SELECT 1 FROM "CreatorRecoveryIntent" i WHERE i."creatorId"=c.id AND i.stream='financial' AND i.status<>'COMPLETE') AS recovering,
@@ -20,9 +22,9 @@ function ledgerAuthoritySql(source) {
 function coverageThroughSql() {
   return `GREATEST(a."throughAt",a."confirmedThroughAt")`;
 }
-function freshSql(now) {
+function freshSql(now, unsupported = 'a."unsupportedCurrency"') {
   return `(a."proofPolicyVersion"=${FINANCIAL_PROOF_POLICY_VERSION} AND NOT a.publishing AND NOT a.recovering AND NOT a.unresolved
-    AND NOT a.undelivered AND a."shortGapFrom" IS NULL
+    AND NOT a.undelivered AND NOT ${unsupported} AND a."shortGapFrom" IS NULL
     AND ${coverageThroughSql()}>=(${now}::timestamptz AT TIME ZONE 'UTC')-interval '3 minutes')`;
 }
 function coverageFirstDaySql() {
@@ -35,6 +37,9 @@ function coverageLastDaySql(now) {
   return `(CASE WHEN ${through}::date<(${now}::timestamptz AT TIME ZONE 'UTC')::date
     AND ${through}<${through}::date+interval '1 day'-interval '1 millisecond'
     THEN ${through}::date-1 ELSE ${through}::date END)`;
+}
+function rangeCurrencySql(from, to) {
+  return `(a."unsupportedCurrency" AND ${unsupportedLedgerCurrencySql('a.id', 'a."activeGeneration"', { from, to })})`;
 }
 function liveLedgerDailySql(source = "visible", now = "$11") {
   return `${ledgerAuthoritySql(source)}, ledger_bounds AS (
@@ -71,24 +76,28 @@ function liveLedgerDailySql(source = "visible", now = "$11") {
     SELECT a.id AS "creatorId",r.period,day.date::date AS date,COALESCE(x.cents,0)::bigint AS "totalCents",
       CASE WHEN r.period=0 AND r.start_day=r.end_day THEN h.points ELSE NULL END AS "hourlyPoints",
       GREATEST(a."throughAt",x.observed) AS "collectedAt",${coverageThroughSql()} AS observed,
-      ${freshSql(now)} AS fresh,x.categories AS "categoryTotals"
+      ${freshSql(now, rangeCurrencySql('day.date', "day.date+interval '1 day'"))} AS fresh,x.categories AS "categoryTotals"
     FROM ledger_authority a CROSS JOIN periods r
     CROSS JOIN LATERAL generate_series(GREATEST(r.start_day,${coverageFirstDaySql()}),
       LEAST(r.end_day,${coverageLastDaySql(now)}),interval '1 day') day(date)
     LEFT JOIN ledger_day_values x ON x."creatorId"=a.id AND x.date=day.date::date
     LEFT JOIN ledger_hour_points h ON h.id=a.id
+    WHERE NOT ${rangeCurrencySql('day.date', "day.date+interval '1 day'")}
   )`;
 }
-async function readLiveEarningsCoverage(db, creatorId, now) {
+async function readLiveEarningsCoverage(db, creatorId, now, window = {}) {
+  const params = [creatorId, now], bounds = {};
+  if (window.from) { params.push(new Date(window.from)); bounds.from = `$${params.length}`; }
+  if (window.to) { params.push(new Date(window.to)); bounds.to = `$${params.length}`; }
+  const unsupported = Object.keys(bounds).length ? unsupportedLedgerCurrencySql('a.id', 'a."activeGeneration"', bounds) : 'a."unsupportedCurrency"';
   const [row] = await db.$queryRawUnsafe(
     `WITH source AS (SELECT id,"agencyId" FROM "CreatorAccount" WHERE id=$1 AND "deletedAt" IS NULL),
-    ${ledgerAuthoritySql("source")} SELECT a."fromAt",${coverageThroughSql()} AS "throughAt",${freshSql("$2")} AS fresh,
-      a."proofPolicyVersion",a."activeGeneration",a.publishing,a.recovering,a."recoveryStopped",a.unresolved,a.undelivered,a."shortGapFrom",
+    ${ledgerAuthoritySql("source")} SELECT a."fromAt",${coverageThroughSql()} AS "throughAt",${freshSql("$2", unsupported)} AS fresh,
+      a."proofPolicyVersion",a."activeGeneration",${unsupported} AS "unsupportedCurrency",a.publishing,a.recovering,a."recoveryStopped",a.unresolved,a.undelivered,a."shortGapFrom",
       ${coverageThroughSql()} AS "sourceObservedAt",pg_current_snapshot()::text AS "snapshotRevision"
     FROM ledger_authority a`,
-    creatorId,
-    now
+    ...params
   );
   return row?.fromAt && row?.throughAt ? row : null;
 }
-module.exports = { liveLedgerDailySql, readLiveEarningsCoverage, ledgerAuthoritySql, coverageThroughSql, freshSql, coverageFirstDaySql, coverageLastDaySql };
+module.exports = { liveLedgerDailySql, readLiveEarningsCoverage, ledgerAuthoritySql, coverageThroughSql, freshSql, coverageFirstDaySql, coverageLastDaySql, rangeCurrencySql };

@@ -197,21 +197,23 @@ test("Closure2 canonical money read failure is UNAVAILABLE, never $0", async () 
   );
 });
 
-test("Closure2 mixed currencies are never summed into one USD amount", async () => {
+test("Closure2 historical unsupported money is unavailable and never converted to USD", async () => {
   const analytics = loadAnalytics(analyticsPrisma({ currencies: true }));
   const payload = await analytics.buildTeamMembers({ agencyId: "agency-1", rangeKey: "7d", includeMoney: true });
   const metrics = payload.members[0].metrics;
-  assert.deepEqual(metrics.revenueByCurrency, { EUR: 10000, USD: 10000 });
+  assert.equal(metrics.revenueByCurrency, null);
+  assert.equal(metrics.revenueUnavailableReason, "UNSUPPORTED_CURRENCY");
   assert.equal(metrics.revenueAttributedCents, null);
   assert.equal(metrics.revenueCurrency, null);
   assert.equal(metrics.dollarsPerMessageCents, null);
 });
 
-test("Closure2 mixed-currency PPV revenue is never collapsed into one amount", async () => {
+test("Closure2 historical unsupported PPV money remains unknown", async () => {
   const analytics = loadAnalytics(analyticsPrisma({ ppvMixed: true }));
   const payload = await analytics.buildTeamMembers({ agencyId: "agency-1", rangeKey: "7d", includeMoney: true });
   const metrics = payload.members[0].metrics;
-  assert.deepEqual(metrics.ppvRevenueByCurrency, { EUR: 10000, USD: 10000 });
+  assert.equal(metrics.ppvRevenueByCurrency, null);
+  assert.equal(metrics.ppvRevenueUnavailableReason, "UNSUPPORTED_CURRENCY");
   assert.equal(metrics.ppvRevenueCents, null);
   assert.equal(metrics.ppvRevenueCurrency, null);
 });

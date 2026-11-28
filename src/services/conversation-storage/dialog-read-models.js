@@ -392,42 +392,65 @@ class DialogReadModels {
   async listTeamPendingBootstrapDialogs(ctx, input) {
     // A new collection window is not proof of the old full history. Bootstrap
     // only tails with a collected creator reply anchoring all following fan messages.
-    const rows = await c.rows(
-      this.db,
-      `SELECT dialog_id,state FROM dialog_archive_thread WHERE scope_id=$1 AND dialog_id>$2 AND state->>'collectionComplete'='true' AND coalesce(state->>'scanHasMore','false')='false' AND ($3::text[] IS NULL OR dialog_id=ANY($3::text[])) AND EXISTS(SELECT 1 FROM dialog_archive_message m WHERE m.scope_id=dialog_archive_thread.scope_id AND m.dialog_id=dialog_archive_thread.dialog_id AND m.sender='creator') ORDER BY dialog_id LIMIT $4`,
-      ctx.scopeId,
-      input.afterDialogId || "",
-      input.dialogIds || null,
-      Math.min(100, input.limit || 50)
-    );
-    const result = [];
-    for (const row of rows) {
-      const last = await c.one(
-        this.db,
-        "SELECT created_at,message_id FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2 AND sender='creator' ORDER BY created_at DESC,length(message_id) DESC,message_id DESC LIMIT 1",
-        ctx.scopeId,
-        row.dialog_id
+    const messageCursors = c.object(input.messageCursors);
+    // Older Desktop consumers treat every returned dialog as complete. They
+    // must never receive a truncated page during a Backend-first rollout.
+    const supportsTailPaging = Object.prototype.hasOwnProperty.call(input, "messageCursors")
+      && input.messageCursors === messageCursors;
+    c.check(Object.keys(messageCursors).length <= 100, "TEAM_BOOTSTRAP_CURSOR_SCOPE_INVALID", 400);
+    const minCreatedAt = input.minCreatedAt ? c.iso(input.minCreatedAt) : null;
+    // Anchor, rewrite generation and message page must be from one committed
+    // archive view. The cursor survives append-only growth; an archive rewrite,
+    // new creator reply or reset starts a fresh idempotent tail reconstruction.
+    return this.db.$transaction(async tx => {
+      const rows = await c.rows(
+        tx,
+        `SELECT t.dialog_id,t.rewrite_revision,s.epoch FROM dialog_archive_thread t JOIN dialog_archive_scope s ON s.scope_id=t.scope_id WHERE t.scope_id=$1 AND t.dialog_id>$2 AND t.state->>'collectionComplete'='true' AND coalesce(t.state->>'scanHasMore','false')='false' AND ($3::text[] IS NULL OR t.dialog_id=ANY($3::text[])) AND EXISTS(SELECT 1 FROM dialog_archive_message m WHERE m.scope_id=t.scope_id AND m.dialog_id=t.dialog_id AND m.sender='creator') ORDER BY t.dialog_id LIMIT $4`,
+        ctx.scopeId, input.afterDialogId || "", input.dialogIds || null,
+        Math.max(1, Math.min(100, c.integer(input.limit, 50, 1000)))
       );
-      if (!last) continue;
-      const tail = await c.rows(
-        this.db,
-        "SELECT message_id,created_at FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2 AND sender='user' AND (created_at,length(message_id),message_id)>($3::timestamptz,length($4::text),$4) AND ($5::timestamptz IS NULL OR created_at>=$5::timestamptz) ORDER BY created_at,length(message_id),message_id LIMIT 501",
-        ctx.scopeId,
-        row.dialog_id,
-        last.created_at,
-        last.message_id,
-        input.minCreatedAt || null
-      );
-      c.check(tail.length <= 500, "TEAM_DIALOG_TAIL_TOO_LARGE", 413);
-      result.push({
-        dialogId: row.dialog_id,
-        fanId: row.dialog_id,
-        fullScanDone: false,
-        tailComplete: true,
-        messages: tail.map((m) => ({ messageId: m.message_id, createdAt: c.iso(m.created_at) })),
-      });
-    }
-    return result;
+      const result = [];
+      for (const row of rows) {
+        const last = await c.one(tx,
+          "SELECT created_at,message_id FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2 AND sender='creator' ORDER BY created_at DESC,length(message_id) DESC,message_id DESC LIMIT 1",
+          ctx.scopeId, row.dialog_id);
+        if (!last) continue;
+        const basis = c.hash(["team-pending-tail-v1", ctx.scopeId, row.dialog_id, row.epoch,
+          String(row.rewrite_revision), c.iso(last.created_at), last.message_id]);
+        let afterAt = c.iso(last.created_at), afterId = last.message_id;
+        const raw = messageCursors[row.dialog_id];
+        if (typeof raw === "string" && raw.length <= 1024) {
+          try {
+            const cursor = JSON.parse(raw);
+            if (cursor.v === 1 && cursor.basis === basis
+              && typeof cursor.afterId === "string" && /^[1-9][0-9]{0,39}$/.test(cursor.afterId)
+              && typeof cursor.afterAt === "string" && c.iso(cursor.afterAt) === cursor.afterAt
+              && (cursor.minCreatedAt === null || (minCreatedAt && c.iso(cursor.minCreatedAt) <= minCreatedAt))) {
+              const anchorCheckpoint = cursor.afterId === last.message_id && cursor.afterAt === c.iso(last.created_at);
+              const checkpoint = anchorCheckpoint ? null : await c.one(tx,
+                "SELECT sender,created_at FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2 AND message_id=$3",
+                ctx.scopeId, row.dialog_id, cursor.afterId);
+              if (anchorCheckpoint || (checkpoint?.sender === "user" && c.iso(checkpoint.created_at) === cursor.afterAt)) {
+                afterAt = cursor.afterAt; afterId = cursor.afterId;
+              }
+            }
+          } catch { /* A stale/corrupt local checkpoint cannot suppress archive facts. */ }
+        }
+        const tail = await c.rows(tx,
+          "SELECT message_id,created_at FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2 AND sender='user' AND (created_at,length(message_id),message_id)>($3::timestamptz,length($4::text),$4) AND ($5::timestamptz IS NULL OR created_at>=$5::timestamptz) AND (created_at,length(message_id),message_id)>($6::timestamptz,length($7::text),$7) ORDER BY created_at,length(message_id),message_id LIMIT 501",
+          ctx.scopeId, row.dialog_id, last.created_at, last.message_id, minCreatedAt, afterAt, afterId);
+        if (!supportsTailPaging) c.check(tail.length <= 500, "TEAM_DIALOG_TAIL_TOO_LARGE", 413);
+        const page = tail.slice(0, 500), end = page.at(-1);
+        result.push({
+          dialogId: row.dialog_id, fanId: row.dialog_id, fullScanDone: false,
+          tailComplete: tail.length <= 500,
+          tailCursor: JSON.stringify({ v: 1, basis, afterId: end?.message_id || afterId,
+            afterAt: end ? c.iso(end.created_at) : afterAt, minCreatedAt }),
+          messages: page.map(m => ({ messageId: m.message_id, createdAt: c.iso(m.created_at) })),
+        });
+      }
+      return result;
+    }, { isolationLevel: "RepeatableRead", maxWait: 5000, timeout: 15000 });
   }
 }
 module.exports = { DialogReadModels, emptyCrmStats };

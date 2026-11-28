@@ -1,4 +1,5 @@
 "use strict";
+const { unsupportedFinancialCurrencySql } = require("./usd-money-read-authority");
 const { scopeSql, scopeParams } = require('./home-scope-repository');
 const { CURRENT_DAY_FRESHNESS_MS, RECENT_CLOSED_FRESHNESS_MS, HISTORICAL_FRESHNESS_MS } = require('./analytics-freshness-policy');
 const { earningsObservationSql } = require('./analytics-observation-time');
@@ -43,6 +44,11 @@ function revenueSql(source = 'visible') {
       SUM("totalCents") AS cents,MAX("collectedAt") AS captured,MIN(observed) AS observed FROM daily GROUP BY "creatorId",period
   ), facts AS MATERIALIZED (
     SELECT c."id",r.period,(COALESCE(e.days,0)=r.end_day-r.start_day+1) AS usable,
+      (${unsupportedFinancialCurrencySql('c.id', { from: 'r.start_day', to: "r.end_day+interval '1 day'" })}
+        OR EXISTS(SELECT 1 FROM ledger_authority a WHERE a.id=c.id AND ${require("./earnings-live-read-sql").rangeCurrencySql('r.start_day', "r.end_day+interval '1 day'")})
+        OR EXISTS(SELECT 1 FROM "CreatorEarningsPublishedDay" usd_day WHERE usd_day."creatorId"=c.id
+          AND usd_day.currency IS DISTINCT FROM 'USD' AND usd_day.date BETWEEN r.start_day AND r.end_day
+          AND NOT EXISTS(SELECT 1 FROM ledger_daily l WHERE l."creatorId"=c.id AND l.date=usd_day.date))) AS "unsupportedCurrency",
       (COALESCE(e.fresh_days,0)=r.end_day-r.start_day+1) AS fresh,COALESCE(e.cents,0) AS cents,e.captured,e.observed
     FROM ${source} c CROSS JOIN periods r LEFT JOIN earnings e ON e."creatorId"=c."id" AND e.period=r.period
   )`;
@@ -87,7 +93,7 @@ async function readHomeTotals(input) {
   }
   const row = await require("./home-ledger-totals").read(db,revenueParams(input),pendingSql) || (await db.$queryRawUnsafe(`${scopeSql()}${revenueSql()}${pendingSql()}
     , totals AS (SELECT period,COUNT(*) AS total,COUNT(*) FILTER (WHERE usable) AS reporting,
-      COUNT(*) FILTER (WHERE usable AND NOT fresh) AS stale,SUM(cents) FILTER (WHERE usable) AS cents
+      COUNT(*) FILTER (WHERE usable AND NOT fresh) AS stale,BOOL_OR("unsupportedCurrency") AS "unsupportedCurrency",SUM(cents) FILTER (WHERE usable) AS cents
       FROM facts GROUP BY period), points AS (SELECT d."date",SUM(d."totalCents") AS cents FROM daily d
       JOIN facts f ON f."id"=d."creatorId" AND f.period=d.period AND f.usable WHERE d.period=0 GROUP BY d."date"),
     hourly AS (SELECT h->>'label' AS label,SUM((h->>'valueCents')::bigint) AS cents
@@ -96,7 +102,7 @@ async function readHomeTotals(input) {
       AND bool_and("hourlyPoints" IS NOT NULL OR "totalCents"=0)
       AND bool_or("hourlyPoints" IS NOT NULL)) AS ready FROM daily WHERE period=0)
     SELECT COALESCE(c.total,0) AS total,COALESCE(c.reporting,0) AS reporting,COALESCE(c.stale,0) AS stale,
-      c.cents,(SELECT round((percentile_cont(0.5) WITHIN GROUP (ORDER BY cents))::numeric)::bigint
+      c.cents,c."unsupportedCurrency",(SELECT round((percentile_cont(0.5) WITHIN GROUP (ORDER BY cents))::numeric)::bigint
         FROM facts WHERE period=0 AND usable) AS median_cents,COALESCE(p.total,0) AS previous_total,COALESCE(p.reporting,0) AS previous_reporting,
       COALESCE(p.stale,0) AS previous_stale,p.cents AS previous_cents,(SELECT COUNT(*) FROM pending) AS pending,
       CASE WHEN c.total=c.reporting AND (SELECT ready FROM hourly_ready) THEN
@@ -109,7 +115,7 @@ async function readHomeTotals(input) {
   const deltaPct = complete && previousComplete && !stale && !number(row.previous_stale)
     ? percentChange(cents,prev) : null;
   return { totalCreators:total, reportingCreators:reporting, staleCreators:stale, pendingCount:number(row.pending),
-    totalCents:cents, deltaPct, medianCreatorRevenueCents:complete && total>0 && !stale && row.median_cents!=null ? number(row.median_cents) : null, points: (row.points || []).map(p=>({label:p.label,valueCents:number(p.valueCents)})) };
+    totalCents:cents, deltaPct, unavailableReason:row.unsupportedCurrency === true ? "UNSUPPORTED_CURRENCY" : null, medianCreatorRevenueCents:complete && total>0 && !stale && row.median_cents!=null ? number(row.median_cents) : null, points: (row.points || []).map(p=>({label:p.label,valueCents:number(p.valueCents)})) };
 }
 async function readHomeCreatorPage(input) {
   const { db, money } = input, page = pageInput(input);
@@ -122,7 +128,7 @@ async function readHomeCreatorPage(input) {
     const prefix = `${scopeSql({ cursor:true, cursorParameter:12, broad:typeof input.member.broad === "boolean" ? input.member.broad : null })}, page_candidates AS MATERIALIZED (SELECT "id","agencyId","displayName","username","avatarUrl","status","remoteId" FROM visible
       WHERE "id">$12::text AND ${searchSql()} ORDER BY "id" LIMIT $13), page AS MATERIALIZED (SELECT * FROM page_candidates ORDER BY "id" LIMIT $14)`;
     const sql = money ? `${prefix}${revenueSql('page')}${pendingSql('page')}
-      SELECT c.*,f.usable,f.fresh,f.cents,f.captured,f.observed,(p."id" IS NOT NULL) AS pending,${subscriberHeadColumns()},
+      SELECT c.*,f.usable,f.fresh,f.cents,f.captured,f.observed,f."unsupportedCurrency",(p."id" IS NOT NULL) AS pending,${subscriberHeadColumns()},
         prior.usable AS previous_usable,prior.fresh AS previous_fresh,prior.cents AS previous_cents,
         CASE WHEN $17::boolean AND f.usable THEN (SELECT jsonb_agg(jsonb_build_object('label',to_char(d.date,'YYYY-MM-DD'),'valueCents',d."totalCents") ORDER BY d.date)
           FROM daily d WHERE d."creatorId"=c.id AND d.period=0) ELSE '[]'::jsonb END AS points,
@@ -135,7 +141,7 @@ async function readHomeCreatorPage(input) {
     rows = await db.$queryRawUnsafe(query,...revenueParams(input),page.after,page.limit+1,page.limit,literalSearch(page.search),page.trend,page.includeRevenuePoints);
   }
   const creators = rows.map(c=>({id:c.id,name:c.displayName,displayName:c.displayName,username:c.username,avatarUrl:c.avatarUrl,status:c.status,remoteId:c.remoteId,
-    revenueCents:c.usable?number(c.cents):null,salesCount:null,uniqueFans:null,capturedAt:c.usable?c.captured:null,
+    revenueCents:c.usable?number(c.cents):null,revenueUnavailableReason:c.unsupportedCurrency === true ? "UNSUPPORTED_CURRENCY" : null,salesCount:null,uniqueFans:null,capturedAt:c.usable?c.captured:null,
     subscriberCount:audienceFromRow(c).subscriberCount,subscribersUpdatedAt:audienceFromRow(c).publishedAt,subscribersStale:audienceFromRow(c).stale,
     ...revenueComparison(number(c.cents),number(c.previous_cents),c.usable===true&&c.fresh===true&&c.previous_usable===true&&c.previous_fresh===true),
     revenuePoints:page.includeRevenuePoints && c.usable ? (c.points||[]).map(point=>({label:point.label,valueCents:number(point.valueCents)})) : [],

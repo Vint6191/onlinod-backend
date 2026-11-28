@@ -67,7 +67,7 @@ function total(map, predicate=()=>true) {
   return { amount, count };
 }
 
-test("A49 rollup replay/reassignment/currency-day correction/refund applies exact old->new delta once", async () => {
+test("A49 USD rollup replay/reassignment/day correction/refund applies exact old->new delta once", async () => {
   const fx=createFixture();
   let r=await applyTeamMoneyFactToRollups({ db:commitDatabaseFixture(fx.db), agencyId:"agency-1", factId:"fact-1" });
   assert.equal(r.changed,true);
@@ -78,13 +78,13 @@ test("A49 rollup replay/reassignment/currency-day correction/refund applies exac
   assert.equal(r.idempotent,true,"same worker replay must not double contribution");
   assert.deepEqual(total(fx.daily),{amount:1000n,count:1});
 
-  fx.fact.memberId="member-b"; fx.fact.currency="EUR"; fx.fact.amountCents=800;
+  fx.fact.memberId="member-b"; fx.fact.amountCents=800;
   fx.fact.occurredAt=new Date("2026-09-02T01:00:00Z"); fx.fact.sourceUpdatedAt=new Date("2026-09-02T01:01:00Z");
   await applyTeamMoneyFactToRollups({ db:commitDatabaseFixture(fx.db), agencyId:"agency-1", factId:"fact-1" });
   assert.deepEqual(total(fx.daily,r=>r.memberId==="member-a"),{amount:0n,count:0},"old member/day/currency bucket must be reversed");
-  assert.deepEqual(total(fx.daily,r=>r.memberId==="member-b" && r.currency==="EUR"),{amount:800n,count:1});
+  assert.deepEqual(total(fx.daily,r=>r.memberId==="member-b" && r.currency==="USD"),{amount:800n,count:1});
   assert.deepEqual(total(fx.lifetime,r=>r.memberId==="member-a"),{amount:0n,count:0});
-  assert.deepEqual(total(fx.lifetime,r=>r.memberId==="member-b" && r.currency==="EUR"),{amount:800n,count:1});
+  assert.deepEqual(total(fx.lifetime,r=>r.memberId==="member-b" && r.currency==="USD"),{amount:800n,count:1});
 
   fx.fact.financialStatus="undo"; fx.fact.attributionActive=false; fx.fact.sourceUpdatedAt=new Date("2026-09-02T02:00:00Z");
   await applyTeamMoneyFactToRollups({ db:commitDatabaseFixture(fx.db), agencyId:"agency-1", factId:"fact-1" });
@@ -95,6 +95,21 @@ test("A49 rollup replay/reassignment/currency-day correction/refund applies exac
   assert.equal(desired.active,false);
   const applied=fx.contributions.get("fact-1");
   assert.equal(applied.active,false);
+});
+
+test("unsupported currency withdraws an existing contribution without relabeling the source and replay cannot restore it", async () => {
+  const fx = createFixture();
+  const input = { db: commitDatabaseFixture(fx.db), agencyId: "agency-1", factId: "fact-1" };
+  await applyTeamMoneyFactToRollups(input);
+  fx.fact.currency = "EUR"; fx.fact.amountCents = 1777;
+  const quarantined = await applyTeamMoneyFactToRollups(input);
+  assert.equal(quarantined.contribution.active, false);
+  assert.deepEqual(total(fx.daily), { amount: 0n, count: 0 });
+  assert.deepEqual(total(fx.lifetime), { amount: 0n, count: 0 });
+  assert.equal(fx.fact.currency, "EUR"); assert.equal(fx.fact.amountCents, 1777);
+  assert.equal([...fx.daily.values()].some(row => row.currency !== "USD"), false);
+  assert.equal((await applyTeamMoneyFactToRollups(input)).idempotent, true);
+  assert.deepEqual(total(fx.daily), { amount: 0n, count: 0 });
 });
 
 

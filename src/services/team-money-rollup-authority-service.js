@@ -10,7 +10,6 @@ function clean(value, max = 220) {
   const s = String(value ?? "").trim();
   return s ? s.slice(0, max) : null;
 }
-function upperCurrency(value) { return (clean(value,16) || "USD").toUpperCase(); }
 function asBigInt(value) { try { return BigInt(value || 0); } catch (_) { return 0n; } }
 function utcDay(value) {
   const d = value instanceof Date ? value : new Date(value);
@@ -74,7 +73,7 @@ function desiredContribution(fact) {
     creatorId: active ? creatorId : null,
     creatorKey: active ? (creatorId || "__none__") : "__none__",
     sourceType: active ? sourceType : null,
-    currency: active ? upperCurrency(fact?.currency) : null,
+    currency: active ? "USD" : null,
     day: active ? day : null,
     amountCents: active ? asBigInt(fact?.amountCents) : 0n,
   };

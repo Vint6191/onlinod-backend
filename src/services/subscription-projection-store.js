@@ -21,6 +21,9 @@ const stateSql = statement("CreatorSubscriptionState", stateColumns, ["creatorId
 const paidSql = statement("CreatorPaidSubscription", paidColumns, ["id"]);
 async function write(db, sql, rows) {
   if (!rows.length) return;
+  if (rows.some(row => !require("./usd-money-contract").isCanonicalUsdCurrency(row.currency))) {
+    throw Object.assign(new Error("UNSUPPORTED_CURRENCY"), { code: "UNSUPPORTED_CURRENCY", status: 422 });
+  }
   await db.$executeRawUnsafe(sql, JSON.stringify(rows.map(({ fanRecordId, ...row }) => ({ ...row, fanId: fanRecordId }))));
 }
 module.exports = { writeStates: (db, rows) => write(db, stateSql, rows), writePayments: (db, rows) => write(db, paidSql, rows) };

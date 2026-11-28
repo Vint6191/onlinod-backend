@@ -354,6 +354,7 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d", db = prisma
     audience,
     creatorScope:{broad:ctx.member.broad,mode:"current_membership",accessEpoch:ctx.member.accessEpoch,totalCreators:revenue.totalCreators,creatorIds:[]},
     revenue:{...availability(money,money?null:"FORBIDDEN"),refreshAllowed:money&&refresh,totalCents:revenue.totalCents,grossCents:null,
+      unavailableReason:revenue.unavailableReason || null,
       deltaPct:revenue.deltaPct,medianCreatorRevenueCents:revenue.medianCreatorRevenueCents,currency:"USD",salesCount:null,uniqueFans:null,creatorCount:revenue.reportingCreators,points:revenue.points,
       coverage:{totalCreators:revenue.totalCreators,reportingCreators:revenue.reportingCreators,pendingCount:revenue.pendingCount,staleCreators:revenue.staleCreators},
       pending:{count:revenue.pendingCount,creatorIds:[],jobs:[],etaSeconds:null},stalenessMs:CURRENT_DAY_FRESHNESS_MS,source:money?"creator_earnings_daily":"forbidden"},

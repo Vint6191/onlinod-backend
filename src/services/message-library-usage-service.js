@@ -9,6 +9,12 @@ const { cleanString, optionalString, jsonObject } = require("./server-store-util
 const fail = (code, message, status = 409) => Object.assign(new Error(message), { code, status });
 const hash = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
+function usageEventForRead(event) {
+  if (require("./usd-money-contract").normalizeUsdCurrency(event.metadata?.currency, { allowMissing: true })) return event;
+  return { ...event, monetaryUnavailableReason: "UNSUPPORTED_CURRENCY",
+    metadata: { ...event.metadata, currency: null, amount: null, price: null } };
+}
+
 function normalizeUsageInput(body = {}) {
   body = jsonObject(body);
   const eventId = body.eventId;
@@ -21,6 +27,9 @@ function normalizeUsageInput(body = {}) {
   const messageId = cleanString(body.messageId || body.blockId, 120) || null;
   if (!creatorId || !scriptId) throw fail("MESSAGE_LIBRARY_USAGE_KEYS_MISSING", "creatorId and scriptId are required", 400);
   const metadata = jsonObject(body.metadata);
+  const { requireUsdCurrency } = require("./usd-money-contract");
+  const currency = requireUsdCurrency(body.currency, { allowMissing: true });
+  requireUsdCurrency(metadata.currency, { allowMissing: true });
   function amount(value) {
     const result = Number(value || 0);
     if (!Number.isFinite(result)) throw fail("MESSAGE_LIBRARY_USAGE_NUMBER_INVALID", "Usage amounts must be finite", 400);
@@ -41,7 +50,7 @@ function normalizeUsageInput(body = {}) {
       draftId: optionalString(body.draftId, 120),
       realMessageId: optionalString(body.realMessageId || body.purchaseMessageId, 120),
       amount: amount(body.amount || metadata.amount),
-      currency: cleanString(body.currency || metadata.currency || "USD", 10).toUpperCase() || "USD",
+      currency,
       mediaCount: Math.min(100, Math.floor(amount(metadata.mediaCount))),
       price: amount(metadata.price),
       lockedText: metadata.lockedText === true,
@@ -71,7 +80,7 @@ async function recordMessageLibraryUsage({ db, agencyId, userId, actorMember, in
         throw fail("MESSAGE_LIBRARY_USAGE_EVENT_CONFLICT", "eventId was already used for different usage data");
       }
       // Script/block trash or cleanup must not undo an already committed event.
-      return { event: prior, replayed: true };
+      return { event: usageEventForRead(prior), replayed: true };
     }
     const collection = await lockMessageLibraryScript({ tx, agencyId, creatorId, scriptId });
     if (!collection) throw fail("MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", "Message Library script not found for this creator", 404);
@@ -81,6 +90,7 @@ async function recordMessageLibraryUsage({ db, agencyId, userId, actorMember, in
     } }) : null;
     if (messageId && !block) throw fail("MESSAGE_LIBRARY_BLOCK_NOT_FOUND", "Message Library block not found", 404);
     if (block && isTrash(block)) throw fail("MESSAGE_LIBRARY_BLOCK_TRASHED", "Message is not available");
+    if (block) require("./usd-money-contract").requireUsdCurrency(block.currency);
     const now = await dbAuthorityNow({ db: tx });
     const event = await tx.contentUsageEvent.create({ data: {
       ...data, id, agencyId, collectionId: collection.id, blockId: block?.id || null,
@@ -97,4 +107,4 @@ async function recordMessageLibraryUsage({ db, agencyId, userId, actorMember, in
   }, { maxWait: 5000, timeout: 15000 });
 }
 
-module.exports = { normalizeUsageInput, recordMessageLibraryUsage };
+module.exports = { normalizeUsageInput, recordMessageLibraryUsage, usageEventForRead };

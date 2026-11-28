@@ -11,6 +11,7 @@ const { projectSubscriptionFacts } = require("./creator-analytics-projection-ser
 const { lockCreatorFacts, mergeNotificationMoney, transactionIdentityConflict, retainKnownFan } = require("./creator-fact-write-authority");
 const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
 const { projectEventFanIdentities } = require("./fan-data-authority-service");
+const { normalizeUsdCurrency } = require("./usd-money-contract");
 
 const SERVICE_VERSION = "notification-facts-v1-history-v8-known-boundary";
 const SCHEMA_VERSION = 5;
@@ -45,10 +46,7 @@ function centsOrNull(value) {
   return value;
 }
 function currency(value) {
-  const raw = value === null || value === undefined || value === "" ? "USD" : value;
-  if (typeof raw !== "string") return null;
-  const code = raw.trim().toUpperCase();
-  return /^[A-Z]{3}$/.test(code) ? code : null;
+  return normalizeUsdCurrency(value, { allowMissing: true });
 }
 function timezone(value) {
   const zone = clean(value || "UTC", 100);
@@ -170,8 +168,9 @@ function normalizeEvent(raw, creatorId) {
   const occurredAt = strictDate(event.purchasedAt || event.subscribedAt || event.likedAt || event.commentedAt || event.receivedAt || event.occurredAt || event.ts);
   if (!occurredAt) return reject("INVALID_OCCURRED_AT");
   const amountCents = centsOrNull(event.amountCents);
-  const currencyCode = currency(event.currency);
-  if (!currencyCode) return reject("INVALID_CURRENCY");
+  const monetary = ["purchases", "tips", "subscriptions"].includes(sourceType);
+  const currencyCode = monetary ? currency(event.currency) : null;
+  if (monetary && !currencyCode) return reject(typeof event.currency === "string" && /^[A-Z]{3}$/.test(event.currency.trim().toUpperCase()) ? "UNSUPPORTED_CURRENCY" : "INVALID_CURRENCY");
 
   const externalFanId = clean(event.fanId || event.dialogId, 180);
   const common = {

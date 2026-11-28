@@ -75,13 +75,15 @@ test("Team tips bind to CreatorTip and recent chatter timing is evidence-only", 
 test("payout undo is excluded from Team PPV money without erasing ownership evidence", () => {
   const { financiallyActive, activeFinancialWhere, teamFinancialStatus } = require("./team-money-financial-state-service");
   for (const financialStatus of ["undo", "refund", "refunded", "chargeback", "unverified", "gross_unknown"]) {
-    assert.equal(financiallyActive({ financialStatus }), false, financialStatus);
+    assert.equal(financiallyActive({ financialStatus, currency: "USD" }), false, financialStatus);
     assert.ok(activeFinancialWhere().OR[1].financialStatus.notIn.includes(financialStatus));
   }
-  assert.equal(financiallyActive({ financialStatus: null }), true, "a notification with known gross remains valid evidence");
-  assert.equal(teamFinancialStatus({ transactionStatus: "done", amountCents: null, netCents: 800 }), "gross_unknown");
-  assert.equal(teamFinancialStatus({ transactionStatus: "done", amountCents: 0 }), "done", "an explicit zero is known");
-  assert.equal(teamFinancialStatus({ transactionStatus: "unverified", amountCents: 1000 }), "unverified");
+  assert.equal(financiallyActive({ financialStatus: null, currency: "USD" }), true, "a USD notification with known gross remains valid evidence");
+  assert.equal(teamFinancialStatus({ transactionStatus: "done", amountCents: null, netCents: 800, currency: "USD" }), "gross_unknown");
+  assert.equal(teamFinancialStatus({ transactionStatus: "done", amountCents: 0, currency: "USD" }), "done", "an explicit zero is known");
+  assert.equal(teamFinancialStatus({ transactionStatus: "unverified", amountCents: 1000, currency: "USD" }), "unverified");
+  assert.equal(financiallyActive({ financialStatus: null, currency: "EUR" }), false);
+  assert.equal(teamFinancialStatus({ transactionStatus: "done", amountCents: 1000, currency: "EUR" }), "unsupported_currency");
   assert.match(analytics, /activeFinancialWhere\(\)/);
   assert.match(analytics, /ppvFinanciallyActive/);
 });

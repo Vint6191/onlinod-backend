@@ -6,10 +6,7 @@ const prisma = require("../prisma");
 const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
 const { resolveHistoricalAttributionTarget } = require("./historical-attribution-target-authority-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
-const { classifySentSource } = require("./team-money-reconciliation-service");
-
-const TIP_ATTRIBUTION_WINDOW_MS = 10 * 60 * 1000;
-const TIP_SOFT_REVIEW_WINDOW_MS = 15 * 60 * 1000;
+const { findRecentTipCandidates, TIP_ATTRIBUTION_WINDOW_MS, TIP_SOFT_REVIEW_WINDOW_MS } = require("./team-sent-message-provenance-service");
 const TIP_CLAIM_GRACE_PERIOD_MS = 48 * 60 * 60 * 1000;
 const TIP_LEDGER_RETENTION_DAYS = 180;
 const TIP_LEDGER_RETENTION_MS = TIP_LEDGER_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -113,22 +110,6 @@ function memberDisplay(member) {
   return member.displayName || member.user?.name || member.user?.email || null;
 }
 
-function candidateFromSent(row, receivedAt) {
-  if (!row?.memberId) return null;
-  const sentAtMs = row.sentAt instanceof Date ? row.sentAt.getTime() : new Date(row.sentAt).getTime();
-  const receivedMs = receivedAt instanceof Date ? receivedAt.getTime() : new Date(receivedAt).getTime();
-  const ageMs = Number.isFinite(sentAtMs) && Number.isFinite(receivedMs) ? Math.max(0, receivedMs - sentAtMs) : null;
-  return {
-    memberId: row.memberId,
-    userId: row.userId || null,
-    deviceId: row.deviceId || null,
-    shiftKey: row.shiftKey || null,
-    sentAtMs: Number.isFinite(sentAtMs) ? sentAtMs : null,
-    ageMinutes: ageMs === null ? null : Math.round(ageMs / 60000),
-    source: "team_sent_message_ledger",
-  };
-}
-
 function mergeCandidates(...inputs) {
   const byMember = new Map();
   const push = (value) => {
@@ -222,45 +203,6 @@ function expiresAtMs(row) {
   return Number.isFinite(received) && received > 0 ? received + TIP_CLAIM_GRACE_PERIOD_MS : null;
 }
 
-async function findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId, receivedAt, db = prisma }) {
-  const to = safeDate(receivedAt);
-  const from = new Date(to.getTime() - TIP_SOFT_REVIEW_WINDOW_MS);
-  const ors = [];
-  const safeFan = clean(fanId, 160);
-  const safeDialog = clean(dialogId, 160);
-  if (safeFan) ors.push({ fanId: safeFan }, { dialogId: safeFan });
-  if (safeDialog && safeDialog !== safeFan) ors.push({ dialogId: safeDialog }, { fanId: safeDialog });
-
-  const where = {
-    agencyId,
-    sentAt: { gte: from, lte: to },
-    memberId: { not: null },
-    ...(clean(accountId, 160) ? { accountId: clean(accountId, 160) } : {}),
-    ...(ors.length ? { OR: ors } : {}),
-  };
-
-  const rows = await db.teamSentMessageLedger.findMany({
-    where,
-    select: { memberId: true, userId: true, deviceId: true, shiftKey: true, sentAt: true, source: true },
-    orderBy: { sentAt: "desc" },
-    take: 200,
-  }).catch(() => []);
-
-  const candidates = mergeCandidates(rows
-    .filter((row) => classifySentSource(row) === "MANUAL")
-    .map((row) => candidateFromSent(row, to)));
-  const primary = candidates.filter((c) => {
-    if (!c.sentAtMs) return false;
-    return to.getTime() - Number(c.sentAtMs) <= TIP_ATTRIBUTION_WINDOW_MS;
-  });
-  const weak = candidates.filter((c) => {
-    if (!c.sentAtMs) return false;
-    const age = to.getTime() - Number(c.sentAtMs);
-    return age > TIP_ATTRIBUTION_WINDOW_MS && age <= TIP_SOFT_REVIEW_WINDOW_MS;
-  });
-  return { primary, weak };
-}
-
 // Audit15: live client tip ingest was retired; canonical CreatorTip reconciliation
 // is the only production TeamTipLedger money writer.
 
@@ -269,16 +211,18 @@ async function canActorClaimTip({ agencyId, row, actor, db = prisma }) {
   if (row.attributedMemberId === actor.id) return true;
   if (String(row.status || "") === "conflict") return false;
 
-  const candidates = mergeCandidates(row.candidates, row.weakCandidates, row.result?.candidates, row.result?.weakCandidates);
-  if (candidates.some((c) => c.memberId === actor.id)) return true;
-
-  const { primary, weak } = await findRecentDialogCandidates({
+  // Cached review candidates are display evidence, not permission to transfer
+  // money. Recheck scoped provenance at the same transaction as the claim, so
+  // rows produced by older reconciliation cannot authorize unrelated workers.
+  const { primary, weak } = await findRecentTipCandidates({
     agencyId,
+    creatorId: row.creatorId,
     accountId: row.accountId,
     fanId: row.fanId,
     dialogId: row.dialogId,
     receivedAt: row.receivedAt, db,
   });
+  if (primary.length > 1) return false;
   return mergeCandidates(primary, weak).some((c) => c.memberId === actor.id);
 }
 
@@ -309,8 +253,8 @@ function tipRowForClaims(row, membersById = new Map()) {
     entityId: row.tipId,
     eventHash: row.eventHash,
     eventType: "tip_received",
-    amountCents: row.amountCents,
-    currency: row.currency,
+    amountCents: require("./usd-money-contract").isCanonicalUsdCurrency(row.currency) && !["gross_unknown", "unsupported_currency"].includes(row.financialStatus) ? row.amountCents : null,
+    currency: require("./usd-money-contract").isCanonicalUsdCurrency(row.currency) && row.financialStatus !== "unsupported_currency" ? "USD" : null,
     occurredAt: row.receivedAt,
     receivedAt: row.receivedAt,
     accountId: row.accountId,
@@ -390,7 +334,7 @@ async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, seni
         filtered.push(row);
         continue;
       }
-      const ok = await canActorClaimTip({ agencyId, row, actor: { id: actorMemberId } });
+      const ok = await readCanonicalTipClaims("tip_claim_candidate_evidence", () => canActorClaimTip({ agencyId, row, actor: { id: actorMemberId } }));
       if (ok) filtered.push(row);
     }
     visible = filtered;
@@ -509,7 +453,8 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
     }
     if (Array.isArray(allowedCreatorIds) && !allowedCreatorIds.includes(row.creatorId)) return { code: "CREATOR_ACCESS_FORBIDDEN" };
     const actor = commit.member;
-    if (!financiallyActive(row)) return { code: "TIP_FINANCIAL_REVERSED", error: "This tip was reversed in the financial ledger" };
+    if (!require("./usd-money-contract").isCanonicalUsdCurrency(row.currency) || row.financialStatus === "unsupported_currency") return { code: "UNSUPPORTED_CURRENCY", error: "This tip has unsupported monetary evidence" };
+    if (!financiallyActive(row)) return { code: "TIP_FINANCIAL_REVERSED", error: "This tip is not financially eligible" };
     const migrationReview = isLegacyMigrationReviewRow(row);
     const historicalManagerReview = cleanAction === "manager_override" && migrationReview;
     const financialIdentityReview = cleanAction === "manager_override" && isFinancialIdentityReviewRow(row);
@@ -822,7 +767,8 @@ function legacyTipCreateData(row) {
     dialogId: row.fanId || null,
     fanId: row.fanId || null,
     amountCents: int(row.amountCents, 0),
-    currency: clean(row.currency, 8) || "USD",
+    currency: row.currency,
+    financialStatus: require("./usd-money-contract").isCanonicalUsdCurrency(row.currency) ? null : "unsupported_currency",
     receivedAt: row.occurredAt,
     status,
     attributedMemberId,

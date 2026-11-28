@@ -44,7 +44,8 @@ async function sourceRows(db,proof,{ids,after='',upper=''}) {
   AND e."fanOnlyFansUserId" IS NULL AND f.currency='USD' AND f."netCents"=e."netCents"
   AND f."occurredAt"=e."occurredAt" AND f."transactionStatus"=e.status AND f."sourceUpdatedAt"=e."observedAt"
  ORDER BY e."transactionId"`,...values);
- return rows.map(row=>({...row,fanOnlyFansUserId:fanId(row.fanOnlyFansUserId)
+ return rows.map(row=>({...row,unsupportedCurrency:(Object.hasOwn(row.financialFact || {}, "currency") && row.financialFact.currency !== "USD")
+  || (Object.hasOwn(row.financialFact?.value || {}, "currency") && row.financialFact.value.currency !== "USD"),fanOnlyFansUserId:fanId(row.fanOnlyFansUserId)
   || (earningsCategory(row)===row.category?fanId(row.legacyFanId):null)}));
 }
 async function sourceUpper(db,proof) {
@@ -65,7 +66,7 @@ async function applyRows(db,creatorId,ids,source,now) {
   row.values[field]=(row.values[field]||0)+delta;metrics.set(id,row);
  };
  for(const id of ids){
-  const before=old.get(id)||null,after=contribution(current.get(id),now);
+  const before=old.get(id)||null,row=current.get(id),after=row?.unsupportedCurrency?null:contribution(row,now);
   if(isDeepStrictEqual(before,after))continue;
   updates.push({transactionId:id,value:after,nextDueAt:after?.nextDueAt||null});
   for(const [value,sign] of [[before,-1],[after,1]])if(value)for(const rangeKey of value.ranges){

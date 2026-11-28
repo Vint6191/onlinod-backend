@@ -2,6 +2,8 @@
 const { createHash } = require("node:crypto");
 const { isDeepStrictEqual } = require("node:util");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { isCanonicalUsdCurrency, requireUsdCurrency } = require("./usd-money-contract");
+const CURRENCY_CONTRACT = "USD_ONLY_V1";
 const DAY = 86400000;
 const FLOOR = new Date("2016-01-01T00:00:00Z");
 const RECENT_DAYS = 7, AUDIT_DAYS = 30, HISTORY_FRESH_MS = 7 * DAY;
@@ -245,7 +247,7 @@ async function lockedRun(db, job) {
   const id = runId(job), windows = windowsFor(job);
   await db.financialReceiptRun.upsert({ where: { id }, create: { id, jobId: job.id, agencyId: job.agencyId, creatorId: job.creatorId,
     generation: job.params.collectionGeneration, windows, cursor: initialCursor(job, windows),
-    proof: { complete: false, ...(currentTraversal(job) ? { version: 2, historyRead: false, traversalComplete: false, verification: "PENDING" } : {}), windows: windows.map(() => ({ ...emptyTotals(), pages: 0, received: 0, rejected: 0, exhausted: false, charts: {} })) } }, update: {} });
+    proof: { complete: false, currencyContract: CURRENCY_CONTRACT, ...(currentTraversal(job) ? { version: 2, historyRead: false, traversalComplete: false, verification: "PENDING" } : {}), windows: windows.map(() => ({ ...emptyTotals(), pages: 0, received: 0, rejected: 0, exhausted: false, charts: {} })) } }, update: {} });
   await db.$queryRawUnsafe('SELECT id FROM "FinancialReceiptRun" WHERE id=$1 FOR UPDATE', id);
   const row = await db.financialReceiptRun.findUnique({ where: { id } });
   if (row.agencyId !== job.agencyId || row.creatorId !== job.creatorId || !isDeepStrictEqual(row.windows, windows)) throw fault("FINANCIAL_RECEIPT_SCOPE_MISMATCH");
@@ -280,6 +282,7 @@ function withinWindow(job, chunk, row) {
   return w && (!w.from || row.occurredAt >= date(w.from)) && row.occurredAt <= date(w.to);
 }
 async function commitPage(db, job, chunk, prepared, accepted, backendRejected, rejectedRows = []) {
+  if (accepted.some(fact => !isCanonicalUsdCurrency(fact.currency))) throw fault("UNSUPPORTED_CURRENCY");
   const { row, checksum } = prepared, index = chunk.windowIndex, proof = row.proof, totals = proof.windows[index];
   const previous = accepted.length ? await db.financialObservedFact.findMany({ where: { runId: row.id, windowIndex: index, externalId: { in: accepted.map(x => x.externalTransactionId) } } }) : [];
   const byId = new Map(previous.map(x => [x.externalId, x.value]));
@@ -379,6 +382,7 @@ async function commitPage(db, job, chunk, prepared, accepted, backendRejected, r
   return envelope(job, cursor);
 }
 async function commitChart(db, job, chunk) {
+  requireUsdCurrency(chunk.currency, { allowMissing: true });
   const row = await lockedRun(db, job), index = integer(chunk.windowIndex, row.windows.length - 1), state = row.cursor, w = row.windows[index];
   const categories = w.kind === "FULL" ? FULL_CHARTS : ["total"], range = comparisonRange(row, index);
   const previous = row.proof.windows[index].charts[chunk.category];
@@ -409,18 +413,33 @@ async function commitChart(db, job, chunk) {
   await db.financialReceiptRun.update({ where: { id: row.id }, data: { cursor, proof, updatedAt: receivedAt } });
   return { replay: false, financialContinuation: envelope(job, cursor) };
 }
+async function currencyAuthority(db, row) {
+  // Only a newly created run receives this marker, after strict source/input
+  // admission was installed. An old run replay must never acquire it.
+  if (row.proof?.currencyContract === CURRENCY_CONTRACT) return { currencySupported: true, unavailableReason: null };
+  const counts = await db.$queryRawUnsafe(`SELECT "windowIndex", COUNT(*)::bigint AS retained,
+      COUNT(*) FILTER (WHERE value->>'currency' IS DISTINCT FROM 'USD')::bigint AS unsupported
+    FROM "FinancialObservedFact" WHERE "runId"=$1 GROUP BY "windowIndex"`, row.id);
+  if (counts.some(value => Number(value.unsupported) > 0)) return { currencySupported: false, unavailableReason: "UNSUPPORTED_CURRENCY" };
+  const windows = row.proof?.windows || [], byWindow = new Map(counts.map(value => [Number(value.windowIndex), Number(value.retained)]));
+  const expected = windows.reduce((total, value) => total + (Number.isSafeInteger(value.count) ? value.count : 0), 0);
+  const supported = expected > 0 && windows.length > 0 && counts.every(value => Number(value.windowIndex) < windows.length)
+    && windows.every((value, index) => Number.isSafeInteger(value.count) && value.count >= 0 && (byWindow.get(index) || 0) === value.count);
+  return { currencySupported: supported, unavailableReason: supported ? null : "CURRENCY_EVIDENCE_UNAVAILABLE" };
+}
 async function completionProof(db, job) {
   if (!enabled(job)) return { complete: false, protocolCurrent: false };
   const row = await db.financialReceiptRun.findUnique({ where: { id: runId(job) } });
   if (!row || row.generation !== job.params.collectionGeneration || row.jobId !== job.id || row.agencyId !== job.agencyId || row.creatorId !== job.creatorId) return { complete: false, protocolCurrent: true };
   const filteredHistory = row.windows[0]?.kind === "FULL" && row.windows[0].from !== null;
   const legacyTraversal = !currentTraversal(job) && row.windows[0]?.kind !== "RESOLUTION";
-  let unavailableReason = filteredHistory ? "FINANCIAL_LEGACY_FILTERED_HISTORY" : legacyTraversal ? "FINANCIAL_LEGACY_FRONTIER_INCOMPLETE" : null;
+  const currency = await currencyAuthority(db, row);
+  let unavailableReason = currency.unavailableReason || (filteredHistory ? "FINANCIAL_LEGACY_FILTERED_HISTORY" : legacyTraversal ? "FINANCIAL_LEGACY_FRONTIER_INCOMPLETE" : null);
   if (!unavailableReason && row.windows[0]?.kind === "FRONTIER") {
     const state = await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId }, select: { coverageThrough: true, baselineRangeTo: true } });
     if (!frontierContinuous(state, row)) unavailableReason = "FINANCIAL_FRONTIER_COVERAGE_GAP";
   }
-  return { complete: !unavailableReason && row.cursor.phase === "done" && row.proof.complete === true, protocolCurrent: true, filteredHistory, unavailableReason, row };
+  return { complete: !unavailableReason && row.cursor.phase === "done" && row.proof.complete === true, protocolCurrent: true, filteredHistory, currencySupported: currency.currencySupported, unavailableReason, row };
 }
 function coverageUpdate(job, current, row, observedAt, now) {
   const head = row.windows[0];
@@ -462,6 +481,6 @@ function evaluateCollection(state, now, freshnessMs) {
   const deferred = Boolean(base.retryAfterAt && base.retryAfterAt > now);
   return Object.freeze({ ...base, fresh: false, stale: base.proven, deferred, due: !deferred && !base.failed });
 }
-module.exports = { FinancialReceiptError, invalidClaim, COLLECTOR, FULL_CHARTS, RECENT_DAYS, AUDIT_DAYS, HISTORY_FRESH_MS, FLOOR, enabled, enter, date, hash, runId,
+module.exports = { FinancialReceiptError, invalidClaim, CURRENCY_CONTRACT, currencyAuthority, COLLECTOR, FULL_CHARTS, RECENT_DAYS, AUDIT_DAYS, HISTORY_FRESH_MS, FLOOR, enabled, enter, date, hash, runId,
   planWindows, windowsFor, claimParams, initialCursor, envelope, resultFor, expectedMatches, restoreContinuation, currentTraversal, historyRead, comparisonRange, comparableTotals, earningsTotals, chartsMatch,
   beforePage, withinWindow, commitPage, commitChart, completionProof, coverageUpdate, coverageView, evaluateCollection };

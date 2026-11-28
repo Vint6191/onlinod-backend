@@ -535,6 +535,11 @@ function canonicalHumanSessionTimes({
 }
 
 function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authenticatedMember, authorityNow, terminalClosureProof = null }) {
+  const hasMoney = event.priceCents !== null && event.priceCents !== undefined;
+  const hasCurrency = event.currency !== null && event.currency !== undefined;
+  const currency = hasMoney || hasCurrency
+    ? require("./usd-money-contract").normalizeUsdCurrency(event.currency, { allowMissing: true }) : null;
+  if ((hasMoney || hasCurrency) && !currency) return { row: null, reason: "unsupported_currency" };
   const eventKind = cleanString(event.eventKind, 80)?.toUpperCase() || "";
   const actionSource = cleanString(event.actionSource, 40)?.toUpperCase() || "";
   const lifecycle = cleanString(event.lifecycle, 40)?.toUpperCase() || "";
@@ -657,7 +662,7 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
       broadcastDispatchId: canonicalBroadcastDispatchId,
       semanticEventKey,
       priceCents: nonNegativeInt(event.priceCents),
-      currency: cleanString(event.currency, 16),
+      currency,
       isPpv: event.isPpv === true,
       mediaCount: Math.max(0, nonNegativeInt(event.mediaCount) || mediaIds.length),
       ts,
@@ -683,6 +688,24 @@ async function dispatchTeamProjectionForDurableEvent(durableRow, db) {
   return { compatibilityInline: true };
 }
 
+function canonicalTeamEventIdentity(row) {
+  // localId is a delivery receipt identity, not permission to acknowledge an
+  // unrelated provider fact. Older clients omitted creator/dialog from their
+  // hash. Retain the first durable payload, but report those collisions so the
+  // Desktop keeps their evidence in diagnostics instead of deleting it as ACKed.
+  const providerIdentity = [row.messageId, row.contentId, row.broadcastDispatchId];
+  return JSON.stringify([
+    row.creatorId || row.accountId || null,
+    row.eventKind || String(row.type || '').toUpperCase(),
+    row.actionSource || null,
+    row.lifecycle || null,
+    row.dialogId || row.fanId || null,
+    ...providerIdentity.map(value => value || null),
+    row.coverageId || null,
+    providerIdentity.some(Boolean) ? null : row.correlationId || null,
+  ]);
+}
+
 async function persistCanonicalTeamEventRow({ db, row }) {
   if (!db || !row) throw new Error("Canonical Team event persistence requires db and row");
   if (row.localId) {
@@ -690,11 +713,14 @@ async function persistCanonicalTeamEventRow({ db, row }) {
       where: { agencyId: row.agencyId, deviceId: row.deviceId, localId: row.localId },
     });
     if (exists) {
+      if (canonicalTeamEventIdentity(exists) !== canonicalTeamEventIdentity(row)) {
+        return { rejected: 'local_id_identity_conflict' };
+      }
       const durableRow = exists;
       await applyLedgerSideEffects(durableRow, db);
       await dispatchTeamProjectionForDurableEvent(durableRow, db);
       await projectCustomDeliveryFromTeamEvent(durableRow, { db });
-    await projectNativeMassWriteFromTeamEvent(durableRow, { db });
+      await projectNativeMassWriteFromTeamEvent(durableRow, { db });
       return { row: durableRow, duplicated: true, inserted: false };
     }
   }
@@ -712,6 +738,9 @@ async function persistCanonicalTeamEventRow({ db, row }) {
       where: { agencyId: row.agencyId, deviceId: row.deviceId, localId: row.localId },
     });
     if (!exists) throw err;
+    if (canonicalTeamEventIdentity(exists) !== canonicalTeamEventIdentity(row)) {
+      return { rejected: 'local_id_identity_conflict' };
+    }
     const durableRow = exists;
     await applyLedgerSideEffects(durableRow, db);
     await dispatchTeamProjectionForDurableEvent(durableRow, db);

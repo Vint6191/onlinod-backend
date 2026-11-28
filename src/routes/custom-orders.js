@@ -453,6 +453,7 @@ router.post("/ready-deliveries/commit", async (req, res) => {
       dialogId: req.body?.dialogId,
       mediaIds: req.body?.mediaIds,
       priceCents: req.body?.priceCents,
+      currency: req.body?.currency,
       networkRequestId: req.body?.networkRequestId,
       overrideReason: req.body?.overrideReason,
       duplicateOverride: bool(req.body?.duplicateOverride),

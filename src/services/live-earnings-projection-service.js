@@ -3,6 +3,7 @@
 // Published transaction identities, not notification amounts, own NET. Scan
 // receipts publish atomically; live writes use that same identity and revision.
 const { hashCanonicalJson: hash } = require("./realtime-receipt-hash");
+const { normalizeUsdCurrency } = require("./usd-money-contract");
 const date = (value) => {
   const d = value ? new Date(value) : null;
   return d && Number.isFinite(+d) ? d : null;
@@ -18,6 +19,7 @@ const publishScan = generation.publish;
 function exactMoney(event) {
   const raw = event.moneyObservation;
   if (!raw || raw.version !== 1) return null;
+  if (unsupportedMoneyCurrency(event)) return null;
   const occurredAt = date(raw.occurredAt),
     revisionAt = date(raw.revisionAt);
   if (
@@ -35,6 +37,15 @@ function exactMoney(event) {
   return { ...raw, amountCents: safe(raw.amountCents) ? raw.amountCents : null, transactionType: normalizeTransactionType(raw.transactionType), occurredAt, revisionAt };
 }
 
+function unsupportedMoneyCurrency(event) {
+  const money = event.moneyObservation, notice = event.notificationObservation || {};
+  if (money?.currency !== undefined && !normalizeUsdCurrency(money.currency)) return true;
+  if (!["purchases", "tips", "subscriptions"].includes(notice.category)) return false;
+  return (notice.currency !== undefined && !normalizeUsdCurrency(notice.currency))
+    || (notice.sourceEvidence?.currency !== undefined && !normalizeUsdCurrency(notice.sourceEvidence.currency))
+    || ["UNSUPPORTED_CURRENCY", "INVALID_CURRENCY", "CURRENCY_CONFLICT"].includes(notice.reasonCode);
+}
+
 async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedAt, capturedTimes = null, now }) {
   await lock(db, creatorId);
   let applied = 0,
@@ -44,7 +55,7 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
     const eventCapturedAt = date(capturedTimes?.[index]) || capturedAt;
     const n = event.notificationObservation || {},
       money = exactMoney(event);
-    if (!money && n.category === "subscriptions" && n.amountCents === 0) continue;
+    if (!money && !unsupportedMoneyCurrency(event) && n.category === "subscriptions" && n.amountCents === 0) continue;
     if (
       !money &&
       !["purchases", "tips", "subscriptions"].includes(n.category) &&
@@ -64,7 +75,7 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
     const reversal = /refund|chargeback|revers/i.test(String(n.sourceType || n.notificationType || event.eventType || ""));
     const identifiable = /^[A-Za-z0-9_-]{1,180}$/.test(event.moneyObservation?.transactionId || "");
     if (!money && reversal && !identifiable) reason = "TRANSACTION_ID_REQUIRED_FOR_REVERSAL";
-    if ((event.moneyObservation?.currency || n.currency) && (event.moneyObservation?.currency || n.currency) !== "USD") reason = "MONEY_CURRENCY_UNSUPPORTED";
+    if (unsupportedMoneyCurrency(event)) reason = "MONEY_CURRENCY_UNSUPPORTED";
     const blocked = ["SOURCE_TIME_INVALID","TRANSACTION_ID_REQUIRED_FOR_REVERSAL","MONEY_CURRENCY_UNSUPPORTED"].includes(reason);
     if (money && !reason) {
       const previous = await generation.activeEntry(db, creatorId, money.transactionId);

@@ -6,7 +6,7 @@ const { runDbTransaction } = require("./db-transaction-service");
 const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 const project = args => runDbTransaction(commitDatabaseFixture(args.db), tx => projectImpl({ ...args, db: tx }));
 const job = {agencyId:"agency",creatorId:"creator"};
-const fact = {fanId:"123",eventType:"paid_subscribed",amountCents:100,eventHash:"receipt",occurredAt:new Date("2026-09-24")};
+const fact = {fanId:"123",eventType:"paid_subscribed",amountCents:100,currency:"USD",eventHash:"receipt",occurredAt:new Date("2026-09-24")};
 function fixture(existing = null) {
   let row = existing, effects = 0;
   const db = {creatorSubscriptionLedger:{

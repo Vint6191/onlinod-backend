@@ -3,6 +3,7 @@ const { attachSchedulerFailureCause, inheritSchedulerFailureCauses } = require("
 
 const { exactFanId, boundedFanIds } = require("./fan-data-input");
 const { valueFieldAuthority } = require("./fan-value-field-authority");
+const { requireUsdCurrency } = require("./usd-money-contract");
 const { runDbTransaction } = require("./db-transaction-service");
 
 
@@ -505,6 +506,7 @@ async function projectEventFanIdentities(tx, observations, receivedAt) {
 
 
 async function projectFanRelationship(tx, observation) {
+  requireUsdCurrency(observation.currency, { allowMissing: true });
   const externalId = onlyFansUserId(observation.onlyFansUserId);
   const observedAt = date(observation.observedAt);
   if (!externalId || !observedAt) throw new Error("Invalid CreatorFanRelationshipObservation");
@@ -576,6 +578,7 @@ function normalizeAvailability(value) {
 }
 
 function normalizedFanValueFacts(observation) {
+  requireUsdCurrency(observation.currency, { allowMissing: true });
   const availability = normalizeAvailability(observation.availability);
   const totalRaw = Object.prototype.hasOwnProperty.call(observation, "totalSpentCents")
     ? observation.totalSpentCents
@@ -602,6 +605,7 @@ function normalizedFanValueFacts(observation) {
 }
 
 async function projectFanValue(tx, observation) {
+  requireUsdCurrency(observation.currency, { allowMissing: true });
   const externalId = onlyFansUserId(observation.onlyFansUserId);
   const observedAt = date(observation.observedAt);
   if (!externalId || !observedAt) throw new Error("Invalid CreatorFanValueObservation");
@@ -716,6 +720,7 @@ async function projectFanValue(tx, observation) {
 }
 
 function subscriberDirectoryObservationFromItem(item) {
+  requireUsdCurrency(item?.currency, { allowMissing: true });
   const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
   const observed = metadata.fanDataObservedFields && typeof metadata.fanDataObservedFields === "object"
     ? metadata.fanDataObservedFields
@@ -953,6 +958,7 @@ function batchObservedAt(rawObservedAt, { observedAtPolicy, receivedAt, causalOb
 }
 
 function normalizeBatchObservation(raw, envelope) {
+  if (raw?.relationship || raw?.value) requireUsdCurrency(raw.currency, { allowMissing: true });
   const externalId = onlyFansUserId(raw?.onlyFansUserId);
   if (!externalId) return null;
   const common = {
@@ -972,6 +978,7 @@ function normalizeBatchObservation(raw, envelope) {
   ]) {
     const input = raw?.[kind];
     if (!input || typeof input !== "object") continue;
+    if (kind === "relationship" || kind === "value") requireUsdCurrency(input.currency, { allowMissing: true });
     const source = trustedBatchSource(input.source, envelope.allowedSources);
     const observedAt = batchObservedAt(input.observedAt, envelope);
     normalized[kind] = { ...ownFacts(input, keys), source, observedAt, ...common };
@@ -1521,6 +1528,13 @@ async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult })
   }
   const requestedFanSet = new Set(requestedFanIds);
   const items = Array.isArray(chunkResult?.items) ? chunkResult.items : [];
+  // Validate the whole monetary page before consuming observation tokens or
+  // allowing any fan/relationship/value projection to advance.
+  requireUsdCurrency(chunkResult?.currency, { allowMissing: true });
+  for (const item of items) {
+    if (item?.relationship || item?.value) requireUsdCurrency(item.currency, { allowMissing: true });
+    for (const kind of ["relationship", "value"]) if (item?.[kind]) requireUsdCurrency(item[kind].currency, { allowMissing: true });
+  }
   if (items.length > FAN_DATA_POINT_REFRESH_CHUNK_MAX) {
     throw new FanDataObservationBoundaryError(
       "FAN_DATA_POINT_REFRESH_CHUNK_TOO_LARGE",

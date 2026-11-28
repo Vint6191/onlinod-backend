@@ -146,6 +146,7 @@ async function prepareCustomManualDeliveryCommit({
   dialogId,
   mediaIds,
   priceCents,
+  currency,
   networkRequestId,
   overrideReason = null,
   duplicateOverride = false,
@@ -154,6 +155,7 @@ async function prepareCustomManualDeliveryCommit({
   db = null,
   authority = null,
 } = {}) {
+  require("./usd-money-contract").requireUsdCurrency(currency, { allowMissing: true });
   const client = db || prisma;
   const actorMemberId = clean(member?.id, 180);
   const actorUserId = clean(userId || member?.userId, 180);

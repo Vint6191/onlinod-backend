@@ -1,5 +1,6 @@
 "use strict";
 const { runDbTransaction } = require("./db-transaction-service");
+const { assertUsdBillingRow } = require("./billing-usd-contract");
 
 const { enableCommercialPricingWrite } = require("./billing-commercial-policy-service");
 
@@ -231,6 +232,7 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
 
     const order = await tx.billingOrder.findUnique({ where: { id: orderId } });
     if (!order || order.status !== "PAID") return { activated: false, reason: "ORDER_NOT_PAID" };
+    assertUsdBillingRow(order);
     if (order.activatedAt) return { activated: false, reason: "ALREADY_ACTIVATED" };
     if (order.testMode && sandboxActivationEnabled !== true) return { activated: false, reason: "SANDBOX_ACTIVATION_DISABLED" };
 

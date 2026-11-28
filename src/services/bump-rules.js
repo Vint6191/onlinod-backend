@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const { onlineObservationFresh } = require("./bump-write-window-service");
+const { normalizeUsdCurrency } = require("./usd-money-contract");
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function int(value, fallback, min, max) { const n = Number(value); return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback; }
@@ -40,7 +41,8 @@ function taskToTemplate(task) {
   const rules = object(task.rules);
   const mediaFiles = mediaIds(config.media || config.mediaFiles);
   const text = htmlText(config.messageText || config.text || "");
-  const price = Number(config.price ?? (Number(config.priceCents || 0) / 100)) || 0;
+  const supportedCurrency = normalizeUsdCurrency(config.currency, { allowMissing: true }) !== null;
+  const price = supportedCurrency ? Number(config.price ?? (Number(config.priceCents || 0) / 100)) || 0 : null;
   const snapshot = {
     id: task.clientId || task.id,
     serverTaskId: task.id,
@@ -55,11 +57,13 @@ function taskToTemplate(task) {
     rfTag: Array.isArray(config.rfTag) ? config.rfTag : [],
     triggers,
     rules,
+    ...(!supportedCurrency ? { unsupportedCurrency: true } : {}),
   };
   return { ...snapshot, fingerprint: stableFingerprint(snapshot) };
 }
 
 function triggerEnabled(template, source) {
+  if (template.unsupportedCurrency) return false;
   const triggers = object(template.triggers);
   if (source === "online") return triggers.fanOnline === true;
   if (source === "hidden_online") return triggers.hiddenOnlineSignal === true;

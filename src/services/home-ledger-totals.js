@@ -1,6 +1,6 @@
 "use strict";
 const {scopeSql}=require("./home-scope-repository");
-const {ledgerAuthoritySql,coverageFirstDaySql,coverageLastDaySql,freshSql}=require("./earnings-live-read-sql");
+const {ledgerAuthoritySql,coverageFirstDaySql,coverageLastDaySql,freshSql,rangeCurrencySql}=require("./earnings-live-read-sql");
 // Coverage is an interval predicate per creator, never C creators × D zero
 // rows. Only actual daily buckets participate in aggregation; fill chart zeros
 // once for the agency after SUM. The fallback still serves pre-ledger installs.
@@ -11,11 +11,11 @@ async function read(db,params,pendingSql) {
    ${ledgerAuthoritySql("visible")}, eligibility AS MATERIALIZED (
      SELECT (SELECT count(*) FROM ledger_authority)=(SELECT count(*) FROM visible)
        AND NOT EXISTS(SELECT 1 FROM ledger_authority a CROSS JOIN periods r
-         WHERE ${coverageFirstDaySql()}>r.start_day OR ${coverageLastDaySql("$11")}<r.end_day) AS ready
+         WHERE ${rangeCurrencySql('r.start_day', "r.end_day+interval '1 day'")} OR ${coverageFirstDaySql()}>r.start_day OR ${coverageLastDaySql("$11")}<r.end_day) AS ready
    ), facts AS MATERIALIZED (
      SELECT c.id,r.period,r.start_day,r.end_day,a."activeGeneration",
-       ${coverageFirstDaySql()}<=r.start_day AND ${coverageLastDaySql("$11")}>=r.end_day AS usable,
-       ${freshSql("$11")} AS fresh FROM visible c CROSS JOIN periods r LEFT JOIN ledger_authority a ON a.id=c.id
+       NOT ${rangeCurrencySql('r.start_day', "r.end_day+interval '1 day'")} AND ${coverageFirstDaySql()}<=r.start_day AND ${coverageLastDaySql("$11")}>=r.end_day AS usable,
+       ${freshSql("$11", rangeCurrencySql('r.start_day', "r.end_day+interval '1 day'"))} AS fresh FROM visible c CROSS JOIN periods r LEFT JOIN ledger_authority a ON a.id=c.id
    ), values_by_day AS MATERIALIZED (
      SELECT f.id,f.period,e.date,e."netCents" AS cents FROM facts f JOIN "CreatorEarningsGenerationDay" e
        ON e.generation=f."activeGeneration" AND e.date BETWEEN f.start_day AND f.end_day

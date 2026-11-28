@@ -108,7 +108,6 @@ function makePrisma({ queryLog, moneyEvidence = { hasUnverifiedFinancialFacts: f
       if (/FROM "TeamMoneyAttributionFact" m/.test(sql) && /GROUPING SETS/.test(sql)) {
         return [
           { memberId: "member-a", sourceType: "PPV", currency: "USD", sourceGrouped: 0, currencyGrouped: 0, factCount: 2n, amountCents: 5000n },
-          { memberId: "member-a", sourceType: null, currency: null, sourceGrouped: 1, currencyGrouped: 1, factCount: 2n, amountCents: 5000n },
         ];
       }
       throw new Error(`UNEXPECTED_SQL:${sql.slice(0, 120)}`);
@@ -178,14 +177,19 @@ test("unknown or unverified Team money marks known revenue as partial without de
 });
 
 
-test("all raw Team aggregate lanes preserve the current-telemetry predicate", () => {
+test("canonical action counts use contributions while raw legacy/audience lanes retain their telemetry predicate", () => {
   const source = fs.readFileSync(path.join(__dirname, "team-analytics-service.js"), "utf8");
   const activityStart = source.indexOf("async function loadActivitySummarySql");
   const legacyStart = source.indexOf("async function loadLegacyBoundedSummarySql");
   const responseStart = source.indexOf("function responseSelectSql", legacyStart);
   const audienceStart = source.indexOf("async function loadAudienceCoverageSummarySql");
   const applyStart = source.indexOf("function applyResponseAggregate", audienceStart);
-  assert.match(source.slice(activityStart, legacyStart), /currentTelemetrySql\("e"\)/);
+  const activityReader = source.slice(activityStart, legacyStart);
+  assert.match(activityReader, /TeamActivityContribution/);
+  assert.match(activityReader, /'APPLIED','APPLIED_BASELINE'/);
+  assert.match(activityReader, /team_activity_contribution_v2/);
+  assert.match(activityReader, /sourceEventAt/);
+  assert.doesNotMatch(activityReader, /FROM "TeamActivityEvent"/);
   assert.match(source.slice(legacyStart, responseStart), /currentTelemetrySql\("e"\)/);
   assert.match(source.slice(audienceStart, applyStart), /currentTelemetrySql\("e"\)/);
 });

@@ -120,6 +120,7 @@ function normalizePriceCents(input, fallback = 0) {
   return fallback;
 }
 function normalizePaidAmountCents(input, fallback = 0) {
+  require("./usd-money-contract").requireUsdCurrency(input?.currency, { allowMissing: true });
   if (input?.paidAmountCents !== undefined) {
     const value = Number(input.paidAmountCents);
     if (!Number.isFinite(value) || value < 0) throw fail("CUSTOM_ORDER_PAID_AMOUNT_INVALID", "paidAmountCents must be a non-negative number");
@@ -306,6 +307,7 @@ async function listCustomOrders({ agencyId, member, creatorId = null, dialogId =
 }
 
 function normalizeCreateInput(input = {}) {
+  require("./usd-money-contract").requireUsdCurrency(input.currency, { allowMissing: true });
   const type = normalizeType(input.type || "CONTENT");
   const requestedMediaIds = mediaIdsString(input.mediaIds);
   if (type === "CONTENT" && requestedMediaIds) throw fail("CUSTOM_ORDER_CONTENT_MEDIA_IDS_RETIRED", "CONTENT media IDs are projected only from proven Custom submissions and cannot be entered manually", 409);
@@ -429,6 +431,7 @@ async function getCustomOrder({ agencyId, member, orderId, now = new Date(), db 
 }
 
 function buildUpdateData(current, input = {}, now = new Date()) {
+  require("./usd-money-contract").requireUsdCurrency(input.currency, { allowMissing: true });
   const patch = {}; const nextType = input.type === undefined ? normalizeType(current.type || "CONTENT") : normalizeType(input.type);
   if (input.scenario !== undefined) patch.scenario = required(input.scenario, "scenario", MAX_SCENARIO);
   if (input.internalNote !== undefined) patch.internalNote = optional(input.internalNote, MAX_NOTE, "internalNote");
@@ -534,6 +537,7 @@ function assertTelegramModelInstructionEditCompatibility(current, input = {}, { 
 }
 
 async function updateCustomOrder({ agencyId, member, orderId, input, now = new Date(), db = null } = {}) {
+  require("./usd-money-contract").requireUsdCurrency(input?.currency, { allowMissing: true });
   if (!agencyId || !member?.id) throw fail("CUSTOM_ORDER_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma"); const current = await loadOwnedOrder({ agencyId, member, orderId, db: client });
   const expectedCreatorId = optionalIdentifier(input?.creatorId, "creatorId", 100); if (expectedCreatorId && expectedCreatorId !== String(current.creatorId)) throw fail("CUSTOM_ORDER_CREATOR_MISMATCH", "Custom order does not belong to the requested creator", 404);

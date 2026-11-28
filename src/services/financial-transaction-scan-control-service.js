@@ -111,6 +111,7 @@ async function stopManualFinancialTransactionScan({ db = prisma, creatorId, now 
 }
 
 function transactionForClient(row) {
+  const supported = row.currency === "USD";
   return {
     id: row.id,
     externalTransactionId: row.externalTransactionId,
@@ -119,10 +120,11 @@ function transactionForClient(row) {
     projectionStatus: row.projectionStatus,
     occurredAt: iso(row.occurredAt),
     fanOnlyFansUserId: row.fanOnlyFansUserId,
-    amountCents: row.amountCents,
-    feeCents: row.feeCents,
-    netCents: row.netCents,
-    currency: row.currency,
+    amountCents: supported ? row.amountCents : null,
+    feeCents: supported ? row.feeCents : null,
+    netCents: supported ? row.netCents : null,
+    currency: supported ? "USD" : null,
+    moneyUnavailableReason: supported ? null : "UNSUPPORTED_CURRENCY",
     transactionStatus: row.transactionStatus,
     page: row.page,
     ordinal: row.ordinal,
@@ -139,11 +141,11 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
   let rows = [];
   let total = 0;
   let summary = {
-    transactionsCount: 0, grossCents: 0, netCents: 0, feeCents: 0, projected: 0, storedOnly: 0,
-    earningsTransactionsCount: 0, earningsGrossCents: 0, earningsNetCents: 0,
-    settledTransactionsCount: 0, settledGrossCents: 0, settledNetCents: 0,
-    pendingTransactionsCount: 0, pendingGrossCents: 0, pendingNetCents: 0,
-    refundTransactionsCount: 0, refundGrossCents: 0, refundNetCents: 0,
+    transactionsCount: 0, grossCents: null, netCents: null, feeCents: null, projected: 0, storedOnly: 0,
+    earningsTransactionsCount: 0, earningsGrossCents: null, earningsNetCents: null,
+    settledTransactionsCount: 0, settledGrossCents: null, settledNetCents: null,
+    pendingTransactionsCount: 0, pendingGrossCents: null, pendingNetCents: null,
+    refundTransactionsCount: 0, refundGrossCents: null, refundNetCents: null,
   };
   let statusSummary = [];
   let typeSummary = [];
@@ -151,6 +153,9 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
   let bounds = null;
   const receipt = await require("./financial-receipt-read-service").read({ db, job, creator, limit: safeLimit, cursor });
   const run = receipt.run, proof = run?.proof.windows[0];
+  const authority = require("./financial-receipt-authority");
+  const moneyUnavailableReason = run ? (await authority.currencyAuthority(db, run)).unavailableReason : null;
+  const quarantine = value => Object.fromEntries(Object.entries(value).map(([key, amount]) => [key, key.endsWith("Cents") ? null : amount]));
   if (proof) {
     rows = receipt.items.map(transactionForClient); total = proof.count; bounds = receipt.bounds;
     const statusTotals = summarizeStatusGroups(Object.values(proof.statusGroups));
@@ -167,22 +172,25 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     charts = Object.entries(proof.charts).map(([key, value]) => ({ ...value, category: categories[key],
       rangeFrom: require("./financial-receipt-authority").comparisonRange(run).from, rangeTo: run.windows[0].to, collectedAt: null }));
   }
+  if (moneyUnavailableReason) {
+    summary = quarantine(summary); statusSummary = statusSummary.map(quarantine);
+    typeSummary = typeSummary.map(quarantine); charts = charts.map(quarantine);
+  }
   const onlineWorkers = await countOnlineBindings(db, creator);
   const continuationEnvelope = object(job?.continuation);
   const continuation = run?.cursor || (continuationEnvelope.driverPhase === "execute" ? object(continuationEnvelope.jobContinuation) : continuationEnvelope);
   const totalChart = charts.find((row) => row.category === "TOTAL") || null;
   const sourceBoundaryReached = Boolean(run && run.proof.windows.every(window => window.exhausted));
-  const authority = require("./financial-receipt-authority");
   const comparison = proof ? authority.earningsTotals(authority.comparableTotals(proof)) : null;
   const scannerRejected = run ? run.proof.windows.reduce((sum, window) => sum + window.rejected, 0) : 0;
   const computedReconciliation = {
-    chartReady: Boolean(totalChart),
-    countMatched: Boolean(totalChart) && comparison?.transactionsCount === Number(totalChart.transactionsCount || 0),
-    grossMatched: !totalChart || comparison?.grossCents == null || totalChart.grossCents == null ? null : comparison.grossCents === totalChart.grossCents,
-    netMatched: Boolean(totalChart) && comparison?.netCents === Number(totalChart.netCents || 0),
+    chartReady: !moneyUnavailableReason && Boolean(totalChart),
+    countMatched: !moneyUnavailableReason && Boolean(totalChart) && comparison?.transactionsCount === Number(totalChart.transactionsCount || 0),
+    grossMatched: moneyUnavailableReason || !totalChart || comparison?.grossCents == null || totalChart.grossCents == null ? null : comparison.grossCents === totalChart.grossCents,
+    netMatched: !moneyUnavailableReason && Boolean(totalChart) && comparison?.netCents === Number(totalChart.netCents || 0),
     chartCount: totalChart ? Number(totalChart.transactionsCount || 0) : null,
     chartGrossCents: totalChart ? totalChart.grossCents : null,
-    chartNetCents: totalChart ? Number(totalChart.netCents || 0) : null,
+    chartNetCents: !moneyUnavailableReason && totalChart?.netCents != null ? Number(totalChart.netCents) : null,
   };
   let status = jobStatus(job);
   if (job?.status === "DONE") {
@@ -197,6 +205,7 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     status,
     manual: isManualJob(job),
     receiptRunId: run?.id || null,
+    moneyUnavailableReason, currency: moneyUnavailableReason || !run ? null : "USD",
     receiptReady: Boolean(run), detailsExpired: receipt.detailsExpired,
     rangeFrom: run?.windows[0]?.from || null, rangeTo: run?.windows[0]?.to || null,
     phase: clean(continuation.phase, 40) || (status === "COMPLETE" || status === "PARTIAL" ? "complete" : "transactions"),
@@ -205,15 +214,15 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     sourceBoundaryReached,
     historyRead: authority.historyRead(run),
     traversalComplete: run?.proof.traversalComplete === true || run?.cursor.phase === "done",
-    verification: object(object(job?.result).completionSideEffect).verification || run?.proof.verification || (run?.proof.complete ? "VERIFIED" : "PENDING"),
-    published: job?.status === "DONE" && run?.proof.complete === true,
+    verification: moneyUnavailableReason || object(object(job?.result).completionSideEffect).verification || run?.proof.verification || (run?.proof.complete ? "VERIFIED" : "PENDING"),
+    published: !moneyUnavailableReason && job?.status === "DONE" && run?.proof.complete === true,
     scannerRejected,
     oldestOccurredAt: iso(bounds?._min?.occurredAt),
     newestOccurredAt: iso(bounds?._max?.occurredAt),
     startedAt: iso(job?.startedAt || job?.scheduledAt),
     completedAt: iso(job?.completedAt),
     lastProgressAt: iso(job?.lastProgressAt),
-    lastErrorCode: status === "FAILED" ? "FINANCIAL_TRANSACTION_SCAN_FAILED" : null,
+    lastErrorCode: moneyUnavailableReason || (status === "FAILED" ? "FINANCIAL_TRANSACTION_SCAN_FAILED" : null),
     lastErrorMessage: status === "FAILED" ? clean(job?.lastError, 1000) : null,
     currentMessage: clean(progress.message, 500),
     onlineWorkers,

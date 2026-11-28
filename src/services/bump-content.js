@@ -14,8 +14,7 @@ function normalizeBumpContent(input = {}) {
   const priceCents = Math.round(price * 100);
   if (!Number.isFinite(price) || price < 0 || !Number.isSafeInteger(priceCents) || priceCents > 2147483647)
     throw invalid("Enter a valid price.");
-  const currency = String(input.currency || "USD").trim().toUpperCase();
-  if (currency !== "USD") throw invalid("Bump prices must use USD.");
+  const currency = require("./usd-money-contract").requireUsdCurrency(input.currency, { allowMissing: true });
   const selected = input.media ?? input.mediaFiles ?? [];
   if (!Array.isArray(selected)) throw invalid("Select valid Vault media.");
   const media = [], seen = new Set();

@@ -2015,7 +2015,7 @@ function normalizedSignal(raw, job) {
     buyerDisplayName: clean(input.buyerDisplayName ?? input.name, 240),
     buyerDeleted: input.buyerDeleted === true || input.deletedUser === true,
     occurredAt, amountCents: integer(input.amountCents ?? input.priceCents, 0),
-    currency: (clean(input.currency, 12) || "USD").toUpperCase(),
+    currency: require("./usd-money-contract").requireUsdCurrency(input.currency, { allowMissing: true }),
     source: clean(input.source, 80) || "notification", metadata: object(input.metadata),
   };
   return { ...candidate, idempotencyKey: purchaseIdempotencyKey(candidate) };
@@ -2028,11 +2028,10 @@ async function applyPurchaseSignalsChunk({ db, job, chunkResult, userId = null }
   const control = await moduleControl(db, agencyId);
   if (!control.enabled) return { accepted: 0, projected: 0, scheduled: 0, disabled: true, localOnly: !process.env.DIALOGS_DATABASE_URL };
   const raws = chunk.kind === "dialog_purchase_signals" ? list(chunk.signals) : [];
+  const signals = raws.map(raw => normalizedSignal(raw, job)).filter(Boolean);
   let accepted = 0;
   let scheduled = 0;
-  for (const raw of raws) {
-    const signal = normalizedSignal(raw, job);
-    if (!signal) continue;
+  for (const signal of signals) {
     accepted += 1;
     // Raw message facts belong to the dedicated Dialogs database. This product DB
     // retains only the durable reconciliation target/job needed to resolve a
