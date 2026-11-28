@@ -37,6 +37,7 @@ export {createSubscriberDirectoryHandlers} from ${JSON.stringify(path.join(mainS
 export {HomeService} from ${JSON.stringify(path.join(mainServices, "home/home-service.ts"))};
 export {createHomeHandlers} from ${JSON.stringify(path.join(mainServices, "home/home-ipc.ts"))};
 export {CreatorAnalyticsService} from ${JSON.stringify(path.join(mainServices, "creator-analytics/creator-analytics-service.ts"))};
+export {normalizeRuntimeWsFrame} from ${JSON.stringify(path.join(mainServices, "creator-runtime/creator-runtime-normalizer.ts"))};
 export {createCreatorAnalyticsHandlers} from ${JSON.stringify(path.join(mainServices, "creator-analytics/creator-analytics-ipc.ts"))};
 export {SubscriberDirectoryService} from ${JSON.stringify(path.join(mainServices, "subscriber-directory/subscriber-directory-service.ts"))};
 export {AutomationService} from ${JSON.stringify(path.join(mainServices, "automation/automation-service.ts"))};

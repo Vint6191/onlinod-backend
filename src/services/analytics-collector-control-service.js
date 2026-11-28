@@ -52,7 +52,7 @@ function collectorPlanningProofAt(collectorType, collectionMode, state, now = ne
   if (collectorType === COLLECTOR_TYPES.CAMPAIGNS) state = require("./campaign-membership-proof-service").membershipProofState(state);
   let baselineVerifiedAt, catchupVerifiedAt;
   if (collectorType === COLLECTOR_TYPES.NOTIFICATIONS) {
-    if (state?.normalizerVersion !== "notification-source-v2") return null;
+    if (state?.normalizerVersion !== "notification-source-v3") return null;
     baselineVerifiedAt = state?.fullBackfillVerifiedAt;
     catchupVerifiedAt = state?.lastCatchupVerifiedAt;
   } else if (collectorType === COLLECTOR_TYPES.FINANCIAL || collectorType === COLLECTOR_TYPES.CAMPAIGNS) {
@@ -82,7 +82,7 @@ function buildCollectionPlanningDedupeParams({ collectorType, collectionMode = "
   return {
     planningEpoch: `${generation}:${proofAt ? proofAt.toISOString() : "none"}`,
     collectionOrderingAfter: orderingAfter ? orderingAfter.toISOString() : "none",
-    ...(collectorType === COLLECTOR_TYPES.NOTIFICATIONS ? { notificationNormalizerVersion: "notification-source-v2" } : {}),
+    ...(collectorType === COLLECTOR_TYPES.NOTIFICATIONS ? { notificationNormalizerVersion: "notification-source-v3" } : {}),
     collectionContractVersion: COLLECTION_CONTRACT_VERSION,
     collectionType: collectorType,
     collectionMode: requestedMode,
@@ -94,7 +94,7 @@ function buildCollectionCommand({ collectorType, collectionMode = "full", reason
   const requestedAt = date(now);
   if (!requestedAt) throw new Error("ANALYTICS_COLLECTION_CLOCK_INVALID");
   return {
-    ...(collectorType === COLLECTOR_TYPES.NOTIFICATIONS ? { notificationNormalizerVersion: "notification-source-v2" } : {}),
+    ...(collectorType === COLLECTOR_TYPES.NOTIFICATIONS ? { notificationNormalizerVersion: "notification-source-v3" } : {}),
     collectionContractVersion: COLLECTION_CONTRACT_VERSION,
     collectionType: collectorType,
     collectionMode: mode(collectionMode),
@@ -177,14 +177,14 @@ function collectorLockKey(type, creatorId) {
   return `analytics-collector:${String(type || "unknown").toLowerCase()}:${String(creatorId || "missing")}`;
 }
 
-async function withCollectorStateLock({ db, type, creatorId, work }) {
+async function withCollectorStateLock({ db, type, creatorId, work, transactionOptions }) {
   if (typeof work !== "function") throw new TypeError("Collector state lock requires work callback");
   // Production Prisma/TransactionClient always supports raw SQL. Tiny unit-test
   // doubles may not; they exercise the authority state machine without
   // pretending to validate PostgreSQL lock behavior.
   if (typeof db?.$executeRawUnsafe !== "function" && typeof db?.$transaction !== "function") return work(db);
   if (type === COLLECTOR_TYPES.CAMPAIGNS) return withCampaignTransactionLock({ db, creatorId, work });
-  return withDbAdvisoryXactLock({ db, key: collectorLockKey(type, creatorId), work });
+  return withDbAdvisoryXactLock({ db, key: collectorLockKey(type, creatorId), work, options: transactionOptions });
 }
 
 function commandAuthority(current, command) {

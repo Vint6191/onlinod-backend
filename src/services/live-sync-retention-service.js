@@ -22,7 +22,8 @@ async function page(db,kind) {
       ORDER BY "capturedAt",id LIMIT $1 FOR UPDATE SKIP LOCKED) DELETE FROM "CreatorMoneyObservation" m USING old WHERE m.id=old.id`,PAGE);
     else if(kind==="intents") {
       const rows=await tx.$queryRawUnsafe(`SELECT id,"creatorId",stream,"targetAt" FROM "CreatorRecoveryIntent"
-        WHERE status='COMPLETE' AND "completedAt"<clock_timestamp()-interval '30 days' ORDER BY "completedAt",id LIMIT $1 FOR UPDATE SKIP LOCKED`,PAGE);
+        WHERE status='COMPLETE' AND reason<>'NOTIFICATION_NORMALIZER_UPGRADE' AND left(id,13)<>'notifupgrade_'
+          AND "completedAt"<clock_timestamp()-interval '30 days' ORDER BY "completedAt",id LIMIT $1 FOR UPDATE SKIP LOCKED`,PAGE);
       if(rows.length) {
         await tx.$executeRawUnsafe(`INSERT INTO "CreatorRecoveryWatermark"("creatorId",stream,"throughAt")
           SELECT "creatorId",stream,max(at) FROM jsonb_to_recordset($1::jsonb) x("creatorId" text,stream text,at timestamp)

@@ -116,6 +116,22 @@ async function publishMessageStates({ db,agencyId,creatorId,affected }) {
   return changes;
 }
 
+// Reclassification withdraws an exact canonical sale, including a sale that an
+// older process already deleted. Rebuild every former target from the remaining
+// independent proofs in this same transaction; never force a message closed.
+async function withdrawCanonicalMediaSales({ db, agencyId, creatorId, saleIds }) {
+  const ids = [...new Set(saleIds || [])];
+  if (!ids.length) return [];
+  if (ids.length > 2000) throw fail("MEDIA_FINANCIAL_PAGE_CAPACITY");
+  await lock(db, agencyId, creatorId);
+  const links = await db.$queryRawUnsafe(`DELETE FROM "CreatorMediaSaleLink" l
+    WHERE l."agencyId"=$1 AND l."creatorId"=$2 AND l."saleId"=ANY($3::text[])
+      AND NOT EXISTS(SELECT 1 FROM "CreatorSale" s WHERE s.id=l."saleId")
+    RETURNING l.*`, agencyId, creatorId, ids);
+  const affected = new Map(links.filter(row => row.sourceKey && row.messageId).map(row => [key(row), row]));
+  return affected.size ? publishMessageStates({ db, agencyId, creatorId, affected }) : [];
+}
+
 function effectiveFact(observed, state, allocation) {
   const result = { ...observed, revenueCents: 0, revenueUnknownCount: 0 };
   if (state?.proofActive) {
@@ -326,5 +342,5 @@ async function runSweep({ db = require("../prisma"), limit = 4, maxRuntimeMs = 4
   return report;
 }
 
-module.exports = { WORK_CLASS, ADOPTION_KEY, SEMANTICS_VERSION, PAGE, COUNTS, sourceKey, lock, counts, verifiedLegacyRows, publishCanonicalMediaSales,
+module.exports = { WORK_CLASS, ADOPTION_KEY, SEMANTICS_VERSION, PAGE, COUNTS, sourceKey, lock, counts, verifiedLegacyRows, publishCanonicalMediaSales, withdrawCanonicalMediaSales,
   effectiveFact, statesForFacts, publishMessageStates, financialProjectionState, financialProjectionReady, applyContributionDeltas, projectFactPage, enumerateAdoption, processPage, runSweep };

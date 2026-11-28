@@ -374,6 +374,59 @@ async function retireNonMessagePurchase(db, sale) {
   return { ok: true, purchase, financiallyInactive: true, reason: "NOT_MESSAGE_SALE" };
 }
 
+// A notification can be corrected to an informational event after its automatic
+// unresolved Team projection was created. That derived row is not independent
+// money authority. Keep its audit/aliases, but withdraw it atomically with the
+// notification-only fact. Attributed, claimed, migrated and payout-owned roots
+// still require explicit review and are never retired through this path.
+async function retireUnattributedNotificationMoney({ db, model, fact, apply = false }) {
+  const sale = model === "creatorSale", tip = model === "creatorTip";
+  if (!sale && !tip) return { allowed: true };
+  const table = sale ? "CreatorSale" : "CreatorTip";
+  // A concurrent Team creator takes an FK key-share lock. This row lock closes
+  // the no-root check/delete gap, including workers that read the fact earlier.
+  if (typeof db.$queryRawUnsafe === "function") await db.$queryRawUnsafe(
+    `SELECT id FROM "${table}" WHERE id=$1 AND "agencyId"=$2 AND "creatorId"=$3 FOR UPDATE`, fact.id, fact.agencyId, fact.creatorId);
+  const delegate = sale ? db.teamPpvPurchaseLedger : db.teamTipLedger;
+  const link = sale ? "creatorSaleId" : "creatorTipId";
+  let root = await delegate.findFirst({ where: { [link]: fact.id } });
+  if (!root) return { allowed: true, projected: false };
+  const jobs = sale && typeof db.$queryRawUnsafe === "function"
+    ? await db.$queryRawUnsafe('SELECT * FROM "TeamPpvResolveJob" WHERE "agencyId"=$1 AND "purchaseId"=$2 ORDER BY id FOR UPDATE', fact.agencyId, root.purchaseId)
+    : sale ? [await lockPpvResolveJobByIdentity(db, { agencyId: fact.agencyId, purchaseId: root.purchaseId, messageId: root.messageId })].filter(Boolean) : [];
+  root = sale ? await lockPpvPurchaseRow(db, root) : await lockTipLedgerRow(db, root);
+  if (!root) return { allowed: true, projected: false };
+  const source = sale ? "creator_sale_unresolved" : "creator_tip_unresolved";
+  const protectedRoot = root.agencyId !== fact.agencyId || (root.creatorId || root.accountId) !== fact.creatorId
+    || root[link] !== fact.id || fact.externalTransactionId || fact.source !== "NOTIFICATION"
+    || root.status !== "unresolved" || root.resolvedSource !== source
+    || root.attributedMemberId || root.attributedUserId || root.attributedShiftKey || root.resolvedAt
+    || root.resolvedByDeviceId || root.resolvedByMemberId || root.financialTransactionId
+    || root.migrationBaselineProtected || root.compactedAt
+    || (tip && (root.source !== "creator_tip_reconciliation" || !Array.isArray(root.history)
+      || root.history.some(item => item?.action !== "unresolved_evidence" || item?.source !== "creator_tip_reconciliation"
+        || item?.prevOwner || item?.nextOwner || item?.byMemberId || item?.resolvedByMemberId)
+      || root.result?.manualResolution || root.result?.manualResolutions?.length || root.result?.legacyMigration))
+    || jobs.some(job => job.status !== "pending" || job.resolvedAt || job.resolvedByMemberId || job.resolvedByDeviceId
+      || job.result?.source !== "creator_sale_reconciliation" || job.result?.manualResolution
+      || job.result?.manualResolutions?.length || job.result?.legacyMigration);
+  if (protectedRoot) return { allowed: false };
+  if (sale && await db.teamPpvClaimAudit.findFirst({ where: { agencyId: fact.agencyId, purchaseId: root.purchaseId }, select: { id: true } })) {
+    return { allowed: false };
+  }
+  if (!apply) return { allowed: true, projected: true };
+  // The canonical guard must see withdrawal before the retained Team root is
+  // updated. Its FK will be cleared by the caller's subsequent canonical delete;
+  // the superseded monetary state survives that FK update and worker replay.
+  await db[model].update({ where: { id: fact.id }, data: { transactionStatus: "superseded" } });
+  root = await delegate.update({ where: { id: root.id }, data: {
+    financialStatus: "superseded", attributionBasis: "NOTIFICATION_SOURCE_RECLASSIFIED",
+  } });
+  for (const job of jobs) await closeInactivePpvResolver(db, job, "NOTIFICATION_SOURCE_RECLASSIFIED");
+  await publishTeamMoneyResult(db, root, "NOTIFICATION_SOURCE_RECLASSIFIED");
+  return { allowed: true, projected: true, retiredRootId: root.id };
+}
+
 async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   if (!saleId) return { ok: false, code: "SALE_ID_REQUIRED" };
   // Memory test clients used by Creator Analytics intentionally do not model
@@ -894,4 +947,5 @@ module.exports = {
   publishTeamMoneyReconciliationWork,
   dispatchTeamMoneyReconciliationForCanonicalFact,
   repairTeamMoneyReconciliationWorkItem,
+  retireUnattributedNotificationMoney,
 };

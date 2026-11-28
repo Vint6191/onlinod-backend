@@ -12,10 +12,46 @@ const { currentCommitContext } = require("./db-commit-kernel");
 
 async function processLiveNotificationBatch({db: tx, creator, member, device, input}) {
     if (currentCommitContext()?.tx !== tx) throw Object.assign(new Error("DATA_CHANGE_OWNER_TRANSACTION_REQUIRED"), {code:"DATA_CHANGE_OWNER_TRANSACTION_REQUIRED"});
+    const sourceLedger = require("./notification-source-ledger-service");
+    const sourceEnvelopes = input.events.filter(event => event.normalizerVersion != null || event.notificationObservation != null);
+    if (sourceEnvelopes.some(event => ![sourceLedger.VERSION, "notification-source-v2"].includes(event.normalizerVersion)
+      || !event.notificationObservation || event.notificationObservation.normalizerVersion !== event.normalizerVersion)) {
+      throw Object.assign(new Error("Unsupported notification normalizer"), { code: "NOTIFICATION_NORMALIZER_UNSUPPORTED", status: 422 });
+    }
+    const legacy = sourceEnvelopes.filter(event => event.normalizerVersion === "notification-source-v2");
+    if (legacy.length) {
+      if (input.normalizerUpgradeProtocol !== 1) throw Object.assign(new Error("Update Desktop to retain legacy notification evidence and request a source repair"), {
+        code: "NOTIFICATION_NORMALIZER_UPGRADE_REQUIRED", status: 409,
+      });
+      if (legacy.length !== input.events.length) throw Object.assign(new Error("Notification normalizer generations cannot share a delivery batch"), {
+        code: "NOTIFICATION_NORMALIZER_BATCH_MIXED", status: 422,
+      });
+      if (!input.delivery) throw Object.assign(new Error("Legacy notification quarantine requires a contiguous delivery receipt"), {
+        code: "NOTIFICATION_UPGRADE_DELIVERY_REQUIRED", status: 409,
+      });
+      let normalizerUpgrade;
+      const now = await dbAuthorityNow({ db: tx });
+      const accepted = await require("./creator-live-sync-service").acceptDelivery({
+        db: tx, agencyId: creator.agencyId, creatorId: creator.id, deviceId: device.id,
+        memberId: member.id, accessEpoch: member.accessEpoch, delivery: input.delivery, events: input.events, now,
+        // Original bytes retain their old sequence digest. V2 money/source
+        // semantics never run again, including an ACK lost before the upgrade.
+        ingest: async () => [],
+        beforeAcknowledge: async ({ session }) => {
+          normalizerUpgrade = await require("./notification-normalizer-upgrade-service").reconcileLegacyNotificationDelivery({
+            db: tx, creator, device, session, delivery: input.delivery, events: input.events, now,
+          });
+        },
+      });
+      if (!normalizerUpgrade) throw Object.assign(new Error("Notification upgrade receipt was not committed"), {
+        code: "NOTIFICATION_UPGRADE_RECEIPT_REQUIRED", status: 409,
+      });
+      return { ...accepted, normalizerUpgrade };
+    }
     const grouped = new Map();
     const dates = [];
-    const sourceEvents=input.events.filter(event=>event.normalizerVersion === "notification-source-v2" && event.notificationObservation);
-    for(const event of sourceEvents){const row=require("./notification-source-ledger-service").normalizeObservation(event.notificationObservation);if(row.occurredAt)dates.push(row.occurredAt);}
+    const sourceEvents=sourceEnvelopes;
+    for(const event of sourceEvents){const row=sourceLedger.normalizeObservation(event.notificationObservation);if(row.occurredAt)dates.push(row.occurredAt);}
     for (const raw of input.events.filter(event=>!sourceEvents.includes(event))) {
       const normalized = normalizeNotificationFact(raw, creator.id);
       if (!normalized.sourceType || normalized.rejected) {
@@ -48,9 +84,9 @@ async function processLiveNotificationBatch({db: tx, creator, member, device, in
               events: sourceEvents.filter(event => event.notificationObservation.category === type && event.notificationObservation.disposition === "FACT").map(event => event.notificationFact),
             }));
             const sourceJob = { ...logicalJob, params: { ...logicalJob.params, types: ["purchases","tips","subscriptions","likes","comments"] } };
-            results.push(await require("./notification-source-ledger-service").ingestNotificationSourcePage({
+            results.push(await sourceLedger.ingestNotificationSourcePage({
               db: tx, job: sourceJob, deviceId: device.id, live: true,
-              chunk: { schemaVersion:6, normalizerVersion:"notification-source-v2", collectorVersion:"notifications-history-v9-source-ledger",
+              chunk: { schemaVersion:6, normalizerVersion:sourceLedger.VERSION, collectorVersion:"notifications-history-v9-source-ledger",
                 scanRunId:input.batchId, page:1, observations:sourceEvents.map(event=>event.notificationObservation), batches, processedRows:sourceEvents.length },
             }));
           }

@@ -62,6 +62,7 @@ function fixture({ commitEpoch = 7, commitBinding = true, source = false } = {})
       normalizeEvent: () => ({ sourceType: "tips", occurredAt: now }), ingestNotificationFacts: write("facts"),
     },
     "../services/notification-source-ledger-service": {
+      VERSION: "notification-source-v3",
       normalizeObservation: () => ({ occurredAt: now }), ingestNotificationSourcePage: write("source"),
     },
     "../services/live-earnings-projection-service": { ingestLive: write("earnings") },
@@ -97,7 +98,7 @@ function fixture({ commitEpoch = 7, commitBinding = true, source = false } = {})
     auth: { agencyId: "agency-a", userId: "user-a", deviceId: "device-a", membership: member },
     params: { creatorId: "creator-a" },
     body: { deviceId: "device-a", batchId: "live-batch-one", observedAt: now.toISOString(), events: source
-      ? [{ normalizerVersion: "notification-source-v2", notificationObservation: { category: "tips", disposition: "FACT" }, notificationFact: {} }]
+      ? [{ normalizerVersion: "notification-source-v3", notificationObservation: { normalizerVersion: "notification-source-v3", category: "tips", disposition: "FACT" }, notificationFact: {} }]
       : [{ eventType: "tip" }],
       delivery: { version: 1, sessionId: "delivery-session-one", entries: [{ seq: 1, capturedAt: now.toISOString() }] },
     },

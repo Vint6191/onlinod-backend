@@ -347,6 +347,7 @@ function projectTipProjectionFact(row) {
 function projectSubscriptionProjectionFact(row) {
   return {
     kind: "subscription",
+    canonicalEventId: row.id,
     eventType: LEGACY_SUBSCRIPTION_EVENT_TYPES[row.eventType] || String(row.eventType || "").toLowerCase(),
     fanId: row.fanOnlyFansUserIdAtEvent || row.fan?.onlyFansUserId || null,
     fanUsername: row.fan?.username || null,
@@ -369,6 +370,10 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, result }) {
   assertNotificationCollectionResult({ job, scanRunId: result?.scanRunId, notificationMode: result?.notificationMode });
   const events = eventList(result);
   const now = await require("./db-time-authority-service").dbAuthorityNow({ db, fallbackNow: new Date() });
+  const frontierProof = await require("./notification-frontier-authority").completionProof(db, job, result);
+  const types = Array.isArray(params.types)
+    ? [...new Set(params.types.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean))]
+    : ["purchases", "tips", "subscriptions", "likes", "comments"];
   const ledger = await ingestNotificationFacts({
     job,
     deviceId,
@@ -384,6 +389,10 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, result }) {
       // from another scan pass of the same JobInstance.
       batchKey: result?.batchKey,
       finalizeCoverage: true,
+      // A stale/corrupt terminal descriptor may retain captured facts, but
+      // cannot publish complete per-type coverage without the source boundary.
+      ...(!frontierProof.verified ? { coverage: Object.fromEntries(types.map(type => [type,
+        { ...(result?.coverage?.[type] || {}), status: "partial", reason: "coverage_unproven" }])) } : {}),
     },
   });
 
@@ -424,11 +433,9 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, result }) {
   summary.compatibilityDeferred = true;
 
   const scanTo = dateOrNull(params.to || result?.to) || now;
-  const types = Array.isArray(params.types)
-    ? [...new Set(params.types.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean))]
-    : ["purchases", "tips", "subscriptions", "likes", "comments"];
   const pageProof = await require("./notification-page-receipt-service").notificationCommittedPageProof(db, job, result);
   summary.pageProof = pageProof;
+  summary.frontierProof = frontierProof;
   const coverageByType = ledger.coverageByType || {};
   const typeComplete = (type) => coverageByType[type] === "complete";
   const allRequestedComplete = types.length > 0 && types.every(typeComplete);
@@ -438,6 +445,7 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, result }) {
   // activity projection, but it must never invalidate Analytics proof or cause
   // another OnlyFans traversal.
   const collectionFactsVerified = ledger.status === "COMMITTED"
+    && frontierProof.verified
     && allRequestedComplete
     && ledger.rejected === 0
     && pageProof.verified;
@@ -492,11 +500,7 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, result }) {
     update: data,
   });
   await completeNotificationSync({ db, job, deviceId, result, successful: collectionFactsVerified });
-  const notificationMode = String(result?.notificationMode || params.notificationMode || "full").trim().toLowerCase() === "catchup"
-    ? "catchup" : "full";
-  const sourceTraversalComplete = result?.sourceExhausted === true
-    && (notificationMode !== "full" || result?.allSourceExhausted === true)
-    && ["COMMITTED", "PARTIAL"].includes(ledger.status);
+  const sourceTraversalComplete = frontierProof.verified && ["COMMITTED", "PARTIAL"].includes(ledger.status);
   const collectionVerified = collectionFactsVerified && sourceTraversalComplete;
   // A PARTIAL canonical collection must return ok=false so JobInstance and the
   // durable SyncState enter the same bounded retry/quarantine lifecycle. A

@@ -72,5 +72,6 @@ test("paid receipt replay returns the same identity without duplicating money or
       fact:{fanId:"123",eventType:"paid_subscribed",amountCents:100,eventHash:"same",occurredAt:new Date("2026-09-24")}});
     ids.push(result.ledgerId); assert.equal(result.duplicate,n>0);
   }
-  assert.equal(rows.size,1); assert.equal(new Set(ids).size,1); assert.deepEqual(calls,["insert","identity","insert","identity","insert","identity"]);
+  assert.equal(rows.size,1); assert.equal(new Set(ids).size,1);
+  assert.equal(calls.filter(call => call === "insert").length,1);
 });

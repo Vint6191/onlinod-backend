@@ -60,7 +60,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
   // A PARTIAL full scan may have reached the historical boundary while rejecting
   // canonical facts; that state must never unlock bounded catch-up as if the
   // baseline were proven. Only the durable verification timestamp is authority.
-  const historicalBaseline = Boolean(state?.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
+  const historicalBaseline = Boolean(state?.normalizerVersion === "notification-source-v3" && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
   if (!historicalBaseline) {
     return {
       from: FULL_HISTORY_FROM.toISOString(),
@@ -124,7 +124,7 @@ async function verifiedFrontierIds({ db, job, scanRunId, mode, headNotificationI
   }
   const rows = await db.creatorNotificationScanItem.findMany({
     where: { creatorId: job.creatorId, sourceJobId: job.id, scanRunId,
-      ...(job.params?.notificationNormalizerVersion === "notification-source-v2" ? {sourcePhase: mode === "full" ? "all_reconciliation" : "all", outcome:{in:["ACCEPTED","IGNORED"]}, occurredAt:{...(mode === "full" ? {} : {gte:new Date(job.params.from)}),lte:new Date(job.params.to)}, OR:[{reasonCode:null},{reasonCode:{not:"OUTSIDE_SCAN_RANGE"}}]} : {}),
+      ...(job.params?.notificationNormalizerVersion === "notification-source-v3" ? {sourcePhase: mode === "full" ? "all_reconciliation" : "all", outcome:{in:["ACCEPTED","IGNORED"]}, occurredAt:{...(mode === "full" ? {} : {gte:new Date(job.params.from)}),lte:new Date(job.params.to)}, OR:[{reasonCode:null},{reasonCode:{not:"OUTSIDE_SCAN_RANGE"}}]} : {}),
     },
     orderBy: [{ page: "asc" }, { ordinal: "asc" }],
     take: 300,
@@ -175,7 +175,11 @@ async function recordNotificationPageProgress({ db, job, deviceId, chunk, fronti
       return existing;
     }
     const sameRun = existing?.scanRunId === scanRunId;
-    const frontierReceipt = await require("./notification-frontier-authority").commitPage(tx,job,chunk,existing?.frontierReceipt,frontierAssessment);
+    const frontierReceipt = {
+      ...await require("./notification-frontier-authority").commitPage(tx,job,chunk,existing?.frontierReceipt,frontierAssessment),
+      ...(existing?.frontierReceipt?.baselineProof ? { baselineProof: existing.frontierReceipt.baselineProof } : {}),
+      attemptedNormalizerVersion: job.params?.notificationNormalizerVersion || null,
+    };
     const data = {
       frontierReceipt,
       status: "SCANNING",
@@ -225,15 +229,13 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
       throw error;
     }
     if (sameGeneration(existing, command) && String(existing?.status || "").toUpperCase() === "COMPLETE") return existing;
-    const sourceExhausted = result?.sourceExhausted === true;
-    const allSourceExhausted = result?.allSourceExhausted === true;
     // A full backfill is verified only after both proof layers are complete:
     // every typed source is exhausted by the desktop continuation and the final
     // unfiltered ALL reconciliation independently reaches hasMore=false.
-    const sourceTraversalComplete = sourceExhausted && (mode !== "full" || allSourceExhausted);
-    const verified = successful === true && sourceTraversalComplete && require("./notification-frontier-authority").completed(job,existing?.frontierReceipt);
+    const sourceTraversalComplete = require("./notification-frontier-authority").sourceTraversalComplete(job, result, existing?.frontierReceipt);
+    const verified = successful === true && sourceTraversalComplete;
     const trustedPriorFullHistoryVerifiedAt = trustedCollectionTimestamp(existing?.fullBackfillVerifiedAt, now);
-    const priorFullHistoryVerified = Boolean(trustedPriorFullHistoryVerifiedAt && existing?.normalizerVersion === "notification-source-v2");
+    const priorFullHistoryVerified = Boolean(trustedPriorFullHistoryVerifiedAt && existing?.normalizerVersion === "notification-source-v3");
     // A later failed/partial FULL refresh must never erase an already durable
     // historical proof. The latest attempt outcome and the last proven baseline
     // are separate facts: PARTIAL/FAILED may make the collector stale/deferred,
@@ -245,8 +247,15 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
         db: tx, job, scanRunId: command.generation, mode, headNotificationId: result?.headNotificationId, existingIds: existing?.knownNotificationIds,
       })
       : boundedNotificationIds(existing?.knownNotificationIds);
+    const requestedThrough = strictDate(job.params?.to);
+    const observedFrom = observationStartForJob(job);
+    const baselineThrough = requestedThrough && observedFrom
+      ? new Date(Math.min(+requestedThrough, +observedFrom)) : null;
     const data = {
-      ...(verified && mode === "full" && result?.normalizerVersion === "notification-source-v2" ? {normalizerVersion:result.normalizerVersion}:{}),
+      ...(verified && mode === "full" && result?.normalizerVersion === "notification-source-v3" ? {normalizerVersion:result.normalizerVersion}:{}),
+      ...(verified && mode === "full" ? { frontierReceipt: { ...object(existing?.frontierReceipt),
+        baselineProof: { normalizerVersion: job.params?.notificationNormalizerVersion || null,
+          generation: command.generation, throughAt: baselineThrough?.toISOString() || null } } } : {}),
       status: overallComplete ? "COMPLETE" : "PARTIAL",
       mode,
       scanRunId: clean(result?.scanRunId, 120),
@@ -282,7 +291,12 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
         ...(verified ? { lastCatchupVerifiedAt: now, lastCatchupObservedAt: observationStartForJob(job) } : {}),
       } : {}),
     };
-    await require("./creator-live-sync-service").completeRecovery(tx,job,overallComplete,{deferPlanningWake:true});
+    // The filter upper bound can include the legacy five-minute tolerance.
+    // It cannot settle delivery debt first accepted after this source walk
+    // started; use the same physical observation bound as the saved proof.
+    await require("./creator-live-sync-service").completeRecovery(tx,job,overallComplete,{
+      deferPlanningWake:true, coveredThrough:baselineThrough,
+    });
     return tx.creatorNotificationSyncState.upsert({
       where: { creatorId: job.creatorId },
       create: { agencyId: job.agencyId, creatorId: job.creatorId, ...data },
@@ -305,6 +319,7 @@ async function recordNotificationSyncFailure({ db, job, deviceId = null, error, 
     const retryAt = terminal ? interruption?.retryAt || null : strictDate(retryAfterAt) || new Date(+retryNow + 5 * 60 * 1000);
     const data = {
       status: "FAILED",
+      frontierReceipt: { ...object(existing?.frontierReceipt), attemptedNormalizerVersion: job.params?.notificationNormalizerVersion || null },
       mode: params.notificationMode === "catchup" ? "catchup" : "full",
       scanRunId: command.generation,
       activeGeneration: command.generation,

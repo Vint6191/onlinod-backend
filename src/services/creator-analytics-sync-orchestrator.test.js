@@ -36,7 +36,7 @@ const input=d=>({db:d,creatorId:'c',agencyId:'a',now});
 const debt=stream=>({id:'debt-'+stream,creatorId:'c',agencyId:'a',stream,reason:'OFFLINE_GAP',gapFrom:old,targetAt:now,policyVersion:2,status:'PENDING'});
 test.beforeEach(()=>{
  planned=[];active=[];sources=[];intents={};locks=[];ledger=true;
- notes={normalizerVersion:'notification-source-v2',status:'COMPLETE',fullBackfillVerifiedAt:old,fullBackfillObservedAt:old,knownNotificationIds:['known'],headNotificationId:'known'};
+ notes={normalizerVersion:'notification-source-v3',status:'COMPLETE',fullBackfillVerifiedAt:old,fullBackfillObservedAt:old,knownNotificationIds:['known'],headNotificationId:'known'};
  financialState={status:'COMPLETE',baselineGeneration:'fin-base',baselineVerifiedAt:old,baselineObservedAt:old,receiptCoverageVersion:1};
  campaignState={status:'COMPLETE',baselineGeneration:'campaign-base',baselineVerifiedAt:old,baselineObservedAt:old,membershipCoverageStatus:'COMPLETE',fanValueFreshnessStatus:'COMPLETE'};
 });
@@ -65,7 +65,7 @@ test('initial history prioritizes financial ledger, campaigns, then notification
  let step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.stage,'financial');assert.equal(planned.at(-1).params.collectionMode,'full');assert.equal(planned.at(-1).params.earningsLedgerVersion,1);
  active=[];financialState={baselineGeneration:'f',baselineVerifiedAt:old};ledger=true;step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.stage,'campaigns');
  active=[];campaignState={baselineGeneration:'c',baselineVerifiedAt:old,membershipCoverageStatus:'COMPLETE'};step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.stage,'notifications');
- active=[];notes={normalizerVersion:'notification-source-v2',fullBackfillVerifiedAt:old};step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.ready,true);
+ active=[];notes={normalizerVersion:'notification-source-v3',fullBackfillVerifiedAt:old};step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.ready,true);
 });
 test('cutover requires one verified ledger baseline, then never repeats it by age',async()=>{
  ledger=false;const d=db();let step=await api.ensureInitialCreatorAnalyticsSync(input(d));assert.equal(step.stage,'financial');assert.equal(planned.length,1);
@@ -102,7 +102,7 @@ test('enrichment debt is partial while notifications proceed without another cam
  notes=null;campaignState.fanValueOutstanding=10;
  const result=await api.ensureInitialCreatorAnalyticsSync(input(db()));assert.equal(result.stage,'notifications');
  assert(!planned.some(job=>job.jobKey==='fetch_campaigns'));
- active=[];notes={normalizerVersion:'notification-source-v2',fullBackfillVerifiedAt:old};
+ active=[];notes={normalizerVersion:'notification-source-v3',fullBackfillVerifiedAt:old};
  const partial=await api.ensureInitialCreatorAnalyticsSync(input(db()));assert.equal(partial.ready,false);
  assert.equal(partial.blocked[0].reason,'enrichment_pending');
 });

@@ -8,7 +8,7 @@ const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { projectSubscriptionFacts } = require("./creator-analytics-projection-service");
-const { lockCreatorFacts, mergeNotificationMoney, transactionIdentityConflict } = require("./creator-fact-write-authority");
+const { lockCreatorFacts, mergeNotificationMoney, transactionIdentityConflict, retainKnownFan } = require("./creator-fact-write-authority");
 const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
 const { projectEventFanIdentities } = require("./fan-data-authority-service");
 
@@ -89,7 +89,7 @@ function identityFingerprint(kind, creatorId, event, occurredAt, amountCents, ca
   }
   if (kind === "subscription") {
     if (transactionId) return sha256(`${kind}|${creatorId}|transaction|${transactionId}|${eventType || "unknown"}`);
-    if (event.normalizerVersion === "notification-source-v2" && notificationId) return sha256(`${kind}|${creatorId}|notification|${notificationId}`);
+    if (["notification-source-v2", "notification-source-v3"].includes(event.normalizerVersion) && notificationId) return sha256(`${kind}|${creatorId}|notification|${notificationId}`);
     // OnlyFans emits the same subscription through new_message, subscribed and
     // later Notifications ALL. Some variants have a notification id and some do
     // not, but they agree on fan, lifecycle type, price and the UTC minute.
@@ -139,6 +139,21 @@ function normalizeEvent(raw, creatorId) {
   const rawType = String(event.eventType || event.type || "").toLowerCase();
   const sourceType = sourceTypeForRawType(rawType);
   const reject = (code) => ({ rejected: code, sourceType });
+  if (event.creatorId != null && event.creatorId !== creatorId) return reject("NOTIFICATION_CREATOR_SCOPE_MISMATCH");
+  for (const key of ["eventType", "type"]) {
+    if (event[key] != null && (typeof event[key] !== "string" || /[\u0000-\u001f\u007f]/.test(event[key]))) return reject("INVALID_NOTIFICATION_TYPE");
+  }
+  for (const key of ["notificationId", "transactionId", "purchaseId", "tipId", "externalEventId", "fanId", "dialogId", "messageId", "postId", "commentId", "likeId"]) {
+    const value = event[key];
+    if (value == null) continue;
+    if ((typeof value !== "string" && typeof value !== "number")
+      || (typeof value === "number" && (!Number.isSafeInteger(value) || value < 0))
+      || (typeof value === "string" && (/[\u0000-\u001f\u007f]/.test(value) || /^-\d+$/.test(value.trim())))) return reject("INVALID_NOTIFICATION_IDENTIFIER");
+  }
+  for (const value of [event.fanUsername, event.username, event.fanName, event.name,
+    event.fanAvatarUrl, event.avatarUrl, event.avatar, object(event.user).avatar, object(event.user).avatarUrl]) {
+    if (value != null && (typeof value !== "string" || value.includes("\u0000"))) return reject("INVALID_NOTIFICATION_PROFILE");
+  }
   if (sourceType !== "subscriptions" && /(refund|chargeback|reversal)/.test(rawType)) {
     return reject("UNSUPPORTED_FINANCIAL_REVERSAL_EVENT");
   }
@@ -364,10 +379,28 @@ function mergeSubscriptionFacts(current, incoming) {
   };
 }
 function mergeFactDataWithExisting(model, existing, incoming) {
-  if (model !== "creatorSubscriptionEvent" || !existing) return mergeNotificationMoney(model, existing, incoming);
+  if (model !== "creatorSubscriptionEvent" || !existing) {
+    let merged = mergeNotificationMoney(model, existing, incoming);
+    if (model === "creatorSale" || model === "creatorTip") merged = retainKnownFan(existing, merged);
+    // A source correction can move the same purchase between a message and a
+    // post. Enrichment may retain a missing identifier, but not an identifier
+    // belonging to the other target type. Use the merged type so a payout-owned
+    // sale retains its existing financial authority.
+    if (model === "creatorSale" && merged.saleType === "MESSAGE") merged.postId = null;
+    if (model === "creatorSale" && merged.saleType === "POST") merged.messageId = null;
+    return merged;
+  }
   const existingHasStrongIdentity = Boolean(existing.externalTransactionId || existing.externalNotificationId);
   const incomingHasStrongIdentity = Boolean(incoming.externalTransactionId || incoming.externalNotificationId);
   const preserveExistingSource = existingHasStrongIdentity && !incomingHasStrongIdentity;
+  const preserveExistingFan = preserveExistingSource || (!incoming.fanRecordId && !incoming.fanOnlyFansUserIdAtEvent);
+  const changedFan = !preserveExistingFan && Boolean(
+    (existing.fanRecordId && incoming.fanRecordId && existing.fanRecordId !== incoming.fanRecordId)
+    || (existing.fanOnlyFansUserIdAtEvent && incoming.fanOnlyFansUserIdAtEvent
+      && existing.fanOnlyFansUserIdAtEvent !== incoming.fanOnlyFansUserIdAtEvent));
+  const fanValue = field => preserveExistingFan
+    ? (existing[field] ?? incoming[field] ?? null)
+    : (incoming[field] ?? (changedFan ? null : existing[field]) ?? null);
   return {
     ...incoming,
     externalNotificationId: existing.externalNotificationId || incoming.externalNotificationId || null,
@@ -376,18 +409,13 @@ function mergeFactDataWithExisting(model, existing, incoming) {
     sourceDeviceId: preserveExistingSource ? existing.sourceDeviceId : incoming.sourceDeviceId,
     sourceJobId: preserveExistingSource ? existing.sourceJobId : incoming.sourceJobId,
     collectedAt: preserveExistingSource ? existing.collectedAt : incoming.collectedAt,
-    fanOnlyFansUserIdAtEvent: preserveExistingSource
-      ? (existing.fanOnlyFansUserIdAtEvent || incoming.fanOnlyFansUserIdAtEvent || null)
-      : (incoming.fanOnlyFansUserIdAtEvent || existing.fanOnlyFansUserIdAtEvent || null),
-    fanUsernameAtEvent: preserveExistingSource
-      ? (existing.fanUsernameAtEvent || incoming.fanUsernameAtEvent || null)
-      : (incoming.fanUsernameAtEvent || existing.fanUsernameAtEvent || null),
-    fanDisplayNameAtEvent: preserveExistingSource
-      ? (existing.fanDisplayNameAtEvent || incoming.fanDisplayNameAtEvent || null)
-      : (incoming.fanDisplayNameAtEvent || existing.fanDisplayNameAtEvent || null),
-    fanAvatarUrlAtEvent: preserveExistingSource
-      ? (existing.fanAvatarUrlAtEvent || incoming.fanAvatarUrlAtEvent || null)
-      : (incoming.fanAvatarUrlAtEvent || existing.fanAvatarUrlAtEvent || null),
+    // The relation and its event snapshots represent one owner. A sparse replay
+    // must retain both; a changed owner must never inherit the former profile.
+    fanRecordId: fanValue("fanRecordId"),
+    fanOnlyFansUserIdAtEvent: fanValue("fanOnlyFansUserIdAtEvent"),
+    fanUsernameAtEvent: fanValue("fanUsernameAtEvent"),
+    fanDisplayNameAtEvent: fanValue("fanDisplayNameAtEvent"),
+    fanAvatarUrlAtEvent: fanValue("fanAvatarUrlAtEvent"),
   };
 }
 function buildFactData({ fact, job, deviceId, fanRecordIds, now }) {
@@ -444,6 +472,32 @@ async function resolveFans(tx, { agencyId, creatorId, facts, now }) {
   const projected = await projectEventFanIdentities(tx, observations, now);
   return { fanRecordIds: new Map([...projected.fans.values()].map((fan) => [fan.onlyFansUserId, fan.id])),
     identityHintConflicts: projected.ambiguousFields };
+}
+
+async function projectLiveTrafficFacts(db, job, model, rows) {
+  if (job.sourceJobId !== null || !rows.length) return;
+  // Live input has no retained JobInstance for the history receipt worker. Its
+  // canonical financial consequences therefore commit with the live fact/ACK.
+  // The existing runtime adapter continues to own live automation triggers.
+  if (model === "creatorSubscriptionEvent") {
+    const project = require("./team-observation-service").projectSubscriptionProjectionFact;
+    for (const row of rows) await require("./subscription-receipt-projection-service").projectCanonicalSubscriptionReceipt({
+      db, job, fact: project(row),
+    });
+    return;
+  }
+  const missing = [...new Set(rows.filter(row => !row.fanOnlyFansUserIdAtEvent && row.fanRecordId).map(row => row.fanRecordId))];
+  const fans = missing.length ? await db.creatorFan.findMany({ where: {
+    agencyId: job.agencyId, creatorId: job.creatorId, id: { in: missing },
+  }, select: { id: true, onlyFansUserId: true } }) : [];
+  const byId = new Map(fans.map(row => [row.id, row.onlyFansUserId]));
+  for (const row of rows) {
+    const fanId = row.fanOnlyFansUserIdAtEvent || byId.get(row.fanRecordId);
+    if (fanId) await require("./traffic-service").markTrafficFanValueDirty({
+      db, agencyId: job.agencyId, creatorId: job.creatorId, fanId,
+      occurredAt: row.purchasedAt || row.tippedAt, reason: "canonical_live_notification",
+    });
+  }
 }
 
 async function existingFacts(tx, model, creatorId, facts) {
@@ -551,7 +605,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
     if (row) canonicalIds.add(row.id);
     if (!row) creates.push({ fact, data });
     else if (valuesEqual(row, data, compareKeys)) unchanged += 1;
-    else updates.push({ id: row.id, data });
+    else updates.push({ id: row.id, data, previous: row });
     for (const token of tokens) seenInput.set(token, fact);
   }
 
@@ -592,7 +646,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
         canonicalIds.add(row.id);
         const mergedData = mergeFactDataWithExisting(model, row, item.data);
         if (!valuesEqual(row, mergedData, compareKeys)) {
-          updates.push({ id: row.id, data: mergedData });
+          updates.push({ id: row.id, data: mergedData, previous: row });
           raceUpdated += 1;
         }
       }
@@ -608,7 +662,8 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
     delete data.createdAt;
     await tx[model].update({ where: { id: update.id }, data });
   }
-  return { inserted, updated: uniqueUpdates.size, unchanged, rejected, canonicalIds: [...canonicalIds] };
+  return { inserted, updated: uniqueUpdates.size, unchanged, rejected, canonicalIds: [...canonicalIds],
+    previousRows: [...uniqueUpdates.values()].map(update => update.previous) };
 }
 
 async function ensureBatch(db, data) {
@@ -721,7 +776,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
     });
   }
   const schemaVersion = incomingSchemaVersion;
-  if (result.finalizeCoverage === true && job.params?.notificationNormalizerVersion === "notification-source-v2" && schemaVersion !== SOURCE_SCHEMA_VERSION) throw Object.assign(new Error("Current notification source receipts are required"), {code:"NOTIFICATION_COLLECTOR_UPGRADE_REQUIRED",status:409});
+  if (result.finalizeCoverage === true && job.params?.notificationNormalizerVersion === "notification-source-v3" && schemaVersion !== SOURCE_SCHEMA_VERSION) throw Object.assign(new Error("Current notification source receipts are required"), {code:"NOTIFICATION_COLLECTOR_UPGRADE_REQUIRED",status:409});
   const scanRunIdRaw = typeof result?.scanRunId === "string" ? result.scanRunId.trim() : "";
   const scanRunId = scanRunIdRaw;
   if (!scanRunId || scanRunId.length > 120 || !/^[A-Za-z0-9._-]{8,120}$/.test(scanRunId)) {
@@ -864,16 +919,18 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       // effect when Team models are available.
       if (groups.sale.length) {
         const persistedSales = await existingFacts(tx, "creatorSale", job.creatorId, groups.sale);
+        await projectLiveTrafficFacts(tx, job, "creatorSale", persistedSales);
         const ambiguous = typeof tx.$queryRawUnsafe === "function"
           ? await require("./financial-correlation-service").invalidateNeighborhoods({ db: tx, job, rows: persistedSales, kind: "SALE", now }) : [];
         for (const sourceId of ambiguous) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "PPV", sourceId, now });
         for (const row of persistedSales) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "PPV", sourceId: row.id, now });
         if (sale.inserted || sale.updated || ambiguous.length) await require("./creator-entity-change-service").publishCanonicalSales({
-          db:tx,agencyId:job.agencyId,creatorId:job.creatorId,saleIds:[...new Set([...persistedSales.map(row=>row.id),...ambiguous])],
+          db:tx,agencyId:job.agencyId,creatorId:job.creatorId,saleIds:[...new Set([...persistedSales.map(row=>row.id),...ambiguous])],previousRows:sale.previousRows,
         });
       }
       if (groups.tip.length) {
         const persistedTips = await existingFacts(tx, "creatorTip", job.creatorId, groups.tip);
+        await projectLiveTrafficFacts(tx, job, "creatorTip", persistedTips);
         const ambiguous = typeof tx.$queryRawUnsafe === "function"
           ? await require("./financial-correlation-service").invalidateNeighborhoods({ db: tx, job, rows: persistedTips, kind: "TIP", now }) : [];
         for (const sourceId of ambiguous) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "TIP", sourceId, now });
@@ -896,6 +953,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
         // twice its bounded event count, including two events exchanging fans.
         await projectSubscriptionFacts({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId,
           fanRecordIds: affectedFanIds, eventIds: persistedSubscriptions.map(row => row.id), now });
+        await projectLiveTrafficFacts(tx, job, "creatorSubscriptionEvent", persistedSubscriptions);
       }
       const like = await persistFactGroup(tx, {
         model: "creatorPostLike", facts: groups.like, job, deviceId, fanRecordIds, now,
@@ -907,7 +965,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       });
       for (const [model, group] of [["creatorTip", tip], ["creatorSubscriptionEvent", subscription], ["creatorPostLike", like], ["creatorPostComment", comment]]) {
         if ((group.inserted || group.updated) && group.canonicalIds.length) await require("./creator-entity-change-service").publishCanonicalFactInvalidations({
-          db: tx, agencyId: job.agencyId, creatorId: job.creatorId, model, ids: group.canonicalIds,
+          db: tx, agencyId: job.agencyId, creatorId: job.creatorId, model, ids: group.canonicalIds, previousRows: group.previousRows,
         });
       }
       let rowOutcomes;
@@ -1017,5 +1075,6 @@ module.exports = {
   identityFingerprint,
   resultCoverage,
   coverageComplete,
+  validateFinalScannerCoverage,
   ingestNotificationFacts,
 };

@@ -158,7 +158,7 @@ function fixture() {
 function notificationConflictFixture() {
   const item = fixture();
   Object.assign(item.job, { creatorId: "creator-1", jobKey: "catchup_notifications_scan", attempts: 0, continuation: null,
-    params: { notificationNormalizerVersion: "notification-source-v2", collectionGeneration: "conflicting-run", collectionRequestedAt: "2026-10-01T00:00:00.000Z",
+    params: { notificationNormalizerVersion: "notification-source-v3", collectionGeneration: "conflicting-run", collectionRequestedAt: "2026-10-01T00:00:00.000Z",
       collectionMode: "full", notificationMode: "full", notificationFrontierVersion: 4, types: [...NOTIFICATION_TYPES] }, result: null });
   item.applyJobChunk = async () => { throw Object.assign(new Error("immutable receipt conflict"), { code: "ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT" }); };
   item.input = { jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3,
@@ -579,6 +579,8 @@ test("vault completion keeps publication fenced with a longer bounded transactio
       return callback(db);
     },
   };
+  const acceptedResult = { mode: "full", scanned: 800 };
+  job.continuation.result = acceptedResult;
   const { completeJob } = loadService({
     db,
     applyJobResult: async ({ db: transactionDb }) => {
@@ -594,7 +596,7 @@ test("vault completion keeps publication fenced with a longer bounded transactio
     leaseRevision: 5,
     workId: "work-complete",
     progress: { current: 800, percent: 100 },
-    result: { mode: "full", scanned: 800 },
+    result: acceptedResult,
   });
   assert.equal(transactionOptions.isolationLevel, "ReadCommitted");
   assert.equal(transactionOptions.maxWait, 10000);
@@ -632,6 +634,8 @@ test("daily catalog completion does not auto-start dialog discovery", async () =
     },
     $transaction: async (callback) => callback(db),
   };
+  const acceptedResult = { mode: "full", scanned: 2_017 };
+  job.continuation.result = acceptedResult;
   const { completeJob } = loadService({
     db,
     applyJobResult: async () => ({ type: "vault_unsorted", publicationMode: "merge" }),
@@ -647,7 +651,7 @@ test("daily catalog completion does not auto-start dialog discovery", async () =
     leaseToken: token,
     leaseRevision: 6,
     workId: "daily-work",
-    result: { mode: "full", scanned: 2_017 },
+    result: acceptedResult,
     progress: { current: 2_017, percent: 100 },
   });
   assert.equal(dailyCalls, 0);
@@ -752,6 +756,8 @@ test("full notification completion keeps canonical proof and terminal mutation i
       },
     },
   };
+  const acceptedResult = { collectorVersion: "notifications-catchup-v3", totalAcceptedEvents: 0 };
+  job.continuation.result = acceptedResult;
   const { completeJob } = loadService({
     db,
     applyJobResult: async ({ db: suppliedDb }) => {
@@ -768,7 +774,7 @@ test("full notification completion keeps canonical proof and terminal mutation i
     leaseToken: token,
     leaseRevision: 7,
     workId: "notification-work",
-    result: { collectorVersion: "notifications-catchup-v3", totalAcceptedEvents: 0 },
+    result: acceptedResult,
     progress: { current: 3, total: 3, percent: 100 },
   });
 
@@ -829,6 +835,21 @@ test("bounded notification catch-up commits DONE with durable intent and no memo
     },
     $transaction: async (callback) => callback(db),
   };
+  const acceptedResult = {
+      notificationMode: "catchup",
+      schemaVersion: 5,
+      scanRunId: "scan-bounded-success-1",
+      totalAcceptedEvents: 1,
+      sourceExhausted: true,
+      coverage: {
+        purchases: { status: "complete", rejected: 0 },
+        tips: { status: "complete", rejected: 0 },
+        subscriptions: { status: "complete", rejected: 0 },
+        likes: { status: "complete", rejected: 0 },
+        comments: { status: "complete", rejected: 0 },
+      },
+    };
+  job.continuation.result = acceptedResult;
   const { completeJob } = loadService({
     db,
     completeNotificationSync: async ({ db: suppliedDb, successful }) => {
@@ -851,20 +872,7 @@ test("bounded notification catch-up commits DONE with durable intent and no memo
     leaseToken: token,
     leaseRevision: 5,
     workId: job.workId,
-    result: {
-      notificationMode: "catchup",
-      schemaVersion: 5,
-      scanRunId: "scan-bounded-success-1",
-      totalAcceptedEvents: 1,
-      sourceExhausted: true,
-      coverage: {
-        purchases: { status: "complete", rejected: 0 },
-        tips: { status: "complete", rejected: 0 },
-        subscriptions: { status: "complete", rejected: 0 },
-        likes: { status: "complete", rejected: 0 },
-        comments: { status: "complete", rejected: 0 },
-      },
-    },
+    result: acceptedResult,
     progress: { current: 1, total: 1, percent: 100 },
   });
 
@@ -980,6 +988,15 @@ test("partial notification completion stops without restarting a new FULL genera
       updateMany: async (args) => { updates.push(args); return { count: 1 }; },
     },
   };
+  const acceptedResult = {
+      collectorVersion: "notifications-catchup-v3",
+      scanRunId: "run-partial-1",
+      coverage: {
+        purchases: { status: "complete", reason: "source_exhausted", rejected: 0 },
+        tips: { status: "partial", reason: "page_limit", rejected: 0, cursorEnd: "tip-cursor-200" },
+      },
+    };
+  job.continuation.result = acceptedResult;
   const { completeJob } = loadService({
     db,
     applyJobResult: async () => ({
@@ -1000,14 +1017,7 @@ test("partial notification completion stops without restarting a new FULL genera
     leaseToken: token,
     leaseRevision: 3,
     workId: job.workId,
-    result: {
-      collectorVersion: "notifications-catchup-v3",
-      scanRunId: "run-partial-1",
-      coverage: {
-        purchases: { status: "complete", reason: "source_exhausted", rejected: 0 },
-        tips: { status: "partial", reason: "page_limit", rejected: 0, cursorEnd: "tip-cursor-200" },
-      },
-    },
+    result: acceptedResult,
     progress: { current: 1, total: 1, percent: 100 },
   });
 
@@ -1065,7 +1075,7 @@ for (const type of ['NOTIFICATIONS','FINANCIAL']) test(`first ${type} claim afte
   const now=new Date(),old=new Date(+now-90*86400000),jobKey=type==='NOTIFICATIONS'?'catchup_notifications_scan':'financial_transactions_scan';
   const params=require('./analytics-collector-control-service').stampCollectionAuthorityParams({collectionContractVersion:1,collectionType:type,
     collectionMode:'catchup',collectionGeneration:'queued-generation',collectionRequestedAt:old.toISOString(),notificationMode:'catchup',
-    notificationNormalizerVersion:'notification-source-v2',types:NOTIFICATION_TYPES,from:'2016-01-01T00:00:00.000Z',stopAtNotificationId:'old-verified-head'},old);
+    notificationNormalizerVersion:'notification-source-v3',types:NOTIFICATION_TYPES,from:'2016-01-01T00:00:00.000Z',stopAtNotificationId:'old-verified-head'},old);
   const candidate={id:'queued-offline',agencyId:'agency-1',creatorId:'creator-1',jobKey,status:'SCHEDULED',leaseRevision:0,attempts:0,
     startedAt:null,continuation:null,params,nextRunAt:old};
   let data;
@@ -1090,7 +1100,7 @@ test("claiming a queued pre-fix repair returns a fresh notification generation a
   const now = new Date();
   const candidate = { id: "queued-old-repair", agencyId: "agency-1", creatorId: "creator-1", jobKey: "catchup_notifications_scan",
     status: "SCHEDULED", leaseRevision: 4, attempts: 2, startedAt: now, progress: { percent: 30 },
-    params: { notificationNormalizerVersion: "notification-source-v2", notificationMode: "catchup", types: ["tips"], collectionGeneration: "old-run", collectionRequestedAt: now.toISOString() },
+    params: { notificationNormalizerVersion: "notification-source-v3", notificationMode: "catchup", types: ["tips"], collectionGeneration: "old-run", collectionRequestedAt: now.toISOString() },
     result: { scanRunId: "old-run", coverage: { tips: { status: "partial" } }, completionSideEffect: { ok: false } },
     continuation: { driverPhase: "execute", jobContinuation: { page: 1 } }, nextRunAt: now,
   };
@@ -1170,6 +1180,8 @@ test("manual notification PARTIAL at a proven source boundary stays a visible on
       updateMany: async (args) => { updates.push(args); return { count: 1 }; },
     },
   };
+  const acceptedResult = { notificationMode: "full", sourceExhausted: true, allSourceExhausted: true };
+  job.continuation.result = acceptedResult;
   const { completeJob } = loadService({
     db,
     applyJobResult: async () => ({
@@ -1184,7 +1196,7 @@ test("manual notification PARTIAL at a proven source boundary stays a visible on
   const result = await completeJob({
     jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token,
     leaseRevision: 4, workId: job.workId,
-    result: { notificationMode: "full", sourceExhausted: true, allSourceExhausted: true },
+    result: acceptedResult,
     progress: { percent: 100 },
   });
 
@@ -1228,6 +1240,8 @@ test("manual notification completion stops when the source boundary was not reac
       updateMany: async (args) => { updates.push(args); return { count: 1 }; },
     },
   };
+  const acceptedResult = { notificationMode: "full", sourceExhausted: false, allSourceExhausted: false };
+  job.continuation.result = acceptedResult;
   const { completeJob } = loadService({
     db,
     applyJobResult: async () => ({
@@ -1242,7 +1256,7 @@ test("manual notification completion stops when the source boundary was not reac
   const result = await completeJob({
     jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token,
     leaseRevision: 5, workId: job.workId,
-    result: { notificationMode: "full", sourceExhausted: false, allSourceExhausted: false },
+    result: acceptedResult,
     progress: { percent: 80 },
   });
 
@@ -1283,6 +1297,8 @@ test("fifth non-resumable partial notification attempt becomes FAILED instead of
       updateMany: async (args) => { updates.push(args); return { count: 1 }; },
     },
   };
+  const acceptedResult = { coverage: { tips: { status: "partial", reason: "cursor_stalled", rejected: 0, cursorEnd: "same" } } };
+  job.continuation.result = acceptedResult;
   const { completeJob } = loadService({
     db,
     applyJobResult: async () => ({
@@ -1298,7 +1314,7 @@ test("fifth non-resumable partial notification attempt becomes FAILED instead of
     leaseToken: token,
     leaseRevision: 11,
     workId: job.workId,
-    result: { coverage: { tips: { status: "partial", reason: "cursor_stalled", rejected: 0, cursorEnd: "same" } } },
+    result: acceptedResult,
     progress: { current: 1, total: 1, percent: 100 },
   });
 
@@ -1353,7 +1369,7 @@ test("claim fence cancels a legacy no-mode notification FULL once historical bas
     agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all" }) },
     creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
     deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
-    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), normalizerVersion: "notification-source-v3", fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
     jobInstance: {
       findFirst: async () => (candidateReads++ === 0 ? candidate : null),
       updateMany: async (args) => {
@@ -1382,7 +1398,7 @@ test("renew fence kills an already claimed legacy no-mode notification FULL afte
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
     agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), normalizerVersion: "notification-source-v3", fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
     jobInstance: {
       findUnique: async () => job,
       updateMany: async (args) => { cancellation = args; return { count: 1 }; },
@@ -1409,7 +1425,7 @@ test("future-poisoned notification baseline cannot cancel a repair FULL lease", 
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
     agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    creatorNotificationSyncState: { findUnique: async () => ({ normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2099-01-01T00:00:00.000Z") }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ normalizerVersion: "notification-source-v3", fullBackfillVerifiedAt: new Date("2099-01-01T00:00:00.000Z") }) },
     jobInstance: {
       findUnique: async () => job,
       updateMany: async (args) => { update = args; return { count: 1 }; },
@@ -1434,7 +1450,7 @@ test("explicitly forced notification FULL is exempt from the legacy-mode lease f
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
     agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    creatorNotificationSyncState: { findUnique: async () => ({ normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-08T00:00:00.000Z") }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ normalizerVersion: "notification-source-v3", fullBackfillVerifiedAt: new Date("2026-08-08T00:00:00.000Z") }) },
     jobInstance: {
       findUnique: async () => job,
       updateMany: async (args) => { update = args; return { count: 1 }; },

@@ -50,10 +50,11 @@ function stateDb(kind) {
   };
   const tx = {
     $executeRawUnsafe: async (sql, key) => {
-      // Transaction-local budget setup is not a domain mutation/lock.
-      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
- if (sql.includes("onlinod.financial_receipts_v1")) return 1;
- locks.push([sql, key]); return 1; },
+      // Observe the lock itself, including the Campaign lock's combined
+      // version-fence statement. Transaction budget/writer setup is separate.
+      if (sql.includes("pg_advisory_xact_lock")) locks.push([sql, key]);
+      return 1;
+    },
     creatorFinancialCollectionState: kind === "financial" ? delegate : undefined,
     creatorCampaignCollectionState: kind === "campaign" ? delegate : undefined,
   };
@@ -87,7 +88,7 @@ test("collection planning identity excludes trigger provenance and random comman
   assert.deepEqual(buildCollectionPlanningDedupeParams({
     collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: "full", state: null,
   }), {
-    notificationNormalizerVersion: "notification-source-v2",
+    notificationNormalizerVersion: "notification-source-v3",
     planningEpoch: "none:none",
     collectionOrderingAfter: "none",
     collectionContractVersion: 1,

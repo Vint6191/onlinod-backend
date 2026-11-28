@@ -179,13 +179,13 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
   // from assertManagementCommitAuthority instead of blocking the KEY SHARE
   // acquired by concurrent job inserts. FOR UPDATE here inverted Home's
   // collector -> job-FK order against the command's creator -> collector order.
-  const financialControl = !cancel && c.action === "operation.control"
-    && ["financial", "analytics_refresh"].includes(c.payload.family);
+  const collectorPlanningControl = !cancel && c.action === "operation.control"
+    && ["financial", "analytics_refresh", "notification"].includes(c.payload.family);
   // Subscriber START is the same database-only owner called by a compound
   // analytics refresh. It can meet a refreshed generation after waiting on
   // that shared fence and must re-evaluate its original revision in a new
   // Serializable attempt, rather than leak a raw write conflict to the UI.
-  const replayablePlanningControl = financialControl || (!cancel && c.action === "operation.control"
+  const replayablePlanningControl = collectorPlanningControl || (!cancel && c.action === "operation.control"
     && c.payload.family === "subscriber");
   if (
     !cancel &&
@@ -214,7 +214,7 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
         throw fail("MANAGEMENT_COMMAND_CONFLICT", "Command ID belongs to a different intent");
       const creatorIds = cancel ? [] : await creatorScope(tx, agencyId, c, prior?.reference);
       if(!cancel) await human.lockPrefix(tx,agencyId,c);
-      if(!cancel && human.has(c) && !financialControl) for(const creatorId of creatorIds) await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE',creatorId,agencyId);
+      if(!cancel && human.has(c) && !collectorPlanningControl) for(const creatorId of creatorIds) await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE',creatorId,agencyId);
       // Match account setters' User-lock order, including across agencies. No User
       // FOR SHARE -> advisory-lock inversion when the existing setter joins.
       if (!cancel && (c.action === "account.profile" || c.action === "account.avatar")) await lockEligibleAccountUser(tx, userId);

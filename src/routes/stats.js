@@ -218,6 +218,7 @@ const liveNotificationSchema = z.object({
   observedAt: z.string().datetime({ offset: true }),
   sourceTimezone: z.literal("UTC").default("UTC"),
   events: z.array(z.record(z.unknown())).min(1).max(100),
+  normalizerUpgradeProtocol: z.literal(1).optional(),
   delivery: z.object({ version: z.literal(1), sessionId: z.string().min(16).max(80),
     entries: z.array(z.object({ seq: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), capturedAt: z.string().datetime({offset:true}) })).min(1).max(100) }).optional(),
 });

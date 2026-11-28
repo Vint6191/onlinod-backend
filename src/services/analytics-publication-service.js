@@ -305,6 +305,19 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
     lastError: complete ? null : protocolSuperseded ? `${job.jobKey}_protocol_superseded` : failureReason,
   } });
   if (job.jobKey === "financial_transactions_scan") await require("./financial-receipt-retention-service").publish({ db, job, now });
+  if (job.jobKey === "financial_transactions_scan" && job.params?.analyticsSyncKind === "initial"
+    && Number(job.params?.analyticsSyncVersion) === require("./creator-analytics-sync-orchestrator").ANALYTICS_SYNC_VERSION
+    && complete && sideEffect?.complete === true && sideEffect?.published === true
+    && !sideEffect?.superseded && !sideEffect?.staleGeneration) {
+    // The recurring planner may already have yielded for an hour before this
+    // baseline became visible. Commit its wake with the Financial proof. The
+    // outbox consumer takes recurring DWI ownership in a separate transaction;
+    // never enter the earlier planning locks from this publication owner.
+    await require("./subscriber-directory-maintenance-signal-service").signalSubscriberDirectoryMaintenance({
+      db, agencyId: job.agencyId, creatorId: job.creatorId,
+      kind: "DERIVED_PLANNING", reason: "INITIAL_FINANCIAL_PUBLISHED",
+    });
+  }
   if (complete) require("./analytics-change-hint-service").publish(job.agencyId);
   require("./analytics-hot-executor").wakeAfterCommit();
   if (retryAt) require("./job-planning-repository").publishPlannedJobAvailable(updated);

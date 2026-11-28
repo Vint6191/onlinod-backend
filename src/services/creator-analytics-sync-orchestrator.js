@@ -85,10 +85,11 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     // lock as accept/complete; dedupe alone cannot reject obsolete work.
     let currentCollectorState = await loadCollectorPlanningState(tx, collectorType, creatorId, collectorState);
     now = await dbAuthorityNow({ db: tx, fallbackNow: now });
-    const recovery = collectorType === COLLECTOR_TYPES.FINANCIAL && params.recoveryIntentId
+    const recovery = [COLLECTOR_TYPES.FINANCIAL, COLLECTOR_TYPES.NOTIFICATIONS].includes(collectorType) && params.recoveryIntentId
       ? await tx.creatorRecoveryIntent.findFirst({ where: { id: params.recoveryIntentId, creatorId, agencyId,
-        stream: "financial", status: { not: "COMPLETE" } } }) : null;
+        stream: collectorType === COLLECTOR_TYPES.FINANCIAL ? "financial" : "notifications", status: { not: "COMPLETE" } } }) : null;
     const fullFinancialRepair = recovery?.reason === "FINANCIAL_PROOF_ADOPTION_FULL";
+    const fullNotificationRepair = recovery?.reason === "NOTIFICATION_NORMALIZER_UPGRADE";
     if (collectorType === COLLECTOR_TYPES.CAMPAIGNS) currentCollectorState = await recoverPublishedMembershipProof({ db: tx, state: currentCollectorState, now });
     const initial = lifecycleParams(params);
     const baseline = collectorPlanningProofAt(collectorType, "full", currentCollectorState, now);
@@ -98,7 +99,7 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
       baselineReady=Boolean(proof);
     }
     if (initial && baselineReady) return { created: false, reason: "baseline_verified" };
-    if (!initial && !baselineReady && !fullFinancialRepair) return { created: false, reason: "baseline_unverified" };
+    if (!initial && !baselineReady && !fullFinancialRepair && !fullNotificationRepair) return { created: false, reason: "baseline_unverified" };
     if (!params.recoveryIntentId && catchupFreshnessMs != null && !collectorCatchupDue(collectorType, currentCollectorState, catchupFreshnessMs, now)) {
       return { created: false, reason: "fresh" };
     }
@@ -107,13 +108,18 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     currentCollectorState = retry.state;
     if (retry.deferred || retry.terminal) return { created: false, reason: retry.deferred ? retry.reason || "deferred" : "failed_terminal", retryAfterAt: retry.retryAfterAt };
 
-    params = { ...params, ...buildCollectionCommand({ collectorType, collectionMode: initial || fullFinancialRepair ? "full" : "catchup", reason: params.reason, now }) };
+    params = { ...params, ...buildCollectionCommand({ collectorType, collectionMode: initial || fullFinancialRepair || fullNotificationRepair ? "full" : "catchup", reason: params.reason, now }) };
     if (fullFinancialRepair) { params.financialMode = "full"; delete params.financialFrontierVersion; }
     let collectionPlan = null;
     if (collectorType === COLLECTOR_TYPES.NOTIFICATIONS) {
-      params = { ...params, ...buildNotificationScanParams({ state: initial ? null : currentCollectorState, now, reason: params.reason, analyticsRangeKey: "all" }) };
-      if (params.recoveryTargetAt) params.to = new Date(params.recoveryTargetAt).toISOString();
-      if (!initial) params.knownNotificationIds = recentKnownNotificationIdsFromState(currentCollectorState);
+      params = { ...params, ...buildNotificationScanParams({ state: initial || fullNotificationRepair ? null : currentCollectorState, now, reason: params.reason, analyticsRangeKey: "all" }) };
+      if (fullNotificationRepair) {
+        params.forceNotificationFullRebuild = true;
+        // FULL reproof observes the new command window. The immutable older
+        // delivery obligation remains on the intent and is checked at commit.
+        delete params.recoveryTargetAt;
+      } else if (params.recoveryTargetAt) params.to = new Date(params.recoveryTargetAt).toISOString();
+      if (!initial && !fullNotificationRepair) params.knownNotificationIds = recentKnownNotificationIdsFromState(currentCollectorState);
     } else if (collectorType === COLLECTOR_TYPES.FINANCIAL) {
       // Financial windows are bound under the claim fence to current coverage.
     } else if (collectorType === COLLECTOR_TYPES.CAMPAIGNS && !initial && params.recoveryIntentId) {
@@ -156,7 +162,7 @@ function verifiedProofTimestampReady(value, now = new Date()) {
 }
 
 function notificationHistoricalBaselineReady(state, now = new Date()) {
-  return state?.normalizerVersion === "notification-source-v2" && verifiedProofTimestampReady(state?.fullBackfillVerifiedAt, now);
+  return state?.normalizerVersion === "notification-source-v3" && verifiedProofTimestampReady(state?.fullBackfillVerifiedAt, now);
 }
 function notificationJobMode(params) {
   // Desktop has always treated anything except an explicit catch-up marker as
@@ -432,10 +438,34 @@ function retryDisposition(state, now = new Date()) {
 }
 
 async function collectorRetryDisposition({ db, collectorType, state, agencyId, creatorId, now, recoveryIntentId = null }) {
+  if (collectorType === COLLECTOR_TYPES.NOTIFICATIONS && state?.normalizerVersion === "notification-source-v2"
+    && state?.frontierReceipt?.attemptedNormalizerVersion !== "notification-source-v3"
+    && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now)) {
+    // A parser deployment is one new cause, separate from retrying an old
+    // failed episode. The first page/failure stores its attempted version, so
+    // an unsuccessful v3 proof cannot replenish its budget on every sweep.
+    return { state, deferred: false, terminal: false, retryAfterAt: null };
+  }
+  if (collectorType === COLLECTOR_TYPES.NOTIFICATIONS && recoveryIntentId) {
+    const upgrade = await db.creatorRecoveryIntent.findFirst({ where: { id: recoveryIntentId, creatorId, agencyId,
+      stream: "notifications", reason: "NOTIFICATION_NORMALIZER_UPGRADE", status: "PENDING", jobId: null } });
+    if (upgrade) {
+      const stopped = await db.creatorRecoveryIntent.findFirst({ where: { creatorId, agencyId,
+        stream: "notifications", reason: "NOTIFICATION_NORMALIZER_UPGRADE", status: "STOPPED" }, select: { id: true } });
+      if (!stopped) return { state, deferred: false, terminal: false, retryAfterAt: null };
+      return { state, deferred: false, terminal: true, retryAfterAt: null };
+    }
+  }
   if (collectorType===COLLECTOR_TYPES.FINANCIAL && recoveryIntentId) {
     const upgrade=await db.creatorRecoveryIntent.findFirst({where:{id:recoveryIntentId,creatorId,agencyId,
       stream:"financial",reason:"FINANCIAL_PROOF_ADOPTION_FULL",status:"PENDING",jobId:null}});
-    if(upgrade)return {state,deferred:false,terminal:false,retryAfterAt:null};
+    if (upgrade) {
+      const stopped = upgrade.id.startsWith("notifupgrade_") ? await db.creatorRecoveryIntent.findFirst({ where: {
+        creatorId, agencyId, stream: "financial", reason: "FINANCIAL_PROOF_ADOPTION_FULL", status: "STOPPED",
+        id: { startsWith: "notifupgrade_" } }, select: { id: true } }) : null;
+      if (!stopped) return {state,deferred:false,terminal:false,retryAfterAt:null};
+      return { state, deferred: false, terminal: true, retryAfterAt: null };
+    }
   }
   // A completed-but-partial notification traversal is a finite outcome. A
   // missing retry date must not become permission to start again from HEAD.
@@ -530,7 +560,8 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     const intent = intents[stream];
     if (!intent) { skipped.push(`${stream}:live_no_recovery_debt`); continue; }
     const fullFinancialRepair = stream === "financial" && intent.reason === "FINANCIAL_PROOF_ADOPTION_FULL";
-    if (!readiness[stream] && !fullFinancialRepair) { skipped.push(`${stream}:baseline_unverified`); continue; }
+    const fullNotificationRepair = stream === "notifications" && intent.reason === "NOTIFICATION_NORMALIZER_UPGRADE";
+    if (!readiness[stream] && !fullFinancialRepair && !fullNotificationRepair) { skipped.push(`${stream}:baseline_unverified`); continue; }
     const jobKey = stream === "notifications" ? NOTIFICATION_JOB_KEY : stream === "financial" ? FINANCIAL_JOB_KEY : CAMPAIGN_JOB_KEY;
     const params = {
       ...buildCollectionCommand({ collectorType, collectionMode:fullFinancialRepair?"full":"catchup", reason:intent.reason, now }),

@@ -330,7 +330,7 @@ async function readCreatorOverviewSnapshot({ db, creatorId, rangeKey = "30d", no
     require("./fan-ltv-read-repository").readFanLtv({ db, creatorId, rangeKey: range, now }),
   ]);
 
-  const currentNotificationParser = ledger.notificationSync?.normalizerVersion === "notification-source-v2";
+  const currentNotificationParser = ledger.notificationSync?.normalizerVersion === "notification-source-v3";
   const notificationBaselineAtRaw = currentNotificationParser ? ledger.notificationSync?.fullBackfillVerifiedAt || null : null;
   const notificationBaselineAt = trustedCollectionTimestamp(notificationBaselineAtRaw, now);
   const notificationCollection = evaluateDurableCollectorState({

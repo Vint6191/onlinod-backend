@@ -71,12 +71,12 @@ function manualContinuationSchema(job) {
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 function historicalBaselineReady(state, now = new Date()) {
-  return Boolean(state?.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
+  return Boolean(state?.normalizerVersion === "notification-source-v3" && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
 }
 function hasCurrentNotificationCommand(job, expectedMode) {
   try {
     const command = collectionCommand(job, COLLECTOR_TYPES.NOTIFICATIONS);
-    return command.mode === expectedMode && job.params?.notificationNormalizerVersion === "notification-source-v2";
+    return command.mode === expectedMode && job.params?.notificationNormalizerVersion === "notification-source-v3";
   } catch {
     return false;
   }
@@ -93,24 +93,38 @@ function pausedManualJobNeedsFreshRun(job, desiredMode) {
 
 async function startManualNotificationScan({ db = prisma, creator, requestedByUserId = null, now = new Date(), forceFull = false }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
-  return withCollectorStateLock({ db, type: COLLECTOR_TYPES.NOTIFICATIONS, creatorId: creator.id, work: async (tx) => {
+  return withCollectorStateLock({ db, type: COLLECTOR_TYPES.NOTIFICATIONS, creatorId: creator.id,
+    // START only plans database work. A conflicting source page may require
+    // replay of this entire root; a joined management command owns its retry.
+    transactionOptions: { maxAttempts: 3 }, work: async (tx) => {
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow: now });
     const syncState = await loadNotificationSyncState(tx, creator.id);
-    const desiredMode = forceFull === true || !historicalBaselineReady(syncState, authorityNow) ? "full" : "catchup";
+    let desiredMode = forceFull === true || !historicalBaselineReady(syncState, authorityNow) ? "full" : "catchup";
+    let preserveForcedFull = false;
     // START must never create a second notification walk beside an automatic
     // initial/catch-up job. The read and possible creation are serialized by the
     // same collector advisory lock used by generation accept/complete.
-    const active = await activeCollectorJob(tx, creator.id, JOB_KEY);
+    let active = await activeCollectorJob(tx, creator.id, JOB_KEY);
+    if (active?.status === "PAUSED" && typeof tx.$queryRawUnsafe === "function") {
+      // Resume only the checkpoint observed after the row wait, never the
+      // pre-lock copy that another admitted owner may have changed.
+      const [locked] = await tx.$queryRawUnsafe('SELECT * FROM "JobInstance" WHERE "id"=$1 FOR UPDATE', active.id);
+      active = locked && ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"].includes(locked.status) ? locked : null;
+    }
     if (active?.status === "PUBLISHING") return { job: active, action: "publishing" };
 
     if (active) {
       const activeParams = object(active.params);
       const activeMode = scanMode(active, null);
       const activeCommandCurrent = hasCurrentNotificationCommand(active, activeMode);
-      const sameMode = activeMode === desiredMode && activeCommandCurrent;
-      if (activeCommandCurrent && activeParams.forceNotificationFullRebuild === true && forceFull !== true) {
-        return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+      preserveForcedFull = activeCommandCurrent && activeParams.forceNotificationFullRebuild === true && forceFull !== true;
+      if (preserveForcedFull) {
+        if (active.status !== "PAUSED") return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+        // START after STOP resumes the explicitly selected historical rebuild,
+        // even when the prior baseline would normally select catch-up.
+        desiredMode = activeMode;
       }
+      const sameMode = activeMode === desiredMode && activeCommandCurrent;
       if (active.status === "PAUSED" && sameMode && !pausedManualJobNeedsFreshRun(active, desiredMode)) {
         const planned = await reschedulePlannedJob({
           db: tx, job: active, params: active.params || {}, priority: active.priority || 0,
@@ -118,7 +132,9 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
           lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
           protectedStatuses: [],
         });
-        return { job: planned.job, action: "resumed" };
+        return { job: planned.job, action: planned.rescheduled ? "resumed"
+          : planned.job?.status === "CLAIMED" ? "already_running"
+            : planned.job?.status === "SCHEDULED" ? "already_queued" : "changed" };
       }
       if (active.status !== "PAUSED" && sameMode) {
         return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
@@ -127,6 +143,11 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
       // A stale/manual command with the wrong mode is fenced before a replacement
       // is planned. The collector lock makes this cancel+replace sequence atomic
       // with automatic planner starts and completion-state generation changes.
+      // Take the contended row through raw SQL first: Prisma model updates can
+      // hide a native deadlock in an unstructured ConnectorError. P2010 retains
+      // its SQLSTATE so the reviewed root can roll back and retry completely.
+      if (typeof tx.$queryRawUnsafe === "function") await tx.$queryRawUnsafe(
+        'SELECT "id" FROM "JobInstance" WHERE "id"=$1 FOR UPDATE', active.id);
       const cancelled = await tx.jobInstance.updateMany({
         where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
         data: {
@@ -163,7 +184,7 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
       manualNotificationScan: true,
       manualNotificationScanVersion: 1,
       manualRunToken,
-      ...(forceFull === true ? { forceNotificationFullRebuild: true } : {}),
+      ...(forceFull === true || preserveForcedFull ? { forceNotificationFullRebuild: true } : {}),
       requestedByUserId: clean(requestedByUserId, 220),
     };
     const scheduled = await scheduleJobNow({

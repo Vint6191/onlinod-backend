@@ -92,10 +92,12 @@ async function processNotificationConsequencePage({ db, item, ownerToken }) {
   }
   return runRootCommit(db, async ({ tx }) => {
     const lifecycle = await lockAgencyLifecycleBarrier({ db: tx, agencyId: item.agencyId });
-    // Producer order is JobInstance -> work; use that order on the consumer too.
+    // Keep the producer's Job -> Facts -> Work order while reading the current
+    // canonical version and replacing its derived consequences.
     if (typeof tx.$queryRawUnsafe === "function") {
       await tx.$queryRawUnsafe('SELECT "id" FROM "JobInstance" WHERE "id"=$1 AND "agencyId"=$2 FOR SHARE', item.objectId, item.agencyId);
     }
+    await require("./creator-fact-write-authority").lockCreatorFacts(tx, item.agencyId, item.creatorId);
     const claim = owned(await work.lockDomainWorkClaimForCommit({ db: tx, item, ownerToken }));
     if (await pauseDeletedAgencyProjection({ db: tx, lifecycle, item, ownerToken })) return { waiting: true, processed: 0 };
     const job = await tx.jobInstance.findUnique({ where: { id: item.objectId } });

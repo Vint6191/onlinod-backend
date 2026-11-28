@@ -282,6 +282,7 @@ async function acceptDelivery({
   events,
   now,
   ingest,
+  beforeAcknowledge = null,
 }) {
   if (
     delivery?.version !== 1 ||
@@ -343,6 +344,10 @@ async function acceptDelivery({
   // Facts, their durable projection signals and the contiguous ACK commit as one.
   if (retiredReplay && entries.at(-1).seq > Number(s.ackedSeq)) throw error("LIVE_DELIVERY_REPLAY_BOUNDARY");
   const results = retiredReplay || !newEntries ? [] : await ingest();
+  // Protocol upgrades also reconcile an old delivery whose original response
+  // was lost. Run after immutable receipt validation, even for an ACK replay,
+  // and before delivery can advance financial freshness.
+  if (beforeAcknowledge) await beforeAcknowledge({ session: s });
   await db.$executeRawUnsafe(
     `DELETE FROM "CreatorRealtimeReceipt" WHERE "sessionId"=$1 AND seq IN (
     SELECT seq FROM "CreatorRealtimeReceipt" WHERE "sessionId"=$1 AND seq<$2 AND "capturedAt"<$3 ORDER BY seq LIMIT 100)`,
@@ -441,7 +446,8 @@ async function completeRecovery(db, job, successful, { deferPlanningWake = false
     : listStream ? job.params?.collectionRequestedAt ?? job.createdAt ?? job.scheduledAt
       : stream === "financial" ? job.params?.endDate : job.params?.to;
   let through = date(sourceThrough);
-  const listSnapshot = listStream ? through : null;
+  const fullSnapshot = listStream || (stream === "notifications" && job.params?.collectionMode === "full"
+    && coveredThrough !== undefined) ? through : null;
   let from = ["subscribers","campaigns"].includes(stream) || job.params?.collectionMode === "full"
     || job.params?.notificationMode === "full" ? null : date(job.params?.recoveryGapFrom);
   if (id) {
@@ -452,7 +458,7 @@ async function completeRecovery(db, job, successful, { deferPlanningWake = false
     `UPDATE "CreatorRecoveryIntent" SET status='COMPLETE',"completedAt"=clock_timestamp(),"updatedAt"=clock_timestamp()
     WHERE id=$1 AND "agencyId"=$2 AND "creatorId"=$3 AND stream=$4 AND "jobId"=$5 AND "policyVersion"=$6
       AND status IN ('RUNNING','STOPPED','COMPLETE') AND "targetAt"<=$7::timestamp
-      AND (reason<>'FINANCIAL_PROOF_ADOPTION_FULL' OR $8::boolean) RETURNING "targetAt","gapFrom"`,
+      AND (reason NOT IN ('FINANCIAL_PROOF_ADOPTION_FULL','NOTIFICATION_NORMALIZER_UPGRADE') OR $8::boolean) RETURNING "targetAt","gapFrom"`,
     id,
     job.agencyId,
     job.creatorId,
@@ -466,9 +472,10 @@ async function completeRecovery(db, job, successful, { deferPlanningWake = false
   );
     if (!rows.length) throw error("LIVE_RECOVERY_COMPLETION_SCOPE_MISMATCH");
     through = date(rows[0].targetAt);
-    // Unordered lists require a complete pass. Its immutable start snapshot
-    // also covers older queued gaps, even when bound to the oldest episode.
-    if (listSnapshot && listSnapshot > through) through = listSnapshot;
+    // A complete list pass or explicitly proven notification FULL covers every
+    // earlier queued gap, even when bound to the oldest episode. Preserve the
+    // source owner's physical observation bound, not just that episode's target.
+    if (fullSnapshot && fullSnapshot > through) through = fullSnapshot;
     if (!["subscribers","campaigns"].includes(stream) && job.params?.collectionMode !== "full") from = date(rows[0].gapFrom);
   }
   if (!through) return;
@@ -479,7 +486,7 @@ async function completeRecovery(db, job, successful, { deferPlanningWake = false
     `UPDATE "CreatorRecoveryIntent" SET status='COMPLETE',"completedAt"=clock_timestamp(),"updatedAt"=clock_timestamp()
     WHERE "creatorId"=$1 AND stream=$2 AND status<>'COMPLETE' AND "targetAt"<=$3::timestamp
       AND ($4::timestamp IS NULL OR "gapFrom">=$4::timestamp)
-      AND (reason<>'FINANCIAL_PROOF_ADOPTION_FULL' OR $5::boolean)`,
+      AND (reason NOT IN ('FINANCIAL_PROOF_ADOPTION_FULL','NOTIFICATION_NORMALIZER_UPGRADE') OR $5::boolean)`,
     job.creatorId,
     stream,
     through.toISOString(), from?.toISOString() || null, job.params?.collectionMode === "full"

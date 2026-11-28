@@ -10,7 +10,7 @@ const { NOTIFICATION_TYPES, hasFullNotificationScope } = require("./notification
 // the receipt checksum even when the source page itself has not changed.
 function notificationRepairParams(job, now, result = job?.result) {
   const params = { ...(job?.params || {}) };
-  const upgrade = params.notificationNormalizerVersion !== "notification-source-v2";
+  const upgrade = params.notificationNormalizerVersion !== "notification-source-v3";
   const mode = !upgrade && params.notificationMode === "catchup" ? "catchup" : "full";
   if (upgrade) { delete params.knownNotificationIds; delete params.stopAtNotificationId; params.from=new Date(0).toISOString(); params.to=new Date(now.getTime()+300000).toISOString(); }
   delete params.resumeCursors;
@@ -33,7 +33,7 @@ function needsNotificationRepairRotation(job) {
   // Older repairs persisted only the types seen so far. Rotate before issuing
   // or accepting work, even without a completion marker. Expanding the scope
   // in place would change immutable receipt checksums under the old run ID.
-  if (!hasFullNotificationScope(job.params) || job.params?.notificationNormalizerVersion !== "notification-source-v2") return true;
+  if (!hasFullNotificationScope(job.params) || job.params?.notificationNormalizerVersion !== "notification-source-v3") return true;
   if (job.params?.notificationMode !== "catchup" && job.params?.notificationFrontierVersion !== 4) return true;
   // lastError is cleared at claim, but the previous completion result survives.
   // This also identifies a pre-fix repair already CLAIMED by a live Desktop.

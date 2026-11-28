@@ -2637,7 +2637,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     verification: {
       officialEarnings,
       officialMessages,
-      notificationFacts: Boolean(notificationSync?.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp(notificationSync?.fullBackfillVerifiedAt, now)),
+      notificationFacts: Boolean(notificationSync?.normalizerVersion === "notification-source-v3" && trustedCollectionTimestamp(notificationSync?.fullBackfillVerifiedAt, now)),
       earningsDays: verifiedEarningsDays,
       earningsComplete: earningsCollectionState.complete,
       earningsProven: earningsCollectionState.proven,

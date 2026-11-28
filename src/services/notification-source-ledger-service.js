@@ -16,7 +16,7 @@ const {
 const {
   dbAuthorityNow
 } = require("./db-time-authority-service");
-const VERSION = "notification-source-v2";
+const VERSION = "notification-source-v3";
 const COLLECTOR = "notifications-history-v9-source-ledger";
 const categories = {
   purchases: "creatorSale",
@@ -46,9 +46,13 @@ function stable(value) {
 function hash(value) {
   return crypto.createHash("sha256").update(stable(value)).digest("hex");
 }
+function containsNullCharacter(value) {
+  if (typeof value === "string") return value.includes("\u0000");
+  return value && typeof value === "object" && Object.entries(value).some(([key, child]) => key.includes("\u0000") || containsNullCharacter(child));
+}
 function string(value, max) {
   if (value == null) return null;
-  if (typeof value !== "string" || !value.trim() || value.length > max) fail("NOTIFICATION_OBSERVATION_INVALID");
+  if (typeof value !== "string" || !value.trim() || value.length > max || value.includes("\u0000")) fail("NOTIFICATION_OBSERVATION_INVALID");
   return value.trim();
 }
 function normalizeObservation(input) {
@@ -71,6 +75,9 @@ function normalizeObservation(input) {
     commentId: 220,
     reasonCode: 160
   })) row[key] = string(input[key], max);
+  for (const key of ["identityKey", "notificationId", "transactionId", "fanOnlyFansUserId", "messageId", "postId", "commentId"]) {
+    if (row[key] && /[\u0000-\u001f\u007f]/.test(row[key])) fail("NOTIFICATION_OBSERVATION_INVALID");
+  }
   if (!row.identityKey || row.notificationId && row.identityKey !== `notification:${row.notificationId}` || !row.notificationId && row.transactionId && row.identityKey !== `transaction:${row.transactionId}`) fail("NOTIFICATION_IDENTITY_MISMATCH");
   if (!row.notificationId && !row.transactionId && !(input.disposition === "REJECTED" && /^unidentified:[a-f0-9]{64}$/.test(row.identityKey))) fail("NOTIFICATION_IDENTITY_MISSING");
   if (row.category && !Object.hasOwn(categories, row.category)) fail("NOTIFICATION_CATEGORY_INVALID");
@@ -90,6 +97,7 @@ function normalizeObservation(input) {
   // A strict diagnostic whitelist prevents arbitrary profiles or credentials entering the ledger.
   const evidence = input.sourceEvidence;
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence) || Buffer.byteLength(stable(evidence)) > 16384) fail("NOTIFICATION_EVIDENCE_INVALID");
+  if (containsNullCharacter(evidence)) fail("NOTIFICATION_EVIDENCE_INVALID");
   const allowed = new Set(["id", "type", "subType", "eventType", "action", "createdAt", "timestamp", "occurredAt", "amount", "price", "amountCents", "currency", "messageId", "postId", "commentId", "isDeleted", "postDeleted", "targetState", "replacePairs", "user", "text", "title", "body", "truncated"]);
   if (Object.keys(evidence).some(key => !allowed.has(key))) fail("NOTIFICATION_EVIDENCE_INVALID");
   for (const [key, value] of Object.entries(evidence)) {
@@ -132,22 +140,10 @@ async function repairFormerFacts(db, job, row, now, apply = false, formerFacts =
     fact
   } of former) {
     if (fact.externalTransactionId || fact.source && fact.source !== "NOTIFICATION") return "RECLASSIFICATION_AUTHORITY_CONFLICT";
-    if (model === "creatorSale" && (await db.teamPpvPurchaseLedger.findFirst({
-      where: {
-        creatorSaleId: fact.id
-      },
-      select: {
-        id: true
-      }
-    }))) return "RECLASSIFICATION_ATTRIBUTION_REVIEW";
-    if (model === "creatorTip" && (await db.teamTipLedger.findFirst({
-      where: {
-        creatorTipId: fact.id
-      },
-      select: {
-        id: true
-      }
-    }))) return "RECLASSIFICATION_ATTRIBUTION_REVIEW";
+    if (["creatorSale", "creatorTip"].includes(model)
+      && !(await require("./team-money-reconciliation-service").retireUnattributedNotificationMoney({ db, model, fact })).allowed) {
+      return "RECLASSIFICATION_ATTRIBUTION_REVIEW";
+    }
     if (model === "creatorSubscriptionEvent" && (await db.creatorPaidSubscription.findFirst({
       where: {
         subscriptionEventId: fact.id,
@@ -186,6 +182,10 @@ async function repairFormerFacts(db, job, row, now, apply = false, formerFacts =
         sourceJobId: job.sourceJobId === null ? null : job.id
       }
     });
+    if (["creatorSale", "creatorTip"].includes(model)) {
+      const retired = await require("./team-money-reconciliation-service").retireUnattributedNotificationMoney({ db, model, fact, apply: true });
+      if (!retired.allowed) fail("RECLASSIFICATION_ATTRIBUTION_REVIEW");
+    }
     if (model === "creatorSubscriptionEvent") {
       await db.creatorPaidSubscription.deleteMany({
         where: {
@@ -211,7 +211,44 @@ async function repairFormerFacts(db, job, row, now, apply = false, formerFacts =
     eventIds: [],
     now
   });
+  await repairRetiredFactConsequences(db, job, row.notificationId, former);
   return null;
+}
+
+async function repairRetiredFactConsequences(db, job, notificationId, former = []) {
+  // Older versions recorded the exact former fact before deleting it, but left
+  // some derived proofs alive. A current FULL/replay repairs those saved IDs as
+  // well, even when there is no canonical row left to reclassify today.
+  const corrections = await db.creatorNotificationCorrection.findMany({ where: {
+    agencyId: job.agencyId, creatorId: job.creatorId, notificationId, reasonCode: "SOURCE_RECLASSIFIED",
+  }, select: { formerModel: true, formerFactId: true, priorEvidence: true } });
+  const byModel = new Map();
+  for (const item of [...former, ...corrections.map(item => ({ model: item.formerModel, fact: item.priorEvidence, formerFactId: item.formerFactId }))]) {
+    const fact = item.fact;
+    if (!Object.values(categories).includes(item.model) || !fact || fact.id !== (item.formerFactId || fact.id)
+      || fact.agencyId !== job.agencyId || fact.creatorId !== job.creatorId || fact.externalNotificationId !== notificationId
+      || fact.externalTransactionId || (fact.source && fact.source !== "NOTIFICATION")) continue;
+    if (!byModel.has(item.model)) byModel.set(item.model, new Map());
+    byModel.get(item.model).set(fact.id, fact);
+  }
+  for (const [model, facts] of byModel) {
+    const present = await db[model].findMany({ where: { id: { in: [...facts.keys()] } }, select: { id: true } });
+    for (const row of present) facts.delete(row.id);
+    const rows = [...facts.values()];
+    if (!rows.length) continue;
+    if (model === "creatorSubscriptionEvent") for (const event of rows) {
+      await require("./subscription-receipt-projection-service").retireCanonicalSubscriptionReceipt({ db, job, event });
+    }
+    const receiptKind = { creatorSale: "CreatorSale", creatorTip: "CreatorTip", creatorSubscriptionEvent: "CreatorSubscriptionEvent" }[model];
+    if (receiptKind) await db.notificationFactReceipt.deleteMany({ where: {
+      agencyId: job.agencyId, creatorId: job.creatorId, kind: receiptKind, factId: { in: rows.map(row => row.id) },
+    } });
+    // Keep individual publication bounds even if one source identity has a long
+    // correction history; every selected row belongs to this exact notification.
+    for (let offset = 0; offset < rows.length; offset += 500) await require("./creator-entity-change-service").publishCanonicalFactRetirements({
+      db, agencyId: job.agencyId, creatorId: job.creatorId, model, rows: rows.slice(offset, offset + 500),
+    });
+  }
 }
 async function ingestNotificationSourcePage({
   db,
@@ -243,8 +280,12 @@ async function ingestNotificationSourcePage({
       const row = rows.find(row => row.identityKey === identity);
       if (!row || row.disposition !== "FACT" || row.category !== batch.notificationType || events.has(identity) || event.normalizerVersion !== VERSION) fail("NOTIFICATION_FACT_OBSERVATION_MISMATCH");
       for (const [sourceKey, factKey] of Object.entries({
+        transactionId: "transactionId",
         eventType: "eventType",
         fanOnlyFansUserId: "fanId",
+        fanUsernameAtEvent: "fanUsername",
+        fanDisplayNameAtEvent: "fanName",
+        fanAvatarUrlAtEvent: "fanAvatarUrl",
         amountCents: "amountCents",
         currency: "currency",
         messageId: "messageId",

@@ -33,7 +33,10 @@ async function processPage({ db, item, ownerToken }) {
   return runRootCommit(db, async ({ tx }) => {
     const lifecycle = await lockAgencyLifecycleBarrier({ db: tx, agencyId: item.agencyId });
     await tx.$queryRawUnsafe('SELECT id FROM "JobInstance" WHERE id=$1 AND "agencyId"=$2 FOR SHARE', item.objectId, item.agencyId);
-    // Same order as producers: Job -> Receipt -> DomainWork. No cursor can
+    await require("./creator-fact-write-authority").lockCreatorFacts(tx, item.agencyId, item.creatorId);
+    // Same order as producers: Job -> Facts -> Receipt -> DomainWork. A
+    // correction cannot race a stale consumer's read and overwrite its result.
+    // No cursor can
     // jump past a newly inserted lower ID: successfully delivered rows disappear.
     const receipts = await tx.$queryRawUnsafe(`SELECT * FROM "NotificationFactReceipt" WHERE "agencyId"=$1 AND "creatorId"=$2 AND "jobId"=$3
       ORDER BY kind,"factId" LIMIT $4 FOR UPDATE SKIP LOCKED`, item.agencyId, item.creatorId, item.objectId, PAGE);

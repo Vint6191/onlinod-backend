@@ -122,13 +122,68 @@ function completed(job, receipt) {
   );
 }
 
+function sourceTraversalComplete(job, result, receipt) {
+  const full = job.params?.notificationMode !== "catchup";
+  return result?.sourceExhausted === true && (!full || result?.allSourceExhausted === true)
+    && completed(job, receipt);
+}
+
+function assertCompletionResult(job, result) {
+  if (job.params?.notificationNormalizerVersion !== "notification-source-v3") return;
+  // A terminal descriptor summarizes source receipts; it is never another
+  // ingress for facts. Validate before accepting immutable completion and on
+  // direct /complete, which can legitimately omit the preceding checkpoint.
+  if (!Array.isArray(result?.events) || result.events.length !== 0)
+    fail("NOTIFICATION_COMPLETION_EVENTS_FORBIDDEN");
+  const params = job.params;
+  if (result.scanRunId !== params.collectionGeneration)
+    fail("ANALYTICS_COLLECTION_GENERATION_MISMATCH");
+  if (result.notificationMode !== params.notificationMode)
+    fail("ANALYTICS_COLLECTION_MODE_MISMATCH");
+  if (result.schemaVersion !== 6 || result.normalizerVersion !== "notification-source-v3"
+    || result.collectorVersion !== "notifications-history-v9-source-ledger" || result.finalizeCoverage !== true
+    || result.batchKey !== `run:${params.collectionGeneration}:completion`
+    || result.notificationType != null || result.sourceTimezone !== "UTC")
+    fail("NOTIFICATION_COMPLETION_METADATA_INVALID");
+  const { parseStrictIsoDateTime } = require("./strict-date-time");
+  const from = parseStrictIsoDateTime(params.from), to = parseStrictIsoDateTime(params.to);
+  const resultFrom = parseStrictIsoDateTime(result.from), resultTo = parseStrictIsoDateTime(result.to);
+  if (!from || !to || to < from || !resultFrom || !resultTo || +from !== +resultFrom || +to !== +resultTo)
+    fail("NOTIFICATION_COMPLETION_METADATA_INVALID");
+  for (const field of ["totalAcceptedEvents", "totalObservedRows", "totalPages"])
+    if (!Number.isSafeInteger(result[field]) || result[field] < 0) fail("NOTIFICATION_COMPLETION_METADATA_INVALID");
+  for (const row of Object.values(result.coverage || {})) {
+    for (const cursor of [row?.cursorStart, row?.cursorEnd])
+      if (cursor != null && String(cursor).trim().length > 220) fail("NOTIFICATION_COMPLETION_METADATA_INVALID");
+  }
+  // Keep the same complete/partial rules as final ingestion. A SQL-proven walk
+  // with rejected rows must still terminate with its truthful partial result.
+  require("./notification-facts-service").validateFinalScannerCoverage(result, job, from, to);
+}
+
+async function completionProof(db, job, result) {
+  const state = enabled(job)
+    ? await db.creatorNotificationSyncState.findUnique({ where: { creatorId: job.creatorId },
+      select: { frontierReceipt: true } })
+    : null;
+  const verified = sourceTraversalComplete(job, result, state?.frontierReceipt);
+  return { verified, reason: verified ? "verified" : "source_boundary_unproven" };
+}
+
+async function assertCompletionContinuation(db, job, result) {
+  assertCompletionResult(job, result);
+  const proof = await completionProof(db, job, result);
+  if (!proof.verified) fail("NOTIFICATION_FRONTIER_COMPLETION_INVALID");
+}
+
 function attachContinuation(job, requestedContinuation, sideEffect) {
   if (!enabled(job) || !sideEffect?.notificationFrontier) return null;
   if (sideEffect.replayed) return job.continuation;
   const receipt = sideEffect.notificationFrontier;
   const envelope = requestedContinuation || {};
   if (envelope.driverPhase === "complete") {
-    if (receipt.phase !== "DONE") fail("NOTIFICATION_FRONTIER_COMPLETION_INVALID");
+    assertCompletionResult(job, envelope.result);
+    if (!sourceTraversalComplete(job, envelope.result, receipt)) fail("NOTIFICATION_FRONTIER_COMPLETION_INVALID");
     return envelope;
   }
   const domain = envelope.driverPhase === "execute" ? envelope.jobContinuation : envelope;
@@ -146,4 +201,5 @@ function attachContinuation(job, requestedContinuation, sideEffect) {
     stopReason: receipt.phase === "DONE" ? (receipt.exhausted ? "source_exhausted" : "known_boundary_reached") : undefined };
   return envelope.driverPhase === "execute" ? { ...envelope, jobContinuation: next } : next;
 }
-module.exports = { NotificationFrontierError, FULL_PHASES, enabled, fullEnabled, assessPage, commitPage, completed, attachContinuation };
+module.exports = { NotificationFrontierError, FULL_PHASES, enabled, fullEnabled, assessPage, commitPage, completed,
+  sourceTraversalComplete, completionProof, assertCompletionResult, assertCompletionContinuation, attachContinuation };

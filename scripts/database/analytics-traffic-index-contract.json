@@ -91,6 +91,13 @@
     "where": null
   },
   {
+    "name": "TrafficReceipt_notification_identity_v3",
+    "table": "CreatorSubscriptionLedger",
+    "unique": false,
+    "expression": "\"creatorId\",\"source\",\"externalEventId\"",
+    "where": null
+  },
+  {
     "name": "CampaignFan_traffic_page_v2",
     "table": "CreatorCampaignFan",
     "unique": false,

@@ -5708,6 +5708,7 @@ model CreatorSubscriptionLedger {
   @@index([agencyId, creatorId, organicConfirmed, attributionAttempts])
   @@index([sourceId, organicConfirmed, amountCents, occurredAt])
   @@index([creatorId, id], map: "TrafficReceipt_backfill_page_v2")
+  @@index([creatorId, source, externalEventId], map: "TrafficReceipt_notification_identity_v3")
 
 }
 

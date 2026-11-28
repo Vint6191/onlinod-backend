@@ -5,6 +5,9 @@ const { createRequire } = require("node:module");
 // The physical OF boundary is controlled. No earnings, finance, Campaign,
 // Traffic or FanData rows are seeded; current workers publish all source facts.
 exports.runAnalytics = async function runAnalytics(f) {
+  if (process.env.ONLINOD_ANALYTICS_PROOF_SCOPE === "notifications") {
+    return require("./current-notification-workflow.cjs").runNotifications(f);
+  }
   const { modules: m, desktop, scratch, output, auth, api, agencyId, deviceId, creatorId: c, creatorIds, must, pass, results } = f;
   const load = createRequire(path.join(desktop, "package.json"));
   const runtime = createRequire(path.join(process.env.ONLINOD_BROWSER_RUNTIME || process.env.ONLINOD_SQL_PROOF_RUNTIME, "package.json"));

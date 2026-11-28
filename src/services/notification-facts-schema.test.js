@@ -132,7 +132,9 @@ test("completion preserves run identity, publishes durable consequences and prov
   assert.match(observation, /subscriptionRefundIgnored/);
   assert.match(observation, /notification_scan_partial/);
   assert.match(observation, /sourceTraversalComplete/);
-  assert.match(observation, /result\?\.sourceExhausted === true/);
+  assert.match(observation, /notification-frontier-authority["']\)\.completionProof\(db, job, result\)/);
+  assert.match(observation, /sourceTraversalComplete = frontierProof\.verified/);
+  assert.match(leaseService, /notification-frontier-authority["']\)\.completionProof\(tx, job, result\)/);
   assert.match(leaseService, /job\.jobKey === "catchup_notifications_scan"/);
   assert.match(leaseService, /job\.params\?\.manualNotificationScan === true/);
   assert.match(leaseService, /Notification history partial/);

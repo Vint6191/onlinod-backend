@@ -148,7 +148,7 @@ async function readInitialCollectionReadiness({ db, creatorId, now = new Date() 
           reason: enrichmentPending ? "Fan profiles are still being collected"
             : enrichmentUnavailable ? "Some fan profiles are unavailable; campaign membership is saved but fan values are incomplete"
               : debt.failed ? "Some fan profiles could not be collected" : "Campaign membership is saved; fan value coverage is incomplete" } : {}) }),
-    source("notifications", notifications, Boolean(notifications?.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp(notifications.fullBackfillVerifiedAt, now)),
+    source("notifications", notifications, Boolean(notifications?.normalizerVersion === "notification-source-v3" && trustedCollectionTimestamp(notifications.fullBackfillVerifiedAt, now)),
       { historyRead: Boolean(notifications?.fullBackfillCompletedAt || notificationEffect.sourceTraversalComplete) }),
     source("subscribers", subscribers, Boolean(subscribers?.publishedAt && subscribers?.publishedGeneration > 0)),
   ];

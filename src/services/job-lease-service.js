@@ -79,12 +79,12 @@ function object(value) {
 function failedJobRetryDelay(job, result, attempts) {
   const backoff = RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1));
   const failure = object(object(result).failure);
-  // Subscriber source failures already carry the provider Retry-After through
+  // Subscriber and notification failures carry provider Retry-After through
   // the worker's durable failure receipt. Preserve that wait at the job owner;
   // using only exponential backoff can immediately repeat a rate-limited read.
   // A malformed hint cannot change scheduling, and a valid hint cannot reset
   // the finite attempt budget or postpone work without a bounded deadline.
-  if (job.jobKey !== "subscriber_directory_scan" || failure.status !== 429
+  if (!["subscriber_directory_scan", "catchup_notifications_scan"].includes(job.jobKey) || failure.status !== 429
     || !Number.isSafeInteger(failure.retryAfterMs) || failure.retryAfterMs <= 0) return backoff;
   return Math.max(backoff, Math.min(SUBSCRIBER_RATE_LIMIT_MAX_RETRY_MS, failure.retryAfterMs));
 }
@@ -572,7 +572,7 @@ async function notificationFullIsRedundant(job, db = prisma, now = new Date()) {
     where: { creatorId: job.creatorId },
     select: { fullBackfillVerifiedAt: true, normalizerVersion: true },
   });
-  return Boolean(state?.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
+  return Boolean(state?.normalizerVersion === "notification-source-v3" && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
 }
 async function cancelRedundantNotificationFull(job, now = new Date(), db = prisma) {
   if (!(await notificationFullIsRedundant(job, db, now))) return false;
@@ -1123,6 +1123,21 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   }
   if (!completionAccepted && require("./financial-receipt-authority").enabled(job) && continuation !== undefined
     && !require("./financial-receipt-authority").expectedMatches(job, continuation)) throw new JobLeaseError("FINANCIAL_PROGRESS_ENDPOINT_REQUIRED", "Financial cursor advances only with a receipt", 409);
+  if (!completionAccepted && job.jobKey === "catchup_notifications_scan" && continuation !== undefined
+    && !isDeepStrictEqual(leaseDriverContinuation(job.continuation), leaseDriverContinuation(continuation))) {
+    // A delayed keepalive may still carry the cursor preceding a committed
+    // page. Only progress can advance it together with its source receipt;
+    // renew must neither rewind that page nor invent a new continuation.
+    const frontier = require("./notification-frontier-authority");
+    const requested = leaseDriverContinuation(continuation);
+    if (frontier.enabled(job) && requested.driverPhase === "complete") {
+      // The current Desktop finishes an exhausted FULL on a no-source turn
+      // through renew. Admit only the metadata for an already proven traversal.
+      await frontier.assertCompletionContinuation(tx, job, requested.result);
+    } else {
+      throw new JobLeaseError("NOTIFICATION_PROGRESS_ENDPOINT_REQUIRED", "Notification cursor advances only with a source receipt", 409);
+    }
+  }
   const tokenHash = hashToken(leaseToken);
   const data = {
     leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
@@ -1204,6 +1219,22 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       && !isDeepStrictEqual(leaseDriverContinuation(job.continuation), leaseDriverContinuation(expectedContinuation))) {
       return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
         progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true } };
+    }
+
+    if (job.jobKey === "catchup_notifications_scan") {
+      const notificationFrontier = require("./notification-frontier-authority");
+      if (notificationFrontier.enabled(job)) {
+        const requested = leaseDriverContinuation(requestedContinuation);
+        if (requested.driverPhase === "complete") notificationFrontier.assertCompletionResult(job, requested.result);
+        if (chunkResult == null && requested.driverPhase === "complete") {
+          // FULL and server-bounded catch-up need a final no-source turn. Its
+          // descriptor may finish only the traversal already proved in SQL.
+          await notificationFrontier.assertCompletionContinuation(tx, job, requested.result);
+        } else if (chunkResult != null && chunkResult.kind !== "notification_facts_page_all"
+          || chunkResult == null && !isDeepStrictEqual(requested, leaseDriverContinuation(job.continuation))) {
+          throw new notificationFrontier.NotificationFrontierError("NOTIFICATION_PAGE_RECEIPT_REQUIRED");
+        }
+      }
     }
 
     if (campaignTraversal.enabled(job)) {
@@ -1472,6 +1503,8 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     job = current.job;
     now = current.now;
     result = acceptedCompletionResult(job, result);
+    if (job.jobKey === "catchup_notifications_scan")
+      require("./notification-frontier-authority").assertCompletionResult(job, result);
     fenceWhere = { id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId,
       leaseTokenHash: hashToken(leaseToken), leaseRevision, leaseUntil: { gt: now } };
     completionData = { ...completionData, completedAt: now, lastProgressAt: now, result: result || null };
@@ -1613,9 +1646,10 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       const fast = await phaseCommit(async (tx) => {
         // Page receipts and the job tuple share this commit boundary. A parallel
         // progress request cannot change the proof between verification and DONE.
-        const pageProof = notificationScannerSuccessful(job, result)
+        const frontierProof = await require("./notification-frontier-authority").completionProof(tx, job, result);
+        const pageProof = frontierProof.verified && notificationScannerSuccessful(job, result)
           ? await notificationCommittedPageProof(tx, job, result)
-          : { verified: false, reason: "scanner_report_partial" };
+          : { verified: false, reason: frontierProof.verified ? "scanner_report_partial" : frontierProof.reason };
         const successful = pageProof.verified === true;
         const attempts = Number(job.attempts || 0) + (successful ? 0 : 1);
         // Provider traversal has already ended. Re-reading every page cannot
@@ -1628,7 +1662,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
           status, attempts, completedAt: now,
           progress: { percent: 100, message: "Notification catch-up partial: saved facts retained; explicit retry required" },
           claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, continuation: null, workId: null,
-          result: { ...(result || {}), completionSideEffect: { verified: false, sourceTraversalComplete: true } },
+          result: { ...(result || {}), completionSideEffect: { verified: false, sourceTraversalComplete: frontierProof.verified } },
           lastError: "notification_scan_partial",
         };
         const updated = await tx.jobInstance.updateMany({ where: fenceWhere, data: successful ? completionData : failureData });
@@ -1637,8 +1671,8 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         if (!successful) await recordJobFailure({ db: tx, job, error: "notification_scan_partial", terminal, retryAfterAt: retryAt });
         await publishNotificationConsequences({ db: tx, job });
         return { status, retryAt, sideEffect: {
-          type: "catchup_notifications", ok: successful, verified: successful, sourceTraversalComplete: true,
-          compatibilityDeferred: successful, pageProof, syncStateId: syncState?.id || null,
+          type: "catchup_notifications", ok: successful, verified: successful, sourceTraversalComplete: frontierProof.verified,
+          compatibilityDeferred: successful, pageProof, frontierProof, syncStateId: syncState?.id || null,
         } };
       });
       return { job: { id: job.id, status: fast.status, retryAt: fast.retryAt }, sideEffect: fast.sideEffect };

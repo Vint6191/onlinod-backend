@@ -128,12 +128,13 @@ async function publishEntityChanges({ db, agencyId, creatorId, changes }) {
   return { staged: true, count: changes.length };
 }
 
-function factInvalidations({ rows, model, creatorId, scopedTypes }) {
+function factInvalidations({ rows, model, creatorId, scopedTypes, retired = false }) {
   const changes = [], byFan = new Map();
   const versions = rows.map(row => {
     const dialogId = row.fanOnlyFansUserIdAtEvent || row.fan?.onlyFansUserId;
     // Transport collection timestamps/devices are not content revisions.
     const canonical = Object.fromEntries(Object.entries(row).filter(([key]) => !["collectedAt", "updatedAt", "sourceDeviceId", "sourceJobId", "sourceUpdatedAt"].includes(key)));
+    if (retired) canonical.retired = true;
     const dataVersion = hashCanonicalJson(canonical);
     if (dialogId) {
       if (!byFan.has(dialogId)) byFan.set(dialogId, []);
@@ -144,13 +145,13 @@ function factInvalidations({ rows, model, creatorId, scopedTypes }) {
   const dataVersion = hashCanonicalJson(versions.sort((a,b) => compare(a[0],b[0])));
   for (const entityType of ["HOME", "TEAM", "CAMPAIGN", "AUDIENCE", "TRAFFIC"]) changes.push({
     entityType, entityId: creatorId, sourceIdentity: `${model}:creator`, sourceVersion: dataVersion,
-    payload: { dataVersion, reason: "CANONICAL_FACT_CHANGED" },
+    payload: { dataVersion, reason: retired ? "CANONICAL_FACT_WITHDRAWN" : "CANONICAL_FACT_CHANGED" },
   });
   for (const [dialogId, parts] of byFan) {
     const fanVersion = hashCanonicalJson(parts.sort((a,b) => compare(a[0],b[0])));
     for (const entityType of scopedTypes) changes.push({ entityType, entityId: dialogId,
       sourceIdentity: `${model}:fan:${dialogId}`, sourceVersion: fanVersion,
-      payload: { dataVersion: fanVersion, reason: "CANONICAL_FACT_CHANGED", dialogId, fanOnlyFansUserId: dialogId } });
+      payload: { dataVersion: fanVersion, reason: retired ? "CANONICAL_FACT_WITHDRAWN" : "CANONICAL_FACT_CHANGED", dialogId, fanOnlyFansUserId: dialogId } });
   }
   return changes;
 }
@@ -160,21 +161,56 @@ async function canonicalFactRows(db, { agencyId, creatorId, ids, model }) {
   return unique.length ? db[model].findMany({ where: { agencyId, creatorId, id: { in: unique } },
     include: { fan: { select: { onlyFansUserId: true } } }, take: unique.length }) : [];
 }
-async function publishCanonicalSales({ db, agencyId, creatorId, saleIds }) {
+async function formerFanInvalidations(db, { agencyId, creatorId, model, rows, previousRows, scopedTypes }) {
+  if (!previousRows?.length) return [];
+  if (previousRows.length > 2000 || previousRows.some(row => row.agencyId !== agencyId || row.creatorId !== creatorId)) throw fail("ENTITY_CHANGE_SCOPE_MISMATCH");
+  const current = new Map(rows.map(row => [row.id, row]));
+  const unknownIds = [...new Set(previousRows.filter(row => !row.fanOnlyFansUserIdAtEvent && row.fanRecordId).map(row => row.fanRecordId))];
+  const oldFans = unknownIds.length ? await db.creatorFan.findMany({ where: { agencyId, creatorId, id: { in: unknownIds } },
+    select: { id: true, onlyFansUserId: true } }) : [];
+  const byFan = new Map(oldFans.map(row => [row.id, row.onlyFansUserId]));
+  const moved = [];
+  for (const previous of previousRows) {
+    const next = current.get(previous.id), oldFan = previous.fanOnlyFansUserIdAtEvent || byFan.get(previous.fanRecordId);
+    const newFan = next?.fanOnlyFansUserIdAtEvent || next?.fan?.onlyFansUserId;
+    if (!next || !oldFan || oldFan === newFan) continue;
+    moved.push({ ...previous, fanOnlyFansUserIdAtEvent: oldFan, correctedToFan: newFan || null });
+  }
+  // Sidecars subscribe to the exact fan/dialog scope. A creator-wide HOME
+  // invalidation cannot refresh the former owner's already-open conversation.
+  return moved.length ? factInvalidations({ rows: moved, model, creatorId, scopedTypes })
+    .filter(change => scopedTypes.includes(change.entityType)) : [];
+}
+async function publishCanonicalSales({ db, agencyId, creatorId, saleIds, previousRows = [] }) {
   await require("./creator-fact-write-authority").lockCreatorFacts(db, agencyId, creatorId);
   const rows = await canonicalFactRows(db, { agencyId, creatorId, ids: saleIds, model: "creatorSale" });
   if (!rows.length) return { staged: true, count: 0 };
   const changes = factInvalidations({ rows, model: "CreatorSale", creatorId, scopedTypes: ["CRM", "MEDIA", "FAN"] });
+  changes.push(...await formerFanInvalidations(db, { agencyId, creatorId, model: "CreatorSale", rows, previousRows, scopedTypes: ["CRM", "MEDIA", "FAN"] }));
   changes.push(...await require("./media-financial-projection-service").publishCanonicalMediaSales({ db, agencyId, creatorId, rows }));
   return publishEntityChanges({ db, agencyId, creatorId, changes });
 }
 
-async function publishCanonicalFactInvalidations({ db, agencyId, creatorId, model, ids }) {
+async function publishCanonicalFactInvalidations({ db, agencyId, creatorId, model, ids, previousRows = [] }) {
   if (!["creatorTip", "creatorSubscriptionEvent", "creatorPostLike", "creatorPostComment"].includes(model)) throw fail("ENTITY_CHANGE_TYPE_INVALID");
   const rows = await canonicalFactRows(db, { agencyId, creatorId, model, ids });
   if (!rows.length) return { staged: true, count: 0 };
-  return publishEntityChanges({ db, agencyId, creatorId,
-    changes: factInvalidations({ rows, model, creatorId, scopedTypes: ["CRM", "FAN"] }) });
+  const changes = factInvalidations({ rows, model, creatorId, scopedTypes: ["CRM", "FAN"] });
+  changes.push(...await formerFanInvalidations(db, { agencyId, creatorId, model, rows, previousRows, scopedTypes: ["CRM", "FAN"] }));
+  return publishEntityChanges({ db, agencyId, creatorId, changes });
+}
+
+async function publishCanonicalFactRetirements({ db, agencyId, creatorId, model, rows }) {
+  if (!["creatorSale", "creatorTip", "creatorSubscriptionEvent", "creatorPostLike", "creatorPostComment"].includes(model)) throw fail("ENTITY_CHANGE_TYPE_INVALID");
+  if (!rows.length) return { staged: true, count: 0 };
+  if (rows.length > 2000 || rows.some(row => row.agencyId !== agencyId || row.creatorId !== creatorId)) throw fail("ENTITY_CHANGE_SCOPE_MISMATCH");
+  const sale = model === "creatorSale";
+  const changes = factInvalidations({ rows, model: sale ? "CreatorSale" : model, creatorId,
+    scopedTypes: sale ? ["CRM", "MEDIA", "FAN"] : ["CRM", "FAN"], retired: true });
+  if (sale) changes.push(...await require("./media-financial-projection-service").withdrawCanonicalMediaSales({
+    db, agencyId, creatorId, saleIds: rows.map(row => row.id),
+  }));
+  return publishEntityChanges({ db, agencyId, creatorId, changes });
 }
 
 async function persistCreator(db, { agencyId, creatorId, changes }) {
@@ -321,4 +357,4 @@ async function runRetentionSweep({ db = require("../prisma"), maxPages = 8, maxR
   return report;
 }
 
-module.exports = { TYPES, MAX_PAGE, RETENTION_DAYS, MAX_RETAINED_CHANGES, publishEntityChanges, publishCanonicalSales, publishCanonicalFactInvalidations, readEntityChanges, readCurrentEntities, retainPage, runRetentionSweep };
+module.exports = { TYPES, MAX_PAGE, RETENTION_DAYS, MAX_RETAINED_CHANGES, publishEntityChanges, publishCanonicalSales, publishCanonicalFactInvalidations, publishCanonicalFactRetirements, readEntityChanges, readCurrentEntities, retainPage, runRetentionSweep };

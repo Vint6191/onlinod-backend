@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v36_financial_correction_projection",
+  "version": "nod_current_v39_notification_upgrade_receipt_retention",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -164,6 +164,18 @@
     {
       "migration": "20261128040000_financial_correction_projection",
       "checksum": "76cd1b58738cc66d6d3e325c35c09c16e4f51a80d52b1e61e6d3be9a4f1c9662"
+    },
+    {
+      "migration": "20261128050000_notification_correction_receipts",
+      "checksum": "184c54daff5e7443c26a268665ca72b93fc477b1963e88510205896b706f74c2"
+    },
+    {
+      "migration": "20261128060000_notification_normalizer_upgrade_reason",
+      "checksum": "6faedf1569250779e4c55b2886bada09fe7e72e79107edce35d67361ad578d99"
+    },
+    {
+      "migration": "20261128070000_notification_upgrade_receipt_retention",
+      "checksum": "0e5a1acb349ad0b00c192823aab399da9fff5d4efae32fb1f8ece1e7b8a0b650"
     }
   ],
   "extension": {
@@ -4863,7 +4875,7 @@
         "type": "c",
         "deferrable": false,
         "deferred": false,
-        "definition": "CHECK (((reason = ANY (ARRAY['OFFLINE_GAP'::text, 'CAPTURE_LOSS'::text])) OR ((stream = 'financial'::text) AND (reason = ANY (ARRAY['FINANCIAL_PROOF_ADOPTION'::text, 'FINANCIAL_PROOF_ADOPTION_FULL'::text, 'FINANCIAL_DELIVERY_GAP'::text])))))"
+        "definition": "CHECK (((reason = ANY (ARRAY['OFFLINE_GAP'::text, 'CAPTURE_LOSS'::text])) OR ((stream = 'financial'::text) AND (reason = ANY (ARRAY['FINANCIAL_PROOF_ADOPTION'::text, 'FINANCIAL_PROOF_ADOPTION_FULL'::text, 'FINANCIAL_DELIVERY_GAP'::text]))) OR ((stream = 'notifications'::text) AND (reason = 'NOTIFICATION_NORMALIZER_UPGRADE'::text))))"
       },
       {
         "table": "CreatorRecoveryIntent",
@@ -5976,6 +5988,15 @@
       },
       {
         "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_ordinary_completed_retention_idx",
+        "unique": false,
+        "keys": "11 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "((status = 'COMPLETE'::text) AND (reason <> 'NOTIFICATION_NORMALIZER_UPGRADE'::text) AND (\"left\"(id, 13) <> 'notifupgrade_'::text))"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
         "name": "CreatorRecoveryIntent_pending_idx",
         "unique": false,
         "keys": "3 4 9 7 1",
@@ -6034,6 +6055,15 @@
         "unique": false,
         "keys": "3 1",
         "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorSubscriptionLedger",
+        "name": "TrafficReceipt_notification_identity_v3",
+        "unique": false,
+        "keys": "3 13 11",
+        "options": "0 0 0",
         "expressions": null,
         "predicate": null
       },
